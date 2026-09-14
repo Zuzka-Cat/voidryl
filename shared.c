@@ -99,7 +99,7 @@ enum EntityKind {
   KIND_CASING
 };
 
-typedef enum {
+enum {
   COMP_POSITION = 0,
   COMP_VELOCITY,
   COMP_AIM,

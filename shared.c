@@ -27,6 +27,12 @@
 #define u8 uint8_t
 #define f32 float
 
+#define CHAR_IS_LOWER(c) ((c) >= 'a' && (c) <= 'z')
+#define CHAR_IS_UPPER(c) ((c) >= 'A' && (c) <= 'Z')
+#define CHAR_IS_DIGIT(c) ((c) >= '0' && (c) <= '9')
+#define CHAR_TO_UPPER(c) (CHAR_IS_LOWER(c) ? ((c) - ('a' - 'A')) : (c))
+#define CHAR_IS_CHAT(c) (CHAR_IS_UPPER(c) || CHAR_IS_DIGIT(c) || (c) == ' ')
+
 typedef struct {
   u8 *items;
   i32 length;
@@ -359,7 +365,7 @@ static bool valid_port(String text, u16 *port) {
     return false;
   for (i32 i = 0; i < text.length; ++i) {
     u8 c = text.items[i];
-    if (c < '0' || c > '9')
+    if (!CHAR_IS_DIGIT(c))
       return false;
     value = value * 10u + (unsigned long)(c - '0');
     if (value > 65535u)
@@ -377,10 +383,8 @@ static bool valid_player_name(String text, String *out) {
   if (!out || !out->items || out->capacity < PLAYER_NAME_LENGTH)
     return false;
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
-    u8 c = text.items[i];
-    if (c >= 'a' && c <= 'z')
-      c = (u8)(c - ('a' - 'A'));
-    if (c < 'A' || c > 'Z')
+    u8 c = (u8)CHAR_TO_UPPER(text.items[i]);
+    if (!CHAR_IS_UPPER(c))
       return false;
     out->items[i] = c;
   }
@@ -392,7 +396,7 @@ static bool valid_wire_name(String name) {
   if (name.length != PLAYER_NAME_LENGTH)
     return false;
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
-    if (name.items[i] < 'A' || name.items[i] > 'Z')
+    if (!CHAR_IS_UPPER(name.items[i]))
       return false;
   return true;
 }
@@ -464,7 +468,7 @@ static bool net_validate_snapshot_fields(const NetSnapshot *snap,
 static void net_sanitize_chat_text(String text) {
   for (i32 i = 0; i < text.length; ++i) {
     u8 c = text.items[i];
-    if ((c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != ' ')
+    if (!CHAR_IS_CHAT(c))
       text.items[i] = ' ';
   }
 }

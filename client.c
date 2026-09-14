@@ -251,10 +251,8 @@ static void update_input(GameState *g, int fd) {
       if (IsKeyPressed(KEY_BACKSPACE) && g->chat_length > 0)
         --g->chat_length;
       while ((c = GetKeyPressed()) != 0) {
-        if (c >= 'a' && c <= 'z')
-          c -= 'a' - 'A';
-        if (((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') &&
-            g->chat_length < CHAT_LENGTH)
+        c = CHAR_TO_UPPER(c);
+        if (CHAR_IS_CHAT(c) && g->chat_length < CHAT_LENGTH)
           g->chat_input[g->chat_length++] = (u8)c;
       }
     }

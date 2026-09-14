@@ -76,6 +76,7 @@ enum NetPacketKind {
 #define BTN_FIRE 1u
 #define BTN_GRAB 2u
 #define BTN_JUMP 4u
+#define BTN_AIM 8u
 
 // Weapon catalog: single source of truth for fire rate, mag size, reload and
 // recoil. To add a weapon, append a WeaponId and a WeaponDef entry; the
@@ -96,6 +97,12 @@ typedef struct WeaponDef {
   f32 recoil_vel_hold;
   f32 rise_vel_tap;
   f32 rise_vel_hold;
+  f32 spread_hip_deg;
+  f32 spread_aim_deg;
+  f32 hip_fov;
+  f32 aim_fov;
+  f32 aim_sens_scale;
+  f32 aim_move_scale;
 } WeaponDef;
 
 static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
@@ -107,12 +114,18 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .recoil_pitch_tap_deg = 1,
             .recoil_pitch_hold_deg = 2,
             .reload_ticks = 160,
-            .slide_tap = 0.10f,
-            .slide_hold = 0.14f,
-            .recoil_vel_tap = 1.0f,
-            .recoil_vel_hold = 1.9f,
-            .rise_vel_tap = 1.05f,
-            .rise_vel_hold = 2.1f,
+            .slide_tap = 0.09f,
+            .slide_hold = 0.126f,
+            .recoil_vel_tap = 0.9f,
+            .recoil_vel_hold = 1.71f,
+            .rise_vel_tap = 0.945f,
+            .rise_vel_hold = 1.89f,
+            .spread_hip_deg = 2.6f,
+            .spread_aim_deg = 0.45f,
+            .hip_fov = 72.0f,
+            .aim_fov = 45.0f,
+            .aim_sens_scale = 0.55f,
+            .aim_move_scale = 0.5f,
         },
 };
 
@@ -331,6 +344,7 @@ typedef struct GameState {
   f32 gun_recoil, gun_recoil_velocity, gun_slide;
   f32 gun_rise, gun_rise_velocity;
   f32 gun_sway_x, gun_sway_y, look_delta_x, look_delta_y;
+  f32 aim_blend, screen_shake;
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
@@ -529,6 +543,45 @@ static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
   int kick = holding ? (int)def->recoil_pitch_hold_deg
                      : (int)def->recoil_pitch_tap_deg;
   return clamp_i16((int)pitch + kick, -75, 75);
+}
+
+// Per-weapon imprecision in degrees. Hip is deliberately loose, ADS is
+// tight but never perfectly exact.
+static f32 weapon_spread_deg(u8 weapon_id, bool aiming) {
+  const WeaponDef *def = weapon_def(weapon_id);
+  return aiming ? def->spread_aim_deg : def->spread_hip_deg;
+}
+
+static f32 weapon_hip_fov(u8 weapon_id) {
+  return weapon_def(weapon_id)->hip_fov;
+}
+
+static f32 weapon_aim_fov(u8 weapon_id) {
+  return weapon_def(weapon_id)->aim_fov;
+}
+
+static f32 weapon_aim_sens_scale(u8 weapon_id) {
+  return weapon_def(weapon_id)->aim_sens_scale;
+}
+
+static f32 weapon_aim_move_scale(u8 weapon_id) {
+  return weapon_def(weapon_id)->aim_move_scale;
+}
+
+// Reload progress 0..1 (0 when not reloading) so the viewmodel can play
+// one smooth whip across the reload.
+static f32 weapon_reload_progress(const GameState *g, u32 e) {
+  if (!weapon_entity_valid(e) || g->weapon_reload[e] == 0)
+    return 0.0f;
+  const WeaponDef *def = weapon_def(g->weapon_id[e]);
+  if (def->reload_ticks == 0)
+    return 0.0f;
+  f32 t = 1.0f - (f32)g->weapon_reload[e] / (f32)def->reload_ticks;
+  if (t < 0.0f)
+    t = 0.0f;
+  if (t > 1.0f)
+    t = 1.0f;
+  return t;
 }
 
 // Reconcile a snapshot weapon state onto a client entity. Remote entities

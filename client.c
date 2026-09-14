@@ -9,6 +9,8 @@ static const Color PAL_PURPLE = {60, 30, 102, 255};
 static const Color PAL_MID = {155, 123, 208, 255};
 static const Color PAL_LIGHT = {246, 213, 232, 255};
 
+static u32 local_player_entity(const GameState *g);
+
 static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   struct in_addr address;
@@ -41,6 +43,8 @@ static void renew_client_session(GameState *g) {
   g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   g->gun_rise = g->gun_rise_velocity = 0.0f;
   g->gun_slide = 0.0f;
+  g->aim_blend = 0.0f;
+  g->screen_shake = 0.0f;
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
@@ -205,7 +209,8 @@ static void client_send_input(GameState *g, int fd, u8 type) {
   String req = game_requested_name(g);
   memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
   if (type == NET_PACKET_INPUT) {
-    packet.buttons = g->input[0].buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP);
+    packet.buttons =
+        g->input[0].buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM);
     packet.sequence = g->next_sequence++;
     packet.move_x = g->input[0].move_x;
     packet.move_z = g->input[0].move_z;
@@ -271,8 +276,11 @@ static void update_input(GameState *g, int fd) {
   g->input[0].buttons = 0;
   if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     g->input[0].buttons |= BTN_FIRE;
-  if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_E))
+  if (IsKeyDown(KEY_E))
     g->input[0].buttons |= BTN_GRAB;
+  bool aiming = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+  if (aiming)
+    g->input[0].buttons |= BTN_AIM;
   if (IsKeyDown(KEY_SPACE))
     g->input[0].buttons |= BTN_JUMP;
   if (IsKeyPressed(KEY_F1))
@@ -287,11 +295,16 @@ static void update_input(GameState *g, int fd) {
   if (!g->mouse_captured)
     return;
   Vector2 mouse = GetMouseDelta();
-  g->look_delta_x = mouse.x;
-  g->look_delta_y = mouse.y;
-  g->view_yaw = wrap_degrees((int)g->view_yaw - (int)lroundf(mouse.x));
-  g->view_pitch =
-      clamp_i16((int)g->view_pitch - (int)lroundf(mouse.y), -75, 75);
+  // ADS precision from the weapon config: slower, finer look while zoomed.
+  u32 sens_e = local_player_entity(g);
+  u8 sens_wid = sens_e != ECS_INVALID_ENTITY ? g->weapon_id[sens_e] : WEAPON_P99;
+  f32 sens = aiming ? weapon_aim_sens_scale(sens_wid) : 1.0f;
+  f32 sdx = mouse.x * sens;
+  f32 sdy = mouse.y * sens;
+  g->look_delta_x = sdx;
+  g->look_delta_y = sdy;
+  g->view_yaw = wrap_degrees((int)g->view_yaw - (int)lroundf(sdx));
+  g->view_pitch = clamp_i16((int)g->view_pitch - (int)lroundf(sdy), -75, 75);
 }
 
 static u32 local_player_entity(const GameState *g) {
@@ -315,23 +328,41 @@ static Vector3 entity_pos(const GameState *g, u32 e, f32 a) {
 static Camera3D make_camera(const GameState *g, f32 a) {
   u32 e = local_player_entity(g);
   Vector3 dir = {0.0f, 0.0f, 1.0f};
+  u8 wid = e != ECS_INVALID_ENTITY ? g->weapon_id[e] : WEAPON_P99;
+  f32 hip_fov = weapon_hip_fov(wid);
+  f32 aim_fov = weapon_aim_fov(wid);
   Camera3D cam = {.position = (Vector3){0.0f, 1.5f, 0.0f},
-                  .up = (Vector3){0.0f, 1.0f, 0.0f},
-                  .fovy = 72.0f,
-                  .projection = CAMERA_PERSPECTIVE};
+                   .up = (Vector3){0.0f, 1.0f, 0.0f},
+                   .fovy = hip_fov,
+                   .projection = CAMERA_PERSPECTIVE};
   if (e != ECS_INVALID_ENTITY) {
     Vector3 p = entity_pos(g, e, a);
     cam.position = (Vector3){p.x, 1.5f + p.y, p.z};
     aim_dir(g->view_yaw, g->view_pitch, &dir);
   }
+  cam.fovy = hip_fov * (1.0f - g->aim_blend) + aim_fov * g->aim_blend;
   cam.target = (Vector3){cam.position.x + dir.x, cam.position.y + dir.y,
-                         cam.position.z + dir.z};
+                          cam.position.z + dir.z};
   return cam;
 }
 
-static void draw_gun_local(f32 recoil, f32 slide, f32 scale, bool firing) {
+static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
+                         f32 reload_t) {
   rlPushMatrix();
   rlScalef(scale, scale, scale);
+  // Reload whip: quick muzzle flick forward/down, settled well before the
+  // reload ends so it reads snappy. Pitch about the gun's own center (not
+  // the view origin) so it whips in front of you instead of orbiting.
+  if (reload_t > 0.0f) {
+    f32 tw = reload_t < 0.65f ? reload_t / 0.65f : 1.0f;
+    f32 whip = sinf(tw * PI);
+    f32 snap = sinf(tw * 2.0f * PI);
+    f32 ang = whip * 32.0f + snap * 4.0f;
+    rlTranslatef(0.0f, -whip * 0.02f, whip * 0.05f);
+    rlTranslatef(-0.32f, -0.05f, 0.25f);
+    rlRotatef(ang, 1.0f, 0.0f, 0.0f);
+    rlTranslatef(0.32f, 0.05f, -0.25f);
+  }
   Vector3 sl = {-0.32f, 0.0f, 0.30f - recoil - slide};
   Vector3 sls = {0.16f, 0.13f, 0.46f};
   Vector3 gr = {-0.32f, -0.15f, 0.18f - recoil};
@@ -340,11 +371,38 @@ static void draw_gun_local(f32 recoil, f32 slide, f32 scale, bool firing) {
   DrawCubeWiresV(sl, sls, PAL_DARK);
   DrawCubeV(gr, grs, PAL_PURPLE);
   DrawCubeWiresV(gr, grs, PAL_DARK);
+  // Sights: two slim rear blocks flush with the housing sides (wide empty
+  // notch between them), plus one slim front block. All three ride the slide.
+  f32 sz = -recoil - slide;
+  Vector3 rss = {0.024f, 0.045f, 0.05f};
+  Vector3 rl = {-0.378f, 0.085f, 0.09f + sz};
+  Vector3 rr = {-0.262f, 0.085f, 0.09f + sz};
+  DrawCubeV(rl, rss, PAL_DARK);
+  DrawCubeWiresV(rl, rss, PAL_MID);
+  DrawCubeV(rr, rss, PAL_DARK);
+  DrawCubeWiresV(rr, rss, PAL_MID);
+  Vector3 fs = {-0.32f, 0.088f, 0.48f + sz};
+  Vector3 fss = {0.024f, 0.055f, 0.024f};
+  DrawCubeV(fs, fss, PAL_DARK);
+  DrawCubeWiresV(fs, fss, PAL_MID);
   if (firing)
     DrawCylinderEx((Vector3){-0.32f, 0.0f, 0.56f - recoil},
                    (Vector3){-0.32f, 0.0f, 0.72f - recoil}, 0.065f, 0.0f, 5,
                    PAL_LIGHT);
   rlPopMatrix();
+}
+
+// Per-weapon viewmodel dispatcher. To add a gun, add a WeaponId + WeaponDef
+// entry, write a draw_gun_<name> renderer, and hook it up here; game logic
+// stays in shared.c with no per-weapon branching elsewhere.
+static void draw_gun_local(u8 weapon_id, f32 recoil, f32 slide, f32 scale,
+                           bool firing, f32 reload_t) {
+  switch (weapon_id) {
+  case WEAPON_P99:
+  default:
+    draw_gun_p99(recoil, slide, scale, firing, reload_t);
+    break;
+  }
 }
 
 static void draw_cube_lit(Vector3 p, Vector3 s, Color fill) {
@@ -359,7 +417,7 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   f32 lag = 1.0f - a;
   f32 yaw_lag = (f32)lag_decode(g->lag_yaw[e]) * lag;
   f32 pitch_lag = (f32)lag_decode(g->lag_pitch[e]) * lag;
-  bool reloading = weapon_is_reloading(g, e);
+  f32 reload_t = weapon_reload_progress(g, e);
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
@@ -369,18 +427,18 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   draw_cube_lit((Vector3){0.0f, 1.44f, 0.06f}, (Vector3){0.26f, 0.26f, 0.26f},
                 hurt ? PAL_LIGHT : PAL_PURPLE);
   rlPushMatrix();
-  rlTranslatef(-0.22f - yaw_lag * 0.018f, 1.16f + pitch_lag * 0.009f +
-                                              fire * 0.05f -
-                                              (reloading ? 0.10f : 0.0f),
+  rlTranslatef(-0.22f - yaw_lag * 0.018f,
+               1.16f + pitch_lag * 0.009f + fire * 0.05f,
                0.30f - fire * 0.02f);
   // True recoil climb for remotes plus stronger turn bob with up/down
-  // cross-coupling from yaw motion.
+  // cross-coupling from yaw motion. Reload whips in place (see draw_gun).
   rlRotatef((f32)-g->pitch[e] - pitch_lag * 0.80f - yaw_lag * 0.28f -
-                fire * 13.0f + (reloading ? 26.0f : 0.0f),
+                fire * 13.0f,
             1.0f, 0.0f, 0.0f);
   rlRotatef(-yaw_lag * 0.85f, 0.0f, 1.0f, 0.0f);
   rlRotatef(-yaw_lag * 0.30f, 0.0f, 0.0f, 1.0f);
-  draw_gun_local(fire * 0.03f, fire * 0.08f, 1.0f, firing);
+  draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
+                 reload_t);
   rlPopMatrix();
   rlPopMatrix();
 }
@@ -476,6 +534,50 @@ static void draw_number(int x, int y, unsigned value, Color color) {
   }
 }
 
+static int ammo_field_width(unsigned mag) {
+  int d = 1;
+  unsigned m = mag;
+  while (m >= 10u) {
+    m /= 10u;
+    ++d;
+  }
+  return d < 2 ? 2 : d;
+}
+
+static void draw_number_padded(int x, int y, unsigned value, int width,
+                               Color color) {
+  u8 buf[8];
+  if (width > (int)sizeof(buf))
+    width = (int)sizeof(buf);
+  for (int i = width - 1; i >= 0; --i) {
+    buf[i] = (u8)('0' + value % 10u);
+    value /= 10u;
+  }
+  for (int i = 0; i < width; ++i) {
+    String t = {&buf[i], 1, 1};
+    draw_small_text(x + i * 4, y, t, color);
+  }
+}
+
+static Color ammo_color(unsigned ammo, unsigned mag, bool reloading) {
+  if (reloading) {
+    int blink = ((int)(GetTime() * 8.0)) & 1;
+    return blink ? PAL_LIGHT : PAL_MID;
+  }
+  if (mag == 0)
+    return PAL_LIGHT;
+  f32 f = (f32)ammo / (f32)mag;
+  if (f > 0.6f)
+    return PAL_LIGHT;
+  if (f > 0.30f)
+    return PAL_MID;
+  if (f <= 0.001f)
+    return PAL_PURPLE;
+  // Low ammo: cool pulse between mid and dark-purple.
+  int blink = ((int)(GetTime() * 6.0)) & 1;
+  return blink ? PAL_MID : PAL_PURPLE;
+}
+
 static int small_text_width(String text) {
   return text.length ? (int)text.length * 4 - 1 : 0;
 }
@@ -535,33 +637,30 @@ static void draw_hud(GameState *g) {
   }
   if (e != ECS_INVALID_ENTITY)
     draw_hit_indicator(g, e);
-  DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
+  if (g->aim_blend < 0.5f)
+    DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
   if (e != ECS_INVALID_ENTITY && g->connected) {
     bool reloading = weapon_is_reloading(g, e);
     unsigned ammo = weapon_ammo(g, e);
     unsigned mag = weapon_mag_size(g, e);
     if (ammo > mag)
       ammo = mag;
-    if (reloading) {
-      DrawRectangle(LOGICAL_W - 32, LOGICAL_H - 9, 30, 7, PAL_DARK);
-      draw_small_text(LOGICAL_W - 31, LOGICAL_H - 8, STR("R"), PAL_MID);
-      draw_small_text(LOGICAL_W - 26, LOGICAL_H - 8, STR("RELOAD"), PAL_LIGHT);
-    } else {
-      DrawRectangle(LOGICAL_W - 26, LOGICAL_H - 9, 24, 7, PAL_DARK);
-      draw_number(LOGICAL_W - 25, LOGICAL_H - 8, ammo, PAL_LIGHT);
-      int num_w = ammo >= 10 ? 7 : 3;
-      int slash_x = LOGICAL_W - 25 + num_w + 2;
-      draw_small_text(slash_x, LOGICAL_H - 8, STR("/"), PAL_MID);
-      draw_number(slash_x + 4, LOGICAL_H - 8, mag, PAL_MID);
-    }
+    int width = ammo_field_width(mag);
+    int num_w = width * 4 - 1;
+    int bx = LOGICAL_W - num_w - 3;
+    DrawRectangle(bx, LOGICAL_H - 9, num_w + 2, 7, PAL_DARK);
+    draw_number_padded(bx + 1, LOGICAL_H - 8, ammo, width,
+                       ammo_color(ammo, mag, reloading));
   }
   if (g->help) {
     DrawRectangle(1, 17, 42, 16, PAL_DARK);
     DrawRectangle(47, 17, 44, 16, PAL_DARK);
     draw_small_text(2, 19, STR("WASD MOVE"), PAL_LIGHT);
-    draw_small_text(2, 26, STR("MOUSE AIM"), PAL_LIGHT);
+    draw_small_text(2, 26, STR("MOUSE LOOK"), PAL_LIGHT);
     draw_small_text(48, 19, STR("SPACE JUMP"), PAL_LIGHT);
     draw_small_text(48, 26, STR("E HOLD"), PAL_LIGHT);
+    DrawRectangle(1, 35, 42, 7, PAL_DARK);
+    draw_small_text(2, 36, STR("RMB AIM"), PAL_LIGHT);
   }
   if (g->chatting) {
     String chat = game_chat_input(g);
@@ -579,10 +678,27 @@ static void draw_hud(GameState *g) {
 static void update_viewmodel(GameState *g, f32 dt) {
   if (dt > 0.05f)
     dt = 0.05f;
-  // Stronger turn bob: larger target, slightly slower follow for more lag.
-  f32 tx = g->look_delta_x * 0.062f;
-  f32 ty = -g->look_delta_y * 0.045f;
-  tx = fmaxf(-0.65f, fminf(0.65f, tx));
+  // ADS target: zoomed unless reloading (sights drop while reloading).
+  bool want_aim = (g->input[0].buttons & BTN_AIM) != 0;
+  u32 aim_e = local_player_entity(g);
+  bool aim_reloading = aim_e != ECS_INVALID_ENTITY &&
+                       weapon_is_reloading(g, aim_e);
+  f32 aim_target = (want_aim && !aim_reloading) ? 1.0f : 0.0f;
+  f32 ak = 1.0f - expf(-12.0f * dt);
+  g->aim_blend += (aim_target - g->aim_blend) * ak;
+  if (g->aim_blend < 0.001f && aim_target == 0.0f)
+    g->aim_blend = 0.0f;
+  if (g->aim_blend > 0.999f && aim_target == 1.0f)
+    g->aim_blend = 1.0f;
+  // Screen shake decay (view-texture offset only, never the camera).
+  g->screen_shake *= expf(-11.0f * dt);
+  if (g->screen_shake < 0.02f)
+    g->screen_shake = 0.0f;
+  // Turn bob: side-side tuned down ~25%, steadier while aiming.
+  f32 steady = 1.0f - g->aim_blend * 0.55f;
+  f32 tx = g->look_delta_x * 0.048f * steady;
+  f32 ty = -g->look_delta_y * 0.045f * steady;
+  tx = fmaxf(-0.50f, fminf(0.50f, tx));
   ty = fmaxf(-0.45f, fminf(0.45f, ty));
   f32 k = 1.0f - expf(-5.2f * dt);
   g->gun_sway_x += (tx - g->gun_sway_x) * k;
@@ -593,16 +709,16 @@ static void update_viewmodel(GameState *g, f32 dt) {
   g->gun_recoil += g->gun_recoil_velocity * dt;
   if (g->gun_recoil < 0.0f)
     g->gun_recoil = g->gun_recoil_velocity = 0.0f;
-  if (g->gun_recoil > 0.09f)
-    g->gun_recoil = 0.09f;
+  if (g->gun_recoil > 0.081f)
+    g->gun_recoil = 0.081f;
   // True recoil climb: separate upward spring for muzzle rise.
   g->gun_rise_velocity +=
       (-95.0f * g->gun_rise - 13.0f * g->gun_rise_velocity) * dt;
   g->gun_rise += g->gun_rise_velocity * dt;
   if (g->gun_rise < 0.0f)
     g->gun_rise = g->gun_rise_velocity = 0.0f;
-  if (g->gun_rise > 0.085f)
-    g->gun_rise = 0.085f;
+  if (g->gun_rise > 0.0765f)
+    g->gun_rise = 0.0765f;
 }
 
 static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
@@ -616,27 +732,40 @@ static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
   Camera3D wcam = {.position = (Vector3){0.0f, 0.0f, 0.0f},
                    .target = (Vector3){0.0f, 0.0f, 1.0f},
                    .up = (Vector3){0.0f, 1.0f, 0.0f},
-                   .fovy = 72.0f,
+                   .fovy = cam.fovy,
                    .projection = CAMERA_PERSPECTIVE};
   BeginMode3D(wcam);
   rlPushMatrix();
   f32 rise = g->gun_rise;
+  f32 b = g->aim_blend;
+  if (b < 0.0f)
+    b = 0.0f;
+  if (b > 1.0f)
+    b = 1.0f;
+  f32 sway_scale = 1.0f - b * 0.75f;
   u32 local_e = local_player_entity(g);
-  bool local_reloading = local_e != ECS_INVALID_ENTITY &&
-                         weapon_is_reloading(g, local_e);
-  f32 reload_dip = local_reloading ? 0.09f : 0.0f;
-  rlTranslatef(g->gun_sway_x * 1.28f, -0.18f + g->gun_sway_y * 1.28f +
-                                        rise * 0.70f - reload_dip,
+  f32 reload_t =
+      local_e != ECS_INVALID_ENTITY ? weapon_reload_progress(g, local_e) : 0.0f;
+  // Hip base slightly right of low-left; ADS base centers the sights
+  // (slide x -0.32*1.35, sight datum ~0.10*1.35).
+  f32 base_x = 0.06f * (1.0f - b) + 0.432f * b;
+  f32 base_y = -0.18f * (1.0f - b) + -0.135f * b;
+  rlTranslatef(base_x + g->gun_sway_x * 1.02f * sway_scale,
+               base_y + g->gun_sway_y * 1.28f * sway_scale +
+                   rise * 0.70f * (1.0f - b * 0.8f),
                0.75f);
-  rlRotatef(g->gun_sway_x * -68.0f, 0.0f, 1.0f, 0.0f);
+  rlRotatef(g->gun_sway_x * -52.0f * sway_scale, 0.0f, 1.0f, 0.0f);
   // Up/down rotation: direct pitch response plus a smaller cross-coupling
   // from turning so yaw motion also tilts the gun vertically.
-  rlRotatef(g->gun_sway_y * -46.0f + g->gun_sway_x * -14.0f - rise * 230.0f +
-                (local_reloading ? 24.0f : 0.0f),
+  // Reload whips in place inside draw_gun (no dip/tilt here).
+  rlRotatef((g->gun_sway_y * -46.0f + g->gun_sway_x * -11.0f) * sway_scale -
+                rise * 230.0f * (1.0f - b * 0.85f),
             1.0f, 0.0f, 0.0f);
-  rlRotatef(g->gun_sway_x * -38.0f, 0.0f, 0.0f, 1.0f);
-  draw_gun_local(g->gun_recoil / 1.35f, g->gun_slide / 1.35f, 1.35f,
-                 g->gun_kick != 0);
+  rlRotatef(g->gun_sway_x * -29.0f * sway_scale, 0.0f, 0.0f, 1.0f);
+  u8 local_wid =
+      local_e != ECS_INVALID_ENTITY ? g->weapon_id[local_e] : WEAPON_P99;
+  draw_gun_local(local_wid, g->gun_recoil / 1.35f, g->gun_slide / 1.35f, 1.35f,
+                 g->gun_kick != 0, reload_t);
   rlPopMatrix();
   EndMode3D();
   draw_hud(g);
@@ -654,6 +783,16 @@ static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
   Rectangle src = {0.0f, 0.0f, (f32)LOGICAL_W, -(f32)LOGICAL_H};
   Rectangle dst = {(f32)((GetScreenWidth() - w) / 2),
                    (f32)((GetScreenHeight() - h) / 2), (f32)w, (f32)h};
+  // Screen shake on the view texture only, never the camera.
+  // Integer screen-pixel offsets only: fractional dst offsets fight the
+  // point filter + integer scaling and read as blur.
+  if (g->screen_shake > 0.01f) {
+    int range = (int)(g->screen_shake * 2.0f + 0.5f);
+    if (range > 0) {
+      dst.x += (f32)GetRandomValue(-range, range);
+      dst.y += (f32)GetRandomValue(-range, range);
+    }
+  }
   DrawTexturePro(target.texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
   EndDrawing();
 }
@@ -674,6 +813,8 @@ static void client_predict_weapon(GameState *g) {
     g->gun_slide = holding ? def->slide_hold : def->slide_tap;
     g->gun_recoil_velocity += holding ? def->recoil_vel_hold : def->recoil_vel_tap;
     g->gun_rise_velocity += holding ? def->rise_vel_hold : def->rise_vel_tap;
+    // View-texture shake (never the camera) on every shot.
+    g->screen_shake = holding ? 1.0f : 0.7f;
     // True recoil: muzzle climbs, so push the aim up. Same step the server
     // applies to the authoritative pitch on confirmation.
     g->view_pitch = weapon_recoil_pitch(g->view_pitch, wid, holding);

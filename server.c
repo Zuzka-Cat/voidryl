@@ -41,8 +41,12 @@ static void movement_system(GameState *g) {
       dx /= len;
       dz /= len;
     }
-    i16 step_x = (i16)lroundf(dx * 3.0f);
-    i16 step_z = (i16)lroundf(dz * 3.0f);
+    bool aiming = (in->buttons & BTN_AIM) != 0;
+    f32 speed = 3.0f;
+    if (aiming)
+      speed *= weapon_aim_move_scale(g->weapon_id[e]);
+    i16 step_x = (i16)lroundf(dx * speed);
+    i16 step_z = (i16)lroundf(dz * speed);
     g->vx[e] = step_x;
     g->vz[e] = step_z;
     if ((in->buttons & BTN_JUMP) != 0 && g->py[e] == 0)
@@ -159,6 +163,31 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
     dir.z /= len;
   } else {
     dir = f;
+  }
+  // Per-weapon imprecision: slight cone, tighter while aiming.
+  {
+    u8 owner = g->owner[pe];
+    bool aiming = owner < MAX_PLAYERS &&
+                  (g->input[owner].buttons & BTN_AIM) != 0;
+    f32 spread = weapon_spread_deg(g->weapon_id[pe], aiming);
+    if (spread > 0.001f) {
+      u32 h = mix32(g->tick * 2654435761u ^ (u32)pe * 40503u ^
+                    (u32)owner * 65599u ^ (u32)g->weapon_ammo[pe] * 97u ^
+                    0x9e3779b9u);
+      u32 h2 = mix32(h ^ 0x85ebca6bu);
+      f32 u1 = (f32)(h & 0xFFFFu) / 32767.5f - 1.0f;
+      f32 u2 = (f32)(h2 & 0xFFFFu) / 32767.5f - 1.0f;
+      f32 s = spread * DEG2RAD;
+      dir.x += (r.x * u1 + u.x * u2) * s;
+      dir.y += (r.y * u1 + u.y * u2) * s;
+      dir.z += (r.z * u1 + u.z * u2) * s;
+      f32 dlen = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+      if (dlen > 0.001f) {
+        dir.x /= dlen;
+        dir.y /= dlen;
+        dir.z /= dlen;
+      }
+    }
   }
   g->px[e] = (i16)lroundf(muzzle.x * POS_SCALE);
   g->py[e] = (i16)lroundf(muzzle.y * POS_SCALE);
@@ -615,7 +644,7 @@ static void server_receive(GameState *g, int fd) {
     g->input[peer->player].aim_yaw = wrap_degrees(packet.aim_yaw);
     g->input[peer->player].aim_pitch = clamp_i16(packet.aim_pitch, -75, 75);
     g->input[peer->player].buttons =
-        packet.buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP);
+        packet.buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM);
   }
 }
 

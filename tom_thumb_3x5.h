@@ -9,7 +9,6 @@
  * License: CC0 1.0 Universal (public-domain dedication).
  *
  * Each uint16_t stores five 3-bit rows, top row first, in bits 14..0.
- * Glyph order is given by TOM_THUMB_3X5_CHARS. All data is read-only.
  */
 #define TOM_THUMB_3X5_CHARS " !+-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 #define TOM_THUMB_3X5_COUNT 44u

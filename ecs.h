@@ -4,14 +4,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Tiny single-word bitset ECS specialized for Purple Stardust. */
 #define ECS_MAX_ENTITIES 32u
 #define ECS_MAX_COMPONENTS 8u
 #define ECS_INVALID_ENTITY UINT32_MAX
 
 typedef struct ECS {
-  uint64_t mask[ECS_MAX_COMPONENTS]; /* bit e means entity e has component c */
-  uint32_t dead;                     /* reusable ids below count */
+  uint64_t mask[ECS_MAX_COMPONENTS];
+  uint32_t dead;
   uint8_t count;
 } ECS;
 

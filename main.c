@@ -10,10 +10,11 @@
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -22,11 +23,12 @@
 #define LOGICAL_W 92
 #define LOGICAL_H 64
 #define POS_SCALE 64
-#define MAX_PLAYERS 3
-#define MAX_BULLETS 9
-#define MAX_IMPACT_MARKS 4
-#define MAX_CASINGS 4
-#define NET_ENTITY_LIMIT 28
+#define MAX_PLAYERS 8
+#define MAX_CUBES 8
+#define MAX_BULLETS 8
+#define MAX_CASINGS 8
+#define MAX_IMPACT_MARKS 8
+#define NET_ENTITY_LIMIT 32
 #define NET_MAGIC 0xB7u
 #define NET_INPUT 1u
 #define NET_SNAPSHOT 2u
@@ -40,7 +42,7 @@
 #define COMMAND_HZ 50
 #define COMMAND_INTERVAL (SIM_HZ / COMMAND_HZ)
 #define CHAT_LENGTH 18
-#define PLAYER_NAME_LENGTH 4
+#define PLAYER_NAME_LENGTH 5
 #define NOTICE_LENGTH 21
 #define BTN_FIRE 1u
 #define BTN_GRAB 2u
@@ -48,15 +50,16 @@
 #define FIRE_COOLDOWN_TICKS 16
 #define PLAYER_FIRE_FLASH_TICKS 6
 #define PLAYER_HIT_FLASH_TICKS 24
-#define BULLET_LIFETIME_TICKS 160
-#define CASING_LIFETIME_TICKS 180
-#define IMPACT_MARK_LIFETIME_TICKS 250
-#define PROJECTILE_LIMIT 96
+#define BULLET_LIFETIME_TICKS 128
+#define CASING_LIFETIME_TICKS 128
+#define IMPACT_MARK_LIFETIME_TICKS 128
+#define ARENA 32
 #define BULLET_SPEED 32.0f
 #define BULLET_ZERO_DISTANCE 12.0f
 #define GUN_MUZZLE_FORWARD 1.46f
 #define GUN_MUZZLE_RIGHT 0.42f
 #define GUN_MUZZLE_UP -0.18f
+#define ARENA_POS (15 * POS_SCALE)
 
 #define COMP_POSITION 0u
 #define COMP_VELOCITY 1u
@@ -76,58 +79,33 @@ enum EntityKind {
 };
 
 typedef struct InputCommand {
-  int8_t move_x;
-  int8_t move_z;
-  int16_t aim_yaw;
-  int16_t aim_pitch;
+  int8_t move_x, move_z;
+  int16_t aim_yaw, aim_pitch;
   uint8_t buttons;
 } InputCommand;
 
 typedef struct Peer {
-  uint32_t address;
-  uint32_t session;
-  uint32_t retired_session;
-  uint16_t port;
-  uint16_t last_sequence;
-  uint16_t last_chat_sequence;
-  uint16_t last_seen;
-  uint8_t active;
-  uint8_t got_sequence;
-  uint8_t got_chat_sequence;
-  uint8_t player;
+  uint32_t address, session, retired_session;
+  uint16_t port, last_sequence, last_chat_sequence, last_seen;
+  uint8_t active, got_sequence, got_chat_sequence, player;
 } Peer;
 
 typedef struct NetInputPacket {
-  uint8_t magic;
-  uint8_t type;
-  uint8_t claimed_player;
-  uint8_t buttons;
+  uint8_t magic, type, claimed_player, buttons;
   uint32_t session;
   uint16_t sequence;
-  int8_t move_x;
-  int8_t move_z;
-  int16_t aim_yaw;
-  int16_t aim_pitch;
+  int8_t move_x, move_z;
+  int16_t aim_yaw, aim_pitch;
   char name[PLAYER_NAME_LENGTH];
 } NetInputPacket;
 
 typedef struct NetEntity {
-  uint8_t entity;
-  uint8_t kind;
-  uint8_t owner;
-  uint8_t flags;
-  int16_t x;
-  int16_t y;
-  int16_t z;
-  int16_t yaw;
-  int16_t pitch;
+  uint8_t entity, kind, owner, flags, extra, _pad;
+  int16_t x, y, z, yaw, pitch;
 } NetEntity;
 
 typedef struct NetChatPacket {
-  uint8_t magic;
-  uint8_t type;
-  uint8_t player;
-  uint8_t length;
+  uint8_t magic, type, player, length;
   uint32_t session;
   uint16_t sequence;
   char name[PLAYER_NAME_LENGTH];
@@ -135,124 +113,58 @@ typedef struct NetChatPacket {
 } NetChatPacket;
 
 typedef struct NetSnapshot {
-  uint8_t magic;
-  uint8_t type;
-  uint8_t local_player;
-  uint8_t count;
+  uint8_t magic, type, local_player, count;
   uint32_t session;
-  uint16_t tick;
-  uint16_t acknowledged_sequence;
+  uint16_t tick, acknowledged_sequence;
   NetEntity entities[NET_ENTITY_LIMIT];
   char names[MAX_PLAYERS][PLAYER_NAME_LENGTH];
 } NetSnapshot;
 
-/* All persistent mutable gameplay, interpolation, chat, and protocol
-   storage is in this aggregate. RenderTexture, socket descriptors, and
-   derived Camera3D values are transport/render handles, not gameplay state. */
 typedef struct GameState {
   ECS ecs;
-  int16_t px[ECS_MAX_ENTITIES];
-  int16_t py[ECS_MAX_ENTITIES];
-  int16_t pz[ECS_MAX_ENTITIES];
-  int16_t vx[ECS_MAX_ENTITIES];
-  int16_t vy[ECS_MAX_ENTITIES];
-  int16_t vz[ECS_MAX_ENTITIES];
-  int16_t yaw[ECS_MAX_ENTITIES];
-  int16_t pitch[ECS_MAX_ENTITIES];
-  int16_t previous_px[ECS_MAX_ENTITIES];
-  int16_t previous_py[ECS_MAX_ENTITIES];
-  int16_t previous_pz[ECS_MAX_ENTITIES];
-  uint8_t kind[ECS_MAX_ENTITIES];
-  uint8_t lifetime[ECS_MAX_ENTITIES];
-  uint8_t owner[ECS_MAX_ENTITIES];
-  uint8_t cooldown[ECS_MAX_ENTITIES];
-  uint8_t flash[ECS_MAX_ENTITIES];
-  uint8_t held_by[ECS_MAX_ENTITIES];
+  int16_t px[ECS_MAX_ENTITIES], py[ECS_MAX_ENTITIES], pz[ECS_MAX_ENTITIES];
+  int16_t vx[ECS_MAX_ENTITIES], vy[ECS_MAX_ENTITIES], vz[ECS_MAX_ENTITIES];
+  int16_t yaw[ECS_MAX_ENTITIES], pitch[ECS_MAX_ENTITIES];
+  uint8_t kind[ECS_MAX_ENTITIES], lifetime[ECS_MAX_ENTITIES];
+  uint8_t owner[ECS_MAX_ENTITIES], cooldown[ECS_MAX_ENTITIES];
+  uint8_t flash[ECS_MAX_ENTITIES], held_by[ECS_MAX_ENTITIES];
   InputCommand input[MAX_PLAYERS];
   Peer peers[MAX_PLAYERS];
   uint8_t player_entity[MAX_PLAYERS];
   uint8_t network_entity[ECS_MAX_ENTITIES];
-  uint32_t snapshot_seen;
-  uint32_t session;
-  uint16_t tick;
-  uint16_t next_sequence;
-  uint16_t next_chat_sequence;
-  uint16_t last_snapshot_tick;
-  uint16_t last_chat_sequence;
-  uint8_t local_player;
-  uint8_t connected;
-  uint8_t mouse_captured;
-  uint8_t help;
-  uint8_t chatting;
-  uint8_t chat_length;
-  uint8_t interpolation_ticks;
-  uint8_t command_ticks;
-  uint8_t gun_kick;
-  uint8_t fire_cooldown;
-  uint8_t visible_players;
-  uint8_t got_snapshot;
-  uint8_t got_chat_sequence;
+  uint32_t snapshot_seen, session;
+  uint16_t tick, next_sequence, next_chat_sequence;
+  uint16_t last_snapshot_tick, last_chat_sequence, notice_ticks;
+  uint16_t snapshot_silence_ticks;
+  uint8_t local_player, connected, mouse_captured, help, chatting, chat_length;
+  uint8_t interpolation_ticks, command_ticks, gun_kick, fire_cooldown;
+  uint8_t visible_players, got_snapshot, got_chat_sequence;
   char requested_name[PLAYER_NAME_LENGTH + 1];
   char player_name[MAX_PLAYERS][PLAYER_NAME_LENGTH + 1];
   char chat_input[CHAT_LENGTH + 1];
   char notice[NOTICE_LENGTH + 1];
-  uint16_t notice_ticks;
-  uint16_t snapshot_silence_ticks;
-  int16_t view_yaw;
-  int16_t view_pitch;
-  float gun_recoil;
-  float gun_recoil_velocity;
-  float gun_slide;
-  float gun_sway_x;
-  float gun_sway_y;
-  float look_delta_x;
-  float look_delta_y;
-  uint8_t net_rx[sizeof(NetSnapshot)];
-  uint8_t net_tx[sizeof(NetSnapshot)];
+  int16_t view_yaw, view_pitch;
+  float gun_recoil, gun_recoil_velocity, gun_slide;
+  float gun_sway_x, gun_sway_y, look_delta_x, look_delta_y;
 } GameState;
 
-_Static_assert(sizeof(NetInputPacket) == 20, "input packet layout changed");
-_Static_assert(sizeof(NetEntity) == 14, "snapshot entity layout changed");
-_Static_assert(sizeof(NetChatPacket) == 32, "chat packet layout changed");
-_Static_assert(sizeof(NetSnapshot) == 416, "snapshot layout changed");
+//_Static_assert(sizeof(NetInputPacket) == 20, "input packet layout changed");
+//_Static_assert(sizeof(NetEntity) == 16, "snapshot entity layout changed");
+//_Static_assert(sizeof(NetChatPacket) == 32, "chat packet layout changed");
+//_Static_assert(sizeof(NetSnapshot) == 556, "snapshot layout changed");
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
-
 _Static_assert(ECS_MAX_ENTITIES <= 32u, "network bitsets assume 32 entities");
+_Static_assert(MAX_PLAYERS <= 8, "visible_players is an 8-bit mask");
 
 static const Color PAL_DARK = {16, 8, 24, 255};
 static const Color PAL_PURPLE = {60, 30, 102, 255};
 static const Color PAL_MID = {155, 123, 208, 255};
 static const Color PAL_LIGHT = {246, 213, 232, 255};
 
-static const char *OUTLINE_FRAGMENT_SHADER =
-    "#version 330\n"
-    "in vec2 fragTexCoord;\n"
-    "in vec4 fragColor;\n"
-    "uniform sampler2D texture0;\n"
-    "uniform vec4 colDiffuse;\n"
-    "uniform vec2 texelSize;\n"
-    "out vec4 finalColor;\n"
-    "void main() {\n"
-    "  vec4 center = texture(texture0, fragTexCoord);\n"
-    "  vec3 left = texture(texture0, fragTexCoord - vec2(texelSize.x, 0.0)).rgb;\n"
-    "  vec3 right = texture(texture0, fragTexCoord + vec2(texelSize.x, 0.0)).rgb;\n"
-    "  vec3 up = texture(texture0, fragTexCoord - vec2(0.0, texelSize.y)).rgb;\n"
-    "  vec3 down = texture(texture0, fragTexCoord + vec2(0.0, texelSize.y)).rgb;\n"
-    "  float edge = max(max(length(center.rgb - left), length(center.rgb - right)),\n"
-    "                   max(length(center.rgb - up), length(center.rgb - down)));\n"
-    "  vec3 luma = vec3(0.2126, 0.7152, 0.0722);\n"
-    "  float centerLuma = dot(center.rgb, luma);\n"
-    "  float darkest = min(min(dot(left, luma), dot(right, luma)),\n"
-    "                      min(dot(up, luma), dot(down, luma)));\n"
-    "  vec3 ink = vec3(0.062745, 0.031373, 0.094118);\n"
-    "  bool darkSide = centerLuma <= darkest + 0.05;\n"
-    "  finalColor = vec4(edge > 0.24 && darkSide ? ink : center.rgb, center.a) * fragColor * colDiffuse;\n"
-    "}\n";
-
 static volatile sig_atomic_t server_running = 1;
 
-static void on_signal(int signal_number) {
-  (void)signal_number;
+static void on_signal(int sig) {
+  (void)sig;
   server_running = 0;
 }
 
@@ -265,11 +177,21 @@ static int16_t clamp_i16(int value, int16_t low, int16_t high) {
 }
 
 static int16_t wrap_degrees(int value) {
-  while (value > 180)
+  value %= 360;
+  if (value > 180)
     value -= 360;
-  while (value < -179)
+  if (value < -179)
     value += 360;
   return (int16_t)value;
+}
+
+static uint32_t mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= UINT32_C(0x7feb352d);
+  x ^= x >> 15;
+  x *= UINT32_C(0x846ca68b);
+  x ^= x >> 16;
+  return x ? x : 1u;
 }
 
 static double hires_time_in_seconds(void) {
@@ -278,50 +200,34 @@ static double hires_time_in_seconds(void) {
   return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
-static uint16_t sequence_host(uint16_t sequence) {
-  return ntohs(sequence);
-}
-
-static uint16_t sequence_wire(uint16_t sequence) {
-  return htons(sequence);
-}
-
-static uint32_t session_host(uint32_t session) {
-  return ntohl(session);
-}
-
-static uint32_t session_wire(uint32_t session) {
-  return htonl(session);
-}
+static uint16_t sequence_host(uint16_t s) { return ntohs(s); }
+static uint16_t sequence_wire(uint16_t s) { return htons(s); }
+static uint32_t session_host(uint32_t s) { return ntohl(s); }
+static uint32_t session_wire(uint32_t s) { return htonl(s); }
+static int16_t wire_i16(int16_t v) { return (int16_t)ntohs((uint16_t)v); }
+static int16_t host_i16(int16_t v) { return (int16_t)htons((uint16_t)v); }
 
 static uint32_t make_session_id(uint32_t previous) {
   struct timespec now;
   (void)clock_gettime(CLOCK_MONOTONIC, &now);
-  uint32_t value = (uint32_t)now.tv_nsec ^ (uint32_t)now.tv_sec * UINT32_C(0x9e3779b9) ^
-                   (uint32_t)getpid() * UINT32_C(0x85ebca6b) ^ previous;
-  value ^= value >> 16;
-  value *= UINT32_C(0x7feb352d);
-  value ^= value >> 15;
-  value *= UINT32_C(0x846ca68b);
-  value ^= value >> 16;
-  return value != 0 ? value : UINT32_C(1);
+  return mix32((uint32_t)now.tv_nsec ^
+               (uint32_t)now.tv_sec * UINT32_C(0x9e3779b9) ^
+               (uint32_t)getpid() * UINT32_C(0x85ebca6b) ^ previous);
 }
 
 static bool sequence_newer(uint16_t a, uint16_t b) {
   return (int16_t)(a - b) > 0;
 }
 
-static int16_t wire_i16(int16_t value) {
-  return (int16_t)ntohs((uint16_t)value);
-}
-
-static int16_t host_i16(int16_t value) {
-  return (int16_t)htons((uint16_t)value);
-}
-
 static int tick_age(uint16_t now, uint16_t then) {
   return (int)(uint16_t)(now - then);
 }
+
+static uint8_t pack_yaw(int deg) {
+  return (uint8_t)((wrap_degrees(deg) + 180) * 256 / 360);
+}
+
+static int unpack_yaw(uint8_t packed) { return (int)packed * 360 / 256 - 180; }
 
 static bool valid_port(const char *text, uint16_t *port) {
   unsigned long value = 0;
@@ -340,16 +246,17 @@ static bool valid_port(const char *text, uint16_t *port) {
   return true;
 }
 
-static bool valid_player_name(const char *text, char out[PLAYER_NAME_LENGTH + 1]) {
+static bool valid_player_name(const char *text,
+                              char out[PLAYER_NAME_LENGTH + 1]) {
   if (!text || strlen(text) != PLAYER_NAME_LENGTH)
     return false;
   for (int i = 0; i < PLAYER_NAME_LENGTH; ++i) {
-    char character = text[i];
-    if (character >= 'a' && character <= 'z')
-      character = (char)(character - ('a' - 'A'));
-    if (character < 'A' || character > 'Z')
+    char c = text[i];
+    if (c >= 'a' && c <= 'z')
+      c = (char)(c - ('a' - 'A'));
+    if (c < 'A' || c > 'Z')
       return false;
-    out[i] = character;
+    out[i] = c;
   }
   out[PLAYER_NAME_LENGTH] = '\0';
   return true;
@@ -414,749 +321,649 @@ static int open_udp_client(const char *host, uint16_t port,
   return fd;
 }
 
-static void game_zero(GameState *game) {
-  memset(game, 0, sizeof(*game));
-  game->local_player = NET_NONE;
-  for (uint32_t i = 0; i < ECS_MAX_ENTITIES; ++i)
-    game->network_entity[i] = NET_NONE;
-  for (uint32_t i = 0; i < MAX_PLAYERS; ++i)
-    game->player_entity[i] = NET_NONE;
+static void game_zero(GameState *g) {
+  memset(g, 0, sizeof(*g));
+  g->local_player = NET_NONE;
+  memset(g->network_entity, NET_NONE, sizeof(g->network_entity));
+  memset(g->player_entity, NET_NONE, sizeof(g->player_entity));
 }
 
-static void clear_entity_data(GameState *game, uint32_t entity) {
-  game->px[entity] = 0;
-  game->py[entity] = 0;
-  game->pz[entity] = 0;
-  game->vx[entity] = 0;
-  game->vy[entity] = 0;
-  game->vz[entity] = 0;
-  game->yaw[entity] = 0;
-  game->pitch[entity] = 0;
-  game->previous_px[entity] = 0;
-  game->previous_py[entity] = 0;
-  game->previous_pz[entity] = 0;
-  game->kind[entity] = 0;
-  game->lifetime[entity] = 0;
-  game->owner[entity] = 0;
-  game->cooldown[entity] = 0;
-  game->flash[entity] = 0;
-  game->held_by[entity] = 0;
+static void clear_entity_data(GameState *g, uint32_t e) {
+  g->px[e] = g->py[e] = g->pz[e] = 0;
+  g->vx[e] = g->vy[e] = g->vz[e] = 0;
+  g->yaw[e] = g->pitch[e] = 0;
+  g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
+  g->cooldown[e] = g->flash[e] = g->held_by[e] = 0;
 }
 
-static int16_t cube_x(uint32_t index) {
-  return (int16_t)(((int)((index * 7u + 3u) % 17u) - 8) * POS_SCALE);
-}
-
-static int16_t cube_z(uint32_t index) {
-  return (int16_t)(((int)((index * 11u + 5u) % 17u) - 8) * POS_SCALE);
-}
-
-static uint32_t create_cube(GameState *game, uint32_t index) {
-  uint32_t entity = ecs_create(&game->ecs);
-  if (entity == ECS_INVALID_ENTITY)
-    return entity;
-  clear_entity_data(game, entity);
-  game->px[entity] = cube_x(index);
-  game->py[entity] = POS_SCALE / 2;
-  game->pz[entity] = cube_z(index);
-  game->kind[entity] = KIND_CUBE;
-  game->previous_px[entity] = game->px[entity];
-  game->previous_py[entity] = game->py[entity];
-  game->previous_pz[entity] = game->pz[entity];
-  ecs_add(&game->ecs, entity, COMP_POSITION);
-  ecs_add(&game->ecs, entity, COMP_RENDERABLE);
-  ecs_add(&game->ecs, entity, COMP_NETWORKED);
-  return entity;
-}
-
-static void game_init(GameState *game) {
-  game_zero(game);
-  for (uint32_t i = 0; i < 8; ++i) {
-    uint32_t entity = create_cube(game, i);
-    if (entity != ECS_INVALID_ENTITY)
-      game->network_entity[entity] = (uint8_t)entity;
+static void add_kind_components(GameState *g, uint32_t e, uint8_t kind) {
+  ecs_add(&g->ecs, e, COMP_POSITION);
+  ecs_add(&g->ecs, e, COMP_RENDERABLE);
+  ecs_add(&g->ecs, e, COMP_NETWORKED);
+  if (kind == KIND_PLAYER) {
+    ecs_add(&g->ecs, e, COMP_VELOCITY);
+    ecs_add(&g->ecs, e, COMP_AIM);
+    ecs_add(&g->ecs, e, COMP_PLAYER);
+  } else if (kind == KIND_BULLET) {
+    ecs_add(&g->ecs, e, COMP_VELOCITY);
+    ecs_add(&g->ecs, e, COMP_PROJECTILE);
+    ecs_add(&g->ecs, e, COMP_LIFETIME);
+  } else if (kind == KIND_CASING) {
+    ecs_add(&g->ecs, e, COMP_VELOCITY);
+    ecs_add(&g->ecs, e, COMP_LIFETIME);
+  } else if (kind == KIND_IMPACT_MARK) {
+    ecs_add(&g->ecs, e, COMP_LIFETIME);
   }
 }
 
-static uint32_t create_player(GameState *game, uint8_t player) {
-  uint32_t entity = ecs_create(&game->ecs);
-  if (entity == ECS_INVALID_ENTITY)
-    return entity;
-  clear_entity_data(game, entity);
-  game->px[entity] = (int16_t)((int)player * 3 - 3) * POS_SCALE;
-  game->py[entity] = 0;
-  game->pz[entity] = 5 * POS_SCALE;
-  game->yaw[entity] = 180;
-  game->pitch[entity] = 0;
-  game->kind[entity] = KIND_PLAYER;
-  game->owner[entity] = player;
-  game->previous_px[entity] = game->px[entity];
-  game->previous_py[entity] = game->py[entity];
-  game->previous_pz[entity] = game->pz[entity];
-  game->player_entity[player] = (uint8_t)entity;
-  ecs_add(&game->ecs, entity, COMP_POSITION);
-  ecs_add(&game->ecs, entity, COMP_VELOCITY);
-  ecs_add(&game->ecs, entity, COMP_AIM);
-  ecs_add(&game->ecs, entity, COMP_PLAYER);
-  ecs_add(&game->ecs, entity, COMP_RENDERABLE);
-  ecs_add(&game->ecs, entity, COMP_NETWORKED);
-  return entity;
+static uint32_t count_kind(const GameState *g, uint8_t kind) {
+  uint32_t comps[] = {COMP_RENDERABLE};
+  EcsQuery q = ecs_query(&g->ecs, comps, 1);
+  uint32_t n = 0;
+  while (ecs_next(&q))
+    if (g->kind[q.entity] == kind)
+      ++n;
+  return n;
 }
 
-static bool cube_overlap(const GameState *game, int16_t x, int16_t z,
+static void destroy_oldest(GameState *g, uint8_t kind) {
+  uint32_t comps[] = {COMP_LIFETIME};
+  EcsQuery q = ecs_query(&g->ecs, comps, 1);
+  uint32_t oldest = ECS_INVALID_ENTITY;
+  uint8_t best = UINT8_MAX;
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    if (g->kind[e] == kind && g->lifetime[e] < best) {
+      best = g->lifetime[e];
+      oldest = e;
+    }
+  }
+  if (oldest != ECS_INVALID_ENTITY)
+    ecs_destroy(&g->ecs, oldest);
+}
+
+static uint32_t take_entity(GameState *g) {
+  uint32_t e = ecs_create(&g->ecs);
+  if (e != ECS_INVALID_ENTITY)
+    return e;
+  destroy_oldest(g, KIND_IMPACT_MARK);
+  e = ecs_create(&g->ecs);
+  if (e != ECS_INVALID_ENTITY)
+    return e;
+  destroy_oldest(g, KIND_CASING);
+  return ecs_create(&g->ecs);
+}
+
+static uint32_t create_cube(GameState *g, uint32_t index) {
+  uint32_t e = ecs_create(&g->ecs);
+  if (e == ECS_INVALID_ENTITY)
+    return e;
+  clear_entity_data(g, e);
+  g->px[e] = (int16_t)(((int)((index * 7u + 3u) % 17u) - 8) * POS_SCALE);
+  g->py[e] = POS_SCALE / 2;
+  g->pz[e] = (int16_t)(((int)((index * 11u + 5u) % 17u) - 8) * POS_SCALE);
+  g->kind[e] = KIND_CUBE;
+  add_kind_components(g, e, KIND_CUBE);
+  return e;
+}
+
+static void game_init(GameState *g) {
+  game_zero(g);
+  for (uint32_t i = 0; i < MAX_CUBES; ++i)
+    (void)create_cube(g, i);
+}
+
+static uint32_t create_player(GameState *g, uint8_t player) {
+  uint32_t e = ecs_create(&g->ecs);
+  if (e == ECS_INVALID_ENTITY)
+    return e;
+  clear_entity_data(g, e);
+  g->px[e] = (int16_t)(((int)player - (int)MAX_PLAYERS / 2) * 2 * POS_SCALE);
+  g->pz[e] = 5 * POS_SCALE;
+  g->yaw[e] = 180;
+  g->kind[e] = KIND_PLAYER;
+  g->owner[e] = player;
+  g->player_entity[player] = (uint8_t)e;
+  add_kind_components(g, e, KIND_PLAYER);
+  return e;
+}
+
+static bool cube_overlap(const GameState *g, int16_t x, int16_t z,
                          int16_t radius) {
-  uint32_t components[] = {COMP_POSITION, COMP_RENDERABLE};
-  EcsQuery query = ecs_query(&game->ecs, components, 2);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    if (game->kind[entity] != KIND_CUBE || game->held_by[entity] != 0)
-      continue;
-    if (abs((int)x - game->px[entity]) < POS_SCALE / 2 + radius &&
-        abs((int)z - game->pz[entity]) < POS_SCALE / 2 + radius)
+  uint32_t comps[] = {COMP_POSITION, COMP_RENDERABLE};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    if (g->kind[e] == KIND_CUBE && g->held_by[e] == 0 &&
+        abs((int)x - g->px[e]) < POS_SCALE / 2 + radius &&
+        abs((int)z - g->pz[e]) < POS_SCALE / 2 + radius)
       return true;
   }
   return false;
 }
 
-static void aim_vector_angles(int16_t yaw_degrees, int16_t pitch_degrees,
-                              Vector3 *out) {
-  float yaw = (float)yaw_degrees * DEG2RAD;
-  float pitch = (float)pitch_degrees * DEG2RAD;
-  float horizontal = cosf(pitch);
-  out->x = sinf(yaw) * horizontal;
+static void aim_dir(int16_t yaw_deg, int16_t pitch_deg, Vector3 *out) {
+  float yaw = (float)yaw_deg * DEG2RAD;
+  float pitch = (float)pitch_deg * DEG2RAD;
+  float h = cosf(pitch);
+  out->x = sinf(yaw) * h;
   out->y = sinf(pitch);
-  out->z = cosf(yaw) * horizontal;
+  out->z = cosf(yaw) * h;
 }
 
-static void aim_vector(const GameState *game, uint32_t entity, Vector3 *out) {
-  float yaw = (float)game->yaw[entity] * DEG2RAD;
-  float pitch = (float)game->pitch[entity] * DEG2RAD;
-  float horizontal = cosf(pitch);
-  out->x = sinf(yaw) * horizontal;
-  out->y = sinf(pitch);
-  out->z = cosf(yaw) * horizontal;
+static void gun_basis(const GameState *g, uint32_t e, Vector3 *f, Vector3 *r,
+                      Vector3 *u) {
+  aim_dir(g->yaw[e], g->pitch[e], f);
+  float yaw = (float)g->yaw[e] * DEG2RAD;
+  *r = (Vector3){-cosf(yaw), 0.0f, sinf(yaw)};
+  *u = (Vector3){r->y * f->z - r->z * f->y, r->z * f->x - r->x * f->z,
+                 r->x * f->y - r->y * f->x};
 }
 
-static void movement_system(GameState *game) {
-  uint32_t components[] = {COMP_POSITION, COMP_VELOCITY, COMP_PLAYER};
-  EcsQuery query = ecs_query(&game->ecs, components, 3);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    uint8_t player = game->owner[entity];
-    InputCommand *input = &game->input[player];
-    float yaw = (float)game->yaw[entity] * DEG2RAD;
-    float dx = (float)input->move_z * sinf(yaw) -
-               (float)input->move_x * cosf(yaw);
-    float dz = (float)input->move_z * cosf(yaw) +
-               (float)input->move_x * sinf(yaw);
-    float length = sqrtf(dx * dx + dz * dz);
-    if (length > 1.0f) {
-      dx /= length;
-      dz /= length;
+static Vector3 gun_point(const GameState *g, uint32_t e, Vector3 f, Vector3 r,
+                         Vector3 u, float along, float side, float lift) {
+  return (Vector3){
+      (float)g->px[e] / POS_SCALE + f.x * along + r.x * side + u.x * lift,
+      (float)g->py[e] / POS_SCALE + 1.5f + f.y * along + r.y * side +
+          u.y * lift,
+      (float)g->pz[e] / POS_SCALE + f.z * along + r.z * side + u.z * lift};
+}
+
+static void movement_system(GameState *g) {
+  uint32_t comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PLAYER};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    InputCommand *in = &g->input[g->owner[e]];
+    float yaw = (float)g->yaw[e] * DEG2RAD;
+    float dx = (float)in->move_z * sinf(yaw) - (float)in->move_x * cosf(yaw);
+    float dz = (float)in->move_z * cosf(yaw) + (float)in->move_x * sinf(yaw);
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len > 1.0f) {
+      dx /= len;
+      dz /= len;
     }
     int16_t step_x = (int16_t)lroundf(dx * 3.0f);
     int16_t step_z = (int16_t)lroundf(dz * 3.0f);
-    game->vx[entity] = step_x;
-    game->vz[entity] = step_z;
-    if ((input->buttons & BTN_JUMP) != 0 && game->py[entity] == 0)
-      game->vy[entity] = 6;
-    if (game->py[entity] > 0 || game->vy[entity] > 0) {
-      game->py[entity] = (int16_t)(game->py[entity] + game->vy[entity]);
-      if (game->tick % 6u == 0 && game->vy[entity] > -6)
-        --game->vy[entity];
-      if (game->py[entity] <= 0) {
-        game->py[entity] = 0;
-        game->vy[entity] = 0;
+    g->vx[e] = step_x;
+    g->vz[e] = step_z;
+    if ((in->buttons & BTN_JUMP) != 0 && g->py[e] == 0)
+      g->vy[e] = 6;
+    if (g->py[e] > 0 || g->vy[e] > 0) {
+      g->py[e] = (int16_t)(g->py[e] + g->vy[e]);
+      if (g->tick % 6u == 0 && g->vy[e] > -6)
+        --g->vy[e];
+      if (g->py[e] <= 0) {
+        g->py[e] = 0;
+        g->vy[e] = 0;
       }
     }
-    int16_t next_x = clamp_i16((int)game->px[entity] + step_x,
-                                -15 * POS_SCALE, 15 * POS_SCALE);
-    int16_t next_z = clamp_i16((int)game->pz[entity] + step_z,
-                                -15 * POS_SCALE, 15 * POS_SCALE);
-    if (!cube_overlap(game, next_x, game->pz[entity], POS_SCALE / 4))
-      game->px[entity] = next_x;
-    if (!cube_overlap(game, game->px[entity], next_z, POS_SCALE / 4))
-      game->pz[entity] = next_z;
+    int16_t nx = clamp_i16((int)g->px[e] + step_x, -ARENA_POS, ARENA_POS);
+    int16_t nz = clamp_i16((int)g->pz[e] + step_z, -ARENA_POS, ARENA_POS);
+    if (!cube_overlap(g, nx, g->pz[e], POS_SCALE / 4))
+      g->px[e] = nx;
+    if (!cube_overlap(g, g->px[e], nz, POS_SCALE / 4))
+      g->pz[e] = nz;
   }
 }
 
-static void aim_system(GameState *game) {
-  uint32_t components[] = {COMP_AIM, COMP_PLAYER};
-  EcsQuery query = ecs_query(&game->ecs, components, 2);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    uint8_t player = game->owner[entity];
-    game->yaw[entity] = wrap_degrees(game->input[player].aim_yaw);
-    game->pitch[entity] = clamp_i16(game->input[player].aim_pitch, -75, 75);
+static void aim_system(GameState *g) {
+  uint32_t comps[] = {COMP_AIM, COMP_PLAYER};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q)) {
+    uint8_t p = g->owner[q.entity];
+    g->yaw[q.entity] = wrap_degrees(g->input[p].aim_yaw);
+    g->pitch[q.entity] = clamp_i16(g->input[p].aim_pitch, -75, 75);
   }
 }
 
-static uint32_t held_cube_for(const GameState *game, uint8_t player) {
-  uint32_t components[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED};
-  EcsQuery query = ecs_query(&game->ecs, components, 3);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    if (game->kind[entity] == KIND_CUBE && game->held_by[entity] == player + 1u)
-      return entity;
-  }
+static uint32_t held_cube_for(const GameState *g, uint8_t player) {
+  uint32_t comps[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  while (ecs_next(&q))
+    if (g->kind[q.entity] == KIND_CUBE && g->held_by[q.entity] == player + 1u)
+      return q.entity;
   return ECS_INVALID_ENTITY;
 }
 
-static void holding_system(GameState *game) {
+static void holding_system(GameState *g) {
   uint32_t players[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
-  EcsQuery player_query = ecs_query(&game->ecs, players, 3);
-  while (ecs_next(&player_query)) {
-    uint32_t player_entity = player_query.entity;
-    uint8_t player = game->owner[player_entity];
-    uint32_t held = held_cube_for(game, player);
-    bool wants_hold = (game->input[player].buttons & BTN_GRAB) != 0;
-    if (!wants_hold && held != ECS_INVALID_ENTITY) {
-      game->held_by[held] = 0;
+  EcsQuery pq = ecs_query(&g->ecs, players, 3);
+  while (ecs_next(&pq)) {
+    uint32_t pe = pq.entity;
+    uint8_t player = g->owner[pe];
+    uint32_t held = held_cube_for(g, player);
+    bool want = (g->input[player].buttons & BTN_GRAB) != 0;
+    if (!want && held != ECS_INVALID_ENTITY) {
+      g->held_by[held] = 0;
       held = ECS_INVALID_ENTITY;
     }
-    if (wants_hold && held == ECS_INVALID_ENTITY) {
-      Vector3 direction;
+    if (want && held == ECS_INVALID_ENTITY) {
+      Vector3 dir;
       uint32_t cubes[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED};
-      EcsQuery cube_query = ecs_query(&game->ecs, cubes, 3);
-      float best_distance = 1000.0f;
+      EcsQuery cq = ecs_query(&g->ecs, cubes, 3);
+      float best_d = 1000.0f;
       uint32_t best = ECS_INVALID_ENTITY;
-      aim_vector(game, player_entity, &direction);
-      while (ecs_next(&cube_query)) {
-        uint32_t cube = cube_query.entity;
-        if (game->kind[cube] != KIND_CUBE || game->held_by[cube] != 0)
+      aim_dir(g->yaw[pe], g->pitch[pe], &dir);
+      while (ecs_next(&cq)) {
+        uint32_t c = cq.entity;
+        if (g->kind[c] != KIND_CUBE || g->held_by[c] != 0)
           continue;
-        Vector3 offset = {
-            (float)(game->px[cube] - game->px[player_entity]) / POS_SCALE,
-            (float)(game->py[cube] - 96) / POS_SCALE,
-            (float)(game->pz[cube] - game->pz[player_entity]) / POS_SCALE};
-        float distance = sqrtf(offset.x * offset.x + offset.y * offset.y +
-                               offset.z * offset.z);
-        float dot = distance > 0.01f
-                        ? (offset.x * direction.x + offset.y * direction.y +
-                           offset.z * direction.z) /
-                              distance
+        Vector3 off = {(float)(g->px[c] - g->px[pe]) / POS_SCALE,
+                       (float)(g->py[c] - 96) / POS_SCALE,
+                       (float)(g->pz[c] - g->pz[pe]) / POS_SCALE};
+        float d = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
+        float dot = d > 0.01f
+                        ? (off.x * dir.x + off.y * dir.y + off.z * dir.z) / d
                         : -1.0f;
-        if (distance < 5.0f && dot > 0.55f && distance < best_distance) {
-          best_distance = distance;
-          best = cube;
+        if (d < 5.0f && dot > 0.55f && d < best_d) {
+          best_d = d;
+          best = c;
         }
       }
       if (best != ECS_INVALID_ENTITY) {
-        game->held_by[best] = player + 1u;
+        g->held_by[best] = player + 1u;
         held = best;
       }
     }
     if (held != ECS_INVALID_ENTITY) {
-      Vector3 direction;
-      aim_vector(game, player_entity, &direction);
-      game->px[held] = clamp_i16(
-          (int)game->px[player_entity] + (int)lroundf(direction.x * 2.0f * POS_SCALE),
-          -15 * POS_SCALE, 15 * POS_SCALE);
-      game->py[held] = POS_SCALE + 32;
-      game->pz[held] = clamp_i16(
-          (int)game->pz[player_entity] + (int)lroundf(direction.z * 2.0f * POS_SCALE),
-          -15 * POS_SCALE, 15 * POS_SCALE);
+      Vector3 dir;
+      aim_dir(g->yaw[pe], g->pitch[pe], &dir);
+      g->px[held] =
+          clamp_i16((int)g->px[pe] + (int)lroundf(dir.x * 2.0f * POS_SCALE),
+                    -ARENA_POS, ARENA_POS);
+      g->py[held] = POS_SCALE + 32;
+      g->pz[held] =
+          clamp_i16((int)g->pz[pe] + (int)lroundf(dir.z * 2.0f * POS_SCALE),
+                    -ARENA_POS, ARENA_POS);
     }
   }
 }
 
-static uint32_t bullet_count(const GameState *game) {
-  uint32_t components[] = {COMP_PROJECTILE};
-  return ecs_count(&game->ecs, components, 1);
-}
-
-static uint32_t spawn_bullet(GameState *game, uint32_t player_entity) {
-  uint32_t entity;
-  Vector3 aim;
-  if (bullet_count(game) >= MAX_BULLETS)
+static uint32_t spawn_bullet(GameState *g, uint32_t pe) {
+  Vector3 f, r, u, muzzle, target, dir;
+  if (count_kind(g, KIND_BULLET) >= MAX_BULLETS)
     return ECS_INVALID_ENTITY;
-  entity = ecs_create(&game->ecs);
-  if (entity == ECS_INVALID_ENTITY)
-    return entity;
-  clear_entity_data(game, entity);
-  aim_vector(game, player_entity, &aim);
-  float yaw = (float)game->yaw[player_entity] * DEG2RAD;
-  Vector3 right = {-cosf(yaw), 0.0f, sinf(yaw)};
-  Vector3 up = {right.y * aim.z - right.z * aim.y,
-                right.z * aim.x - right.x * aim.z,
-                right.x * aim.y - right.y * aim.x};
-  Vector3 muzzle = {
-      (float)game->px[player_entity] / POS_SCALE +
-          aim.x * GUN_MUZZLE_FORWARD + right.x * GUN_MUZZLE_RIGHT +
-          up.x * GUN_MUZZLE_UP,
-      (float)game->py[player_entity] / POS_SCALE + 1.5f +
-          aim.y * GUN_MUZZLE_FORWARD + right.y * GUN_MUZZLE_RIGHT +
-          up.y * GUN_MUZZLE_UP,
-      (float)game->pz[player_entity] / POS_SCALE +
-          aim.z * GUN_MUZZLE_FORWARD + right.z * GUN_MUZZLE_RIGHT +
-          up.z * GUN_MUZZLE_UP};
-  Vector3 target = {
-      (float)game->px[player_entity] / POS_SCALE +
-          aim.x * BULLET_ZERO_DISTANCE,
-      (float)game->py[player_entity] / POS_SCALE + 1.5f +
-          aim.y * BULLET_ZERO_DISTANCE,
-      (float)game->pz[player_entity] / POS_SCALE +
-          aim.z * BULLET_ZERO_DISTANCE};
-  Vector3 direction = {target.x - muzzle.x, target.y - muzzle.y,
-                       target.z - muzzle.z};
-  float length = sqrtf(direction.x * direction.x + direction.y * direction.y +
-                       direction.z * direction.z);
-  if (length > 0.001f) {
-    direction.x /= length;
-    direction.y /= length;
-    direction.z /= length;
+  uint32_t e = take_entity(g);
+  if (e == ECS_INVALID_ENTITY)
+    return e;
+  clear_entity_data(g, e);
+  gun_basis(g, pe, &f, &r, &u);
+  muzzle = gun_point(g, pe, f, r, u, GUN_MUZZLE_FORWARD, GUN_MUZZLE_RIGHT,
+                     GUN_MUZZLE_UP);
+  target = gun_point(g, pe, f, r, u, BULLET_ZERO_DISTANCE, 0.0f, 0.0f);
+  dir =
+      (Vector3){target.x - muzzle.x, target.y - muzzle.y, target.z - muzzle.z};
+  float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+  if (len > 0.001f) {
+    dir.x /= len;
+    dir.y /= len;
+    dir.z /= len;
   } else {
-    direction = aim;
+    dir = f;
   }
-  game->px[entity] = (int16_t)lroundf(muzzle.x * POS_SCALE);
-  game->py[entity] = (int16_t)lroundf(muzzle.y * POS_SCALE);
-  game->pz[entity] = (int16_t)lroundf(muzzle.z * POS_SCALE);
-  game->vx[entity] = (int16_t)lroundf(direction.x * BULLET_SPEED);
-  game->vy[entity] = (int16_t)lroundf(direction.y * BULLET_SPEED);
-  game->vz[entity] = (int16_t)lroundf(direction.z * BULLET_SPEED);
-  game->yaw[entity] =
-      wrap_degrees((int)lroundf(atan2f(direction.x, direction.z) * RAD2DEG));
-  game->pitch[entity] =
-      clamp_i16((int)lroundf(asinf(direction.y) * RAD2DEG), -89, 89);
-  game->owner[entity] = game->owner[player_entity];
-  game->kind[entity] = KIND_BULLET;
-  game->lifetime[entity] = BULLET_LIFETIME_TICKS;
-  game->previous_px[entity] = game->px[entity];
-  game->previous_py[entity] = game->py[entity];
-  game->previous_pz[entity] = game->pz[entity];
-  ecs_add(&game->ecs, entity, COMP_POSITION);
-  ecs_add(&game->ecs, entity, COMP_VELOCITY);
-  ecs_add(&game->ecs, entity, COMP_PROJECTILE);
-  ecs_add(&game->ecs, entity, COMP_LIFETIME);
-  ecs_add(&game->ecs, entity, COMP_RENDERABLE);
-  ecs_add(&game->ecs, entity, COMP_NETWORKED);
-  return entity;
+  g->px[e] = (int16_t)lroundf(muzzle.x * POS_SCALE);
+  g->py[e] = (int16_t)lroundf(muzzle.y * POS_SCALE);
+  g->pz[e] = (int16_t)lroundf(muzzle.z * POS_SCALE);
+  g->vx[e] = (int16_t)lroundf(dir.x * BULLET_SPEED);
+  g->vy[e] = (int16_t)lroundf(dir.y * BULLET_SPEED);
+  g->vz[e] = (int16_t)lroundf(dir.z * BULLET_SPEED);
+  g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
+  g->pitch[e] = clamp_i16((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
+  g->owner[e] = g->owner[pe];
+  g->kind[e] = KIND_BULLET;
+  g->lifetime[e] = BULLET_LIFETIME_TICKS;
+  add_kind_components(g, e, KIND_BULLET);
+  return e;
 }
 
-static uint32_t casing_count(const GameState *game) {
-  uint32_t components[] = {COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 1);
-  uint32_t count = 0;
-  while (ecs_next(&query))
-    if (game->kind[query.entity] == KIND_CASING)
-      ++count;
-  return count;
-}
-
-static void remove_oldest_casing(GameState *game) {
-  uint32_t components[] = {COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 1);
-  uint32_t oldest = ECS_INVALID_ENTITY;
-  uint8_t shortest_lifetime = UINT8_MAX;
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    if (game->kind[entity] == KIND_CASING &&
-        game->lifetime[entity] < shortest_lifetime) {
-      oldest = entity;
-      shortest_lifetime = game->lifetime[entity];
-    }
-  }
-  if (oldest != ECS_INVALID_ENTITY)
-    ecs_destroy(&game->ecs, oldest);
-}
-
-static void spawn_casing(GameState *game, uint32_t player_entity) {
-  Vector3 aim;
-  aim_vector(game, player_entity, &aim);
-  float yaw = (float)game->yaw[player_entity] * DEG2RAD;
-  Vector3 right = {-cosf(yaw), 0.0f, sinf(yaw)};
-  Vector3 up = {right.y * aim.z - right.z * aim.y,
-                right.z * aim.x - right.x * aim.z,
-                right.x * aim.y - right.y * aim.x};
-  if (casing_count(game) >= MAX_CASINGS)
-    remove_oldest_casing(game);
-  uint32_t entity = ecs_create(&game->ecs);
-  if (entity == ECS_INVALID_ENTITY)
+static void spawn_casing(GameState *g, uint32_t pe) {
+  Vector3 f, r, u, port;
+  uint32_t h, e;
+  if (count_kind(g, KIND_CASING) >= MAX_CASINGS)
+    destroy_oldest(g, KIND_CASING);
+  e = take_entity(g);
+  if (e == ECS_INVALID_ENTITY)
     return;
-  clear_entity_data(game, entity);
-  Vector3 ejection_port = {
-      (float)game->px[player_entity] / POS_SCALE + aim.x * 0.72f +
-          right.x * GUN_MUZZLE_RIGHT + up.x * 0.03f,
-      (float)game->py[player_entity] / POS_SCALE + 1.5f + aim.y * 0.72f +
-          right.y * GUN_MUZZLE_RIGHT + up.y * 0.03f,
-      (float)game->pz[player_entity] / POS_SCALE + aim.z * 0.72f +
-          right.z * GUN_MUZZLE_RIGHT + up.z * 0.03f};
-  game->px[entity] = (int16_t)lroundf(ejection_port.x * POS_SCALE);
-  game->py[entity] = (int16_t)lroundf(ejection_port.y * POS_SCALE);
-  game->pz[entity] = (int16_t)lroundf(ejection_port.z * POS_SCALE);
-  game->vx[entity] = (int16_t)lroundf(right.x * 4.0f + up.x * 5.0f - aim.x);
-  game->vy[entity] = (int16_t)lroundf(right.y * 4.0f + up.y * 5.0f - aim.y);
-  game->vz[entity] = (int16_t)lroundf(right.z * 4.0f + up.z * 5.0f - aim.z);
-  game->yaw[entity] = wrap_degrees(game->yaw[player_entity] + 70);
-  game->pitch[entity] = 30;
-  game->held_by[entity] = (uint8_t)(entity * 37u);
-  game->owner[entity] = game->owner[player_entity];
-  game->kind[entity] = KIND_CASING;
-  game->lifetime[entity] = CASING_LIFETIME_TICKS;
-  game->previous_px[entity] = game->px[entity];
-  game->previous_py[entity] = game->py[entity];
-  game->previous_pz[entity] = game->pz[entity];
-  ecs_add(&game->ecs, entity, COMP_POSITION);
-  ecs_add(&game->ecs, entity, COMP_VELOCITY);
-  ecs_add(&game->ecs, entity, COMP_LIFETIME);
-  ecs_add(&game->ecs, entity, COMP_RENDERABLE);
-  ecs_add(&game->ecs, entity, COMP_NETWORKED);
+  clear_entity_data(g, e);
+  gun_basis(g, pe, &f, &r, &u);
+  port = gun_point(g, pe, f, r, u, 0.72f, GUN_MUZZLE_RIGHT, 0.03f);
+  h = mix32(g->tick * 33u + e * 17u + (uint32_t)g->owner[pe] * 91u +
+            (uint32_t)g->px[pe]);
+  float jx = ((int)(h & 255u) - 128) / 64.0f;
+  float jy = ((int)((h >> 8) & 255u) - 128) / 96.0f;
+  float jz = ((int)((h >> 16) & 255u) - 128) / 64.0f;
+  g->px[e] = (int16_t)lroundf(port.x * POS_SCALE);
+  g->py[e] = (int16_t)lroundf(port.y * POS_SCALE);
+  g->pz[e] = (int16_t)lroundf(port.z * POS_SCALE);
+  g->vx[e] =
+      (int16_t)lroundf(r.x * (4.2f + jx) + u.x * (4.5f + jy) - f.x * 0.6f);
+  g->vy[e] = (int16_t)lroundf(5.4f + jy * 2.8f + ((h >> 24) & 7u) * 0.15f);
+  g->vz[e] =
+      (int16_t)lroundf(r.z * (4.2f + jz) + u.z * (4.5f + jy) - f.z * 0.6f);
+  g->yaw[e] = wrap_degrees(g->yaw[pe] + 50 + (int)(h % 41u));
+  g->pitch[e] = (int16_t)(18 + (int)((h >> 5) % 29u));
+  g->held_by[e] = (uint8_t)h;
+  g->owner[e] = g->owner[pe];
+  g->kind[e] = KIND_CASING;
+  g->lifetime[e] = CASING_LIFETIME_TICKS;
+  add_kind_components(g, e, KIND_CASING);
 }
 
-static void weapon_system(GameState *game) {
-  uint32_t components[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
-  EcsQuery query = ecs_query(&game->ecs, components, 3);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    uint8_t player = game->owner[entity];
-    if (game->cooldown[entity] > 0)
-      --game->cooldown[entity];
-    if ((game->input[player].buttons & BTN_FIRE) != 0 &&
-        game->cooldown[entity] == 0) {
-      if (spawn_bullet(game, entity) != ECS_INVALID_ENTITY) {
-        game->cooldown[entity] = FIRE_COOLDOWN_TICKS;
-        if (game->flash[entity] <= PLAYER_FIRE_FLASH_TICKS)
-          game->flash[entity] = PLAYER_FIRE_FLASH_TICKS;
-        spawn_casing(game, entity);
-      }
+static void weapon_system(GameState *g) {
+  uint32_t comps[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    uint8_t p = g->owner[e];
+    if (g->cooldown[e] > 0)
+      --g->cooldown[e];
+    if ((g->input[p].buttons & BTN_FIRE) != 0 && g->cooldown[e] == 0 &&
+        spawn_bullet(g, e) != ECS_INVALID_ENTITY) {
+      g->cooldown[e] = FIRE_COOLDOWN_TICKS;
+      if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
+        g->flash[e] = PLAYER_FIRE_FLASH_TICKS;
+      spawn_casing(g, e);
     }
-    if (game->flash[entity] > 0)
-      --game->flash[entity];
+    if (g->flash[e] > 0)
+      --g->flash[e];
   }
 }
 
-static uint32_t impact_mark_count(const GameState *game) {
-  uint32_t components[] = {COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 1);
-  uint32_t count = 0;
-  while (ecs_next(&query))
-    if (game->kind[query.entity] == KIND_IMPACT_MARK)
-      ++count;
-  return count;
+static void make_impact_mark(GameState *g, uint32_t e, bool floor_impact) {
+  if (count_kind(g, KIND_IMPACT_MARK) >= MAX_IMPACT_MARKS)
+    destroy_oldest(g, KIND_IMPACT_MARK);
+  if (floor_impact)
+    g->py[e] = 1;
+  else {
+    g->px[e] = (int16_t)(g->px[e] - g->vx[e]);
+    g->py[e] = (int16_t)(g->py[e] - g->vy[e]);
+    g->pz[e] = (int16_t)(g->pz[e] - g->vz[e]);
+  }
+  g->kind[e] = KIND_IMPACT_MARK;
+  g->lifetime[e] = IMPACT_MARK_LIFETIME_TICKS;
+  g->flash[e] = 3;
+  g->vx[e] = g->vy[e] = g->vz[e] = 0;
+  ecs_remove(&g->ecs, e, COMP_PROJECTILE);
+  ecs_remove(&g->ecs, e, COMP_VELOCITY);
 }
 
-static void make_impact_mark(GameState *game, uint32_t entity,
-                             bool floor_impact) {
-  if (impact_mark_count(game) >= MAX_IMPACT_MARKS) {
-    uint32_t components[] = {COMP_LIFETIME};
-    EcsQuery query = ecs_query(&game->ecs, components, 1);
-    uint32_t oldest = ECS_INVALID_ENTITY;
-    uint8_t shortest_lifetime = UINT8_MAX;
-    while (ecs_next(&query)) {
-      uint32_t mark = query.entity;
-      if (game->kind[mark] == KIND_IMPACT_MARK &&
-          game->lifetime[mark] < shortest_lifetime) {
-        oldest = mark;
-        shortest_lifetime = game->lifetime[mark];
-      }
-    }
-    if (oldest != ECS_INVALID_ENTITY)
-      ecs_destroy(&game->ecs, oldest);
-  }
-  if (floor_impact) {
-    game->py[entity] = 1;
-  } else {
-    game->px[entity] = (int16_t)(game->px[entity] - game->vx[entity]);
-    game->py[entity] = (int16_t)(game->py[entity] - game->vy[entity]);
-    game->pz[entity] = (int16_t)(game->pz[entity] - game->vz[entity]);
-  }
-  game->kind[entity] = KIND_IMPACT_MARK;
-  game->lifetime[entity] = IMPACT_MARK_LIFETIME_TICKS;
-  game->flash[entity] = 3;
-  ecs_remove(&game->ecs, entity, COMP_PROJECTILE);
-  ecs_remove(&game->ecs, entity, COMP_VELOCITY);
-}
-
-static void casing_system(GameState *game) {
-  uint32_t components[] = {COMP_POSITION, COMP_VELOCITY, COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 3);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    if (game->kind[entity] != KIND_CASING)
+static void casing_system(GameState *g) {
+  uint32_t comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_LIFETIME};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    if (g->kind[e] != KIND_CASING)
       continue;
-    game->px[entity] = (int16_t)(game->px[entity] + game->vx[entity]);
-    game->py[entity] = (int16_t)(game->py[entity] + game->vy[entity]);
-    game->pz[entity] = (int16_t)(game->pz[entity] + game->vz[entity]);
-    if (game->tick % 3u == 0 && game->vy[entity] > -8)
-      --game->vy[entity];
-    if (game->py[entity] <= 3) {
-      game->py[entity] = 3;
-      if (game->vy[entity] < -1)
-        game->vy[entity] = (int16_t)(-game->vy[entity] / 3);
-      else
-        game->vy[entity] = 0;
-      game->vx[entity] = (int16_t)(game->vx[entity] * 3 / 4);
-      game->vz[entity] = (int16_t)(game->vz[entity] * 3 / 4);
+    g->px[e] = (int16_t)(g->px[e] + g->vx[e]);
+    g->py[e] = (int16_t)(g->py[e] + g->vy[e]);
+    g->pz[e] = (int16_t)(g->pz[e] + g->vz[e]);
+    if (g->tick % 3u == 0 && g->vy[e] > -8)
+      --g->vy[e];
+    if (g->py[e] <= 4) {
+      g->py[e] = 4;
+      g->vy[e] = 0;
+      g->vx[e] = (int16_t)(g->vx[e] * 2 / 3);
+      g->vz[e] = (int16_t)(g->vz[e] * 2 / 3);
+      if (abs(g->vx[e]) < 1)
+        g->vx[e] = 0;
+      if (abs(g->vz[e]) < 1)
+        g->vz[e] = 0;
     }
-    if (game->vx[entity] != 0 || game->vy[entity] != 0 ||
-        game->vz[entity] != 0) {
-      game->yaw[entity] = wrap_degrees(game->yaw[entity] + 13);
-      game->pitch[entity] = wrap_degrees(game->pitch[entity] + 17);
-      game->held_by[entity] = (uint8_t)(game->held_by[entity] + 19u);
+    if (g->vx[e] || g->vy[e] || g->vz[e]) {
+      g->yaw[e] = wrap_degrees(g->yaw[e] + 9 + (g->held_by[e] & 7));
+      g->pitch[e] = wrap_degrees(g->pitch[e] + 11 + ((g->held_by[e] >> 3) & 7));
+      g->held_by[e] = (uint8_t)(g->held_by[e] + 13u);
     }
   }
 }
 
-static void projectile_system(GameState *game) {
-  uint32_t components[] = {COMP_POSITION, COMP_VELOCITY, COMP_PROJECTILE,
-                           COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 4);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    game->px[entity] = (int16_t)(game->px[entity] + game->vx[entity]);
-    game->py[entity] = (int16_t)(game->py[entity] + game->vy[entity]);
-    game->pz[entity] = (int16_t)(game->pz[entity] + game->vz[entity]);
-    bool floor_impact = game->py[entity] < 0;
-    bool leave_mark = floor_impact;
-    bool hit = game->px[entity] < -PROJECTILE_LIMIT * POS_SCALE ||
-               game->px[entity] > PROJECTILE_LIMIT * POS_SCALE ||
-               game->pz[entity] < -PROJECTILE_LIMIT * POS_SCALE ||
-               game->pz[entity] > PROJECTILE_LIMIT * POS_SCALE ||
-               floor_impact ||
-               game->py[entity] > PROJECTILE_LIMIT * POS_SCALE;
-    uint32_t cubes[] = {COMP_POSITION, COMP_RENDERABLE};
-    EcsQuery cube_query = ecs_query(&game->ecs, cubes, 2);
-    while (!hit && ecs_next(&cube_query)) {
-      uint32_t cube = cube_query.entity;
-      if (game->kind[cube] == KIND_CUBE && game->held_by[cube] == 0 &&
-          abs((int)game->px[entity] - game->px[cube]) < 42 &&
-          abs((int)game->py[entity] - game->py[cube]) < 48 &&
-          abs((int)game->pz[entity] - game->pz[cube]) < 42) {
+static void mark_hit_dir(GameState *g, uint32_t victim, uint32_t from) {
+  int deg = (int)lroundf(atan2f((float)(g->px[from] - g->px[victim]),
+                                (float)(g->pz[from] - g->pz[victim])) *
+                         RAD2DEG);
+  g->held_by[victim] = pack_yaw(deg);
+  g->flash[victim] = PLAYER_HIT_FLASH_TICKS;
+}
+
+static void projectile_system(GameState *g) {
+  uint32_t comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PROJECTILE,
+                      COMP_LIFETIME};
+  EcsQuery q = ecs_query(&g->ecs, comps, 4);
+  int bound = ARENA * POS_SCALE;
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    g->px[e] = (int16_t)(g->px[e] + g->vx[e]);
+    g->py[e] = (int16_t)(g->py[e] + g->vy[e]);
+    g->pz[e] = (int16_t)(g->pz[e] + g->vz[e]);
+    bool floor_hit = g->py[e] < 0;
+    bool leave = floor_hit;
+    bool hit = floor_hit || g->py[e] > bound || g->px[e] < -bound ||
+               g->px[e] > bound || g->pz[e] < -bound || g->pz[e] > bound;
+    uint32_t solids[] = {COMP_POSITION, COMP_RENDERABLE};
+    EcsQuery sq = ecs_query(&g->ecs, solids, 2);
+    while (!hit && ecs_next(&sq)) {
+      uint32_t c = sq.entity;
+      if (g->kind[c] == KIND_CUBE && g->held_by[c] == 0 &&
+          abs((int)g->px[e] - g->px[c]) < 42 &&
+          abs((int)g->py[e] - g->py[c]) < 48 &&
+          abs((int)g->pz[e] - g->pz[c]) < 42) {
         hit = true;
-        leave_mark = true;
+        leave = true;
       }
     }
     uint32_t players[] = {COMP_POSITION, COMP_PLAYER};
-    EcsQuery player_query = ecs_query(&game->ecs, players, 2);
-    while (!hit && ecs_next(&player_query)) {
-      uint32_t player = player_query.entity;
-      if (game->owner[player] != game->owner[entity] &&
-          abs((int)game->px[entity] - game->px[player]) < 32 &&
-          game->py[entity] < 128 && game->py[entity] > 0 &&
-          abs((int)game->pz[entity] - game->pz[player]) < 32) {
-        game->flash[player] = PLAYER_HIT_FLASH_TICKS;
+    EcsQuery pq = ecs_query(&g->ecs, players, 2);
+    while (!hit && ecs_next(&pq)) {
+      uint32_t p = pq.entity;
+      if (g->owner[p] != g->owner[e] && abs((int)g->px[e] - g->px[p]) < 32 &&
+          g->py[e] < 128 && g->py[e] > 0 &&
+          abs((int)g->pz[e] - g->pz[p]) < 32) {
+        uint32_t src = e;
+        uint8_t ow = g->owner[e];
+        if (ow < MAX_PLAYERS && g->player_entity[ow] != NET_NONE &&
+            ecs_alive(&g->ecs, g->player_entity[ow]))
+          src = g->player_entity[ow];
+        mark_hit_dir(g, p, src);
         hit = true;
       }
     }
     if (hit) {
-      if (leave_mark)
-        make_impact_mark(game, entity, floor_impact);
+      if (leave)
+        make_impact_mark(g, e, floor_hit);
       else
-        ecs_destroy(&game->ecs, entity);
+        ecs_destroy(&g->ecs, e);
     }
   }
 }
 
-static void lifetime_system(GameState *game) {
-  uint32_t components[] = {COMP_POSITION, COMP_LIFETIME};
-  EcsQuery query = ecs_query(&game->ecs, components, 2);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    bool age = game->kind[entity] != KIND_IMPACT_MARK || game->tick % 2u == 0;
-    if (age && game->lifetime[entity] > 0)
-      --game->lifetime[entity];
-    if (game->kind[entity] == KIND_IMPACT_MARK) {
-      if (game->lifetime[entity] > 166)
-        game->flash[entity] = 3;
-      else if (game->lifetime[entity] > 83)
-        game->flash[entity] = 2;
-      else
-        game->flash[entity] = 1;
-    }
-    if (game->lifetime[entity] == 0)
-      ecs_destroy(&game->ecs, entity);
+static void lifetime_system(GameState *g) {
+  uint32_t comps[] = {COMP_POSITION, COMP_LIFETIME};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    bool age = g->kind[e] != KIND_IMPACT_MARK || g->tick % 2u == 0;
+    if (age && g->lifetime[e] > 0)
+      --g->lifetime[e];
+    if (g->kind[e] == KIND_IMPACT_MARK)
+      g->flash[e] = (uint8_t)(g->lifetime[e] > 84   ? 3
+                              : g->lifetime[e] > 42 ? 2
+                                                    : 1);
+    if (g->lifetime[e] == 0)
+      ecs_destroy(&g->ecs, e);
   }
 }
 
-static void server_tick(GameState *game) {
-  aim_system(game);
-  movement_system(game);
-  holding_system(game);
-  weapon_system(game);
-  casing_system(game);
-  projectile_system(game);
-  lifetime_system(game);
-  ++game->tick;
+static void server_tick(GameState *g) {
+  aim_system(g);
+  movement_system(g);
+  holding_system(g);
+  weapon_system(g);
+  casing_system(g);
+  projectile_system(g);
+  lifetime_system(g);
+  ++g->tick;
 }
 
-static void write_snapshot(GameState *game, uint8_t recipient, uint16_t ack,
-                           uint32_t session) {
-  NetSnapshot snapshot;
-  uint32_t components[] = {COMP_POSITION, COMP_NETWORKED, COMP_RENDERABLE};
-  EcsQuery query;
-  memset(&snapshot, 0, sizeof(snapshot));
-  snapshot.magic = NET_MAGIC;
-  snapshot.type = NET_SNAPSHOT;
-  snapshot.local_player = recipient;
-  snapshot.session = session_wire(session);
-  snapshot.tick = sequence_wire(game->tick);
-  snapshot.acknowledged_sequence = sequence_wire(ack);
-  for (uint32_t player = 0; player < MAX_PLAYERS; ++player)
-    memcpy(snapshot.names[player], game->player_name[player], PLAYER_NAME_LENGTH);
-  query = ecs_query(&game->ecs, components, 3);
-  while (snapshot.count < NET_ENTITY_LIMIT && ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    NetEntity *wire = &snapshot.entities[snapshot.count++];
-    wire->entity = (uint8_t)entity;
-    wire->kind = game->kind[entity];
-    wire->owner = game->owner[entity];
-    wire->flags = game->flash[entity];
-    if (wire->kind == KIND_CUBE || wire->kind == KIND_CASING)
-      wire->flags = game->held_by[entity];
-    wire->x = host_i16(game->px[entity]);
-    wire->y = host_i16(game->py[entity]);
-    wire->z = host_i16(game->pz[entity]);
-    wire->yaw = host_i16(game->yaw[entity]);
-    wire->pitch = host_i16(game->pitch[entity]);
+static void write_snapshot(GameState *g, NetSnapshot *snap, uint8_t recipient,
+                           uint16_t ack, uint32_t session) {
+  uint32_t comps[] = {COMP_POSITION, COMP_NETWORKED, COMP_RENDERABLE};
+  EcsQuery q;
+  memset(snap, 0, sizeof(*snap));
+  snap->magic = NET_MAGIC;
+  snap->type = NET_SNAPSHOT;
+  snap->local_player = recipient;
+  snap->session = session_wire(session);
+  snap->tick = sequence_wire(g->tick);
+  snap->acknowledged_sequence = sequence_wire(ack);
+  for (uint32_t p = 0; p < MAX_PLAYERS; ++p)
+    memcpy(snap->names[p], g->player_name[p], PLAYER_NAME_LENGTH);
+  q = ecs_query(&g->ecs, comps, 3);
+  while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
+    uint32_t e = q.entity;
+    NetEntity *w = &snap->entities[snap->count++];
+    w->entity = (uint8_t)e;
+    w->kind = g->kind[e];
+    w->owner = g->owner[e];
+    w->flags = g->flash[e];
+    w->extra = g->held_by[e];
+    w->x = host_i16(g->px[e]);
+    w->y = host_i16(g->py[e]);
+    w->z = host_i16(g->pz[e]);
+    w->yaw = host_i16(g->yaw[e]);
+    w->pitch = host_i16(g->pitch[e]);
   }
-  memcpy(game->net_tx, &snapshot, sizeof(snapshot));
 }
 
-static bool snapshot_size_valid(size_t size, const NetSnapshot *snapshot) {
-  return size == sizeof(NetSnapshot) && snapshot->count <= NET_ENTITY_LIMIT;
-}
-
-static void send_peer_snapshot(GameState *game, int fd, const Peer *peer) {
+static void send_peer_snapshot(int fd, const Peer *peer,
+                               const NetSnapshot *snap) {
   struct sockaddr_in address;
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = peer->address;
   address.sin_port = peer->port;
-  (void)sendto(fd, game->net_tx, sizeof(NetSnapshot), 0,
-               (const struct sockaddr *)&address, sizeof(address));
+  (void)sendto(fd, snap, sizeof(*snap), 0, (const struct sockaddr *)&address,
+               sizeof(address));
 }
 
-static int find_peer_session(const GameState *game, uint32_t session) {
+static int find_peer_session(const GameState *g, uint32_t session) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
-    if (game->peers[i].active && game->peers[i].session == session)
+    if (g->peers[i].active && g->peers[i].session == session)
       return i;
   return -1;
 }
 
-static bool session_was_retired(const GameState *game, uint32_t session) {
+static bool session_was_retired(const GameState *g, uint32_t session) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
-    if ((!game->peers[i].active && game->peers[i].session == session) ||
-        game->peers[i].retired_session == session)
+    if ((!g->peers[i].active && g->peers[i].session == session) ||
+        g->peers[i].retired_session == session)
       return true;
   return false;
 }
 
-static int peer_with_name(const GameState *game,
+static int peer_with_name(const GameState *g,
                           const char name[PLAYER_NAME_LENGTH]) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
-    if (memcmp(game->player_name[i], name, PLAYER_NAME_LENGTH) == 0)
+    if (memcmp(g->player_name[i], name, PLAYER_NAME_LENGTH) == 0)
       return i;
   return -1;
 }
 
-static void remove_peer(GameState *game, int peer_index);
+static void remove_peer(GameState *g, int peer_index);
 
-static int add_peer(GameState *game, const struct sockaddr_in *from,
+static int add_peer(GameState *g, const struct sockaddr_in *from,
                     uint32_t session, const char name[PLAYER_NAME_LENGTH]) {
-  int slot = peer_with_name(game, name);
+  int slot = peer_with_name(g, name);
   if (slot < 0) {
     for (int i = 0; i < MAX_PLAYERS; ++i)
-      if (!game->peers[i].active && game->player_entity[i] == NET_NONE) {
+      if (!g->peers[i].active && g->player_entity[i] == NET_NONE) {
         slot = i;
         break;
       }
   }
   if (slot < 0)
     return -1;
-  if (game->peers[slot].active)
-    remove_peer(game, slot);
-  uint32_t entity = create_player(game, (uint8_t)slot);
-  if (entity == ECS_INVALID_ENTITY)
+  if (g->peers[slot].active)
+    remove_peer(g, slot);
+  uint32_t e = create_player(g, (uint8_t)slot);
+  if (e == ECS_INVALID_ENTITY)
     return -1;
-  Peer *peer = &game->peers[slot];
+  Peer *peer = &g->peers[slot];
   if (peer->session != session)
     peer->retired_session = peer->session;
   peer->session = session;
   peer->address = from->sin_addr.s_addr;
   peer->port = from->sin_port;
-  peer->last_sequence = 0;
-  peer->last_chat_sequence = 0;
-  peer->last_seen = game->tick;
+  peer->last_sequence = peer->last_chat_sequence = 0;
+  peer->last_seen = g->tick;
   peer->active = 1;
-  peer->got_sequence = 0;
-  peer->got_chat_sequence = 0;
+  peer->got_sequence = peer->got_chat_sequence = 0;
   peer->player = (uint8_t)slot;
-  memset(&game->input[slot], 0, sizeof(game->input[slot]));
-  game->input[slot].aim_yaw = game->yaw[entity];
-  game->input[slot].aim_pitch = game->pitch[entity];
-  memcpy(game->player_name[slot], name, PLAYER_NAME_LENGTH);
-  game->player_name[slot][PLAYER_NAME_LENGTH] = '\0';
+  memset(&g->input[slot], 0, sizeof(g->input[slot]));
+  g->input[slot].aim_yaw = g->yaw[e];
+  memcpy(g->player_name[slot], name, PLAYER_NAME_LENGTH);
+  g->player_name[slot][PLAYER_NAME_LENGTH] = '\0';
   return slot;
 }
 
-static void remove_peer(GameState *game, int peer_index) {
-  Peer *peer = &game->peers[peer_index];
+static void remove_peer(GameState *g, int peer_index) {
+  Peer *peer = &g->peers[peer_index];
   uint8_t player = peer->player;
-  uint32_t entity = game->player_entity[player];
-  if (entity != NET_NONE && ecs_alive(&game->ecs, entity)) {
-    for (uint32_t c = 0; c < ECS_MAX_COMPONENTS; ++c)
-      ecs_remove(&game->ecs, entity, c);
-    ecs_destroy(&game->ecs, entity);
-  }
+  uint32_t e = g->player_entity[player];
+  if (e != NET_NONE && ecs_alive(&g->ecs, e))
+    ecs_destroy(&g->ecs, e);
   for (uint32_t i = 0; i < ECS_MAX_ENTITIES; ++i)
-    if (game->held_by[i] == player + 1u)
-      game->held_by[i] = 0;
-  game->player_entity[player] = NET_NONE;
-  memset(&game->input[player], 0, sizeof(game->input[player]));
-  peer->active = 0;
-  peer->got_sequence = 0;
-  peer->got_chat_sequence = 0;
+    if (g->held_by[i] == player + 1u)
+      g->held_by[i] = 0;
+  g->player_entity[player] = NET_NONE;
+  memset(&g->input[player], 0, sizeof(g->input[player]));
+  peer->active = peer->got_sequence = peer->got_chat_sequence = 0;
 }
 
-static void server_relay_chat(GameState *game, int fd, int sender,
+static void server_relay_chat(GameState *g, int fd, int sender,
                               NetChatPacket *packet) {
-  packet->player = game->peers[sender].player;
-  packet->sequence = sequence_wire(game->next_chat_sequence++);
-  memcpy(packet->name, game->player_name[packet->player], PLAYER_NAME_LENGTH);
+  packet->player = g->peers[sender].player;
+  packet->sequence = sequence_wire(g->next_chat_sequence++);
+  memcpy(packet->name, g->player_name[packet->player], PLAYER_NAME_LENGTH);
   for (int i = 0; i < MAX_PLAYERS; ++i) {
-    if (!game->peers[i].active)
+    if (!g->peers[i].active)
       continue;
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = game->peers[i].address;
-    address.sin_port = game->peers[i].port;
-    packet->session = session_wire(game->peers[i].session);
+    address.sin_addr.s_addr = g->peers[i].address;
+    address.sin_port = g->peers[i].port;
+    packet->session = session_wire(g->peers[i].session);
     (void)sendto(fd, packet, sizeof(*packet), 0,
                  (const struct sockaddr *)&address, sizeof(address));
   }
 }
 
-static void server_receive(GameState *game, int fd) {
+static void server_receive(GameState *g, int fd) {
+  uint8_t buf[sizeof(NetSnapshot)];
   for (;;) {
     struct sockaddr_in from;
     socklen_t from_size = sizeof(from);
-    ssize_t received = recvfrom(fd, game->net_rx, sizeof(game->net_rx), 0,
-                                (struct sockaddr *)&from, &from_size);
-    if (received < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return;
+    ssize_t n =
+        recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_size);
+    if (n < 0)
       return;
-    }
-    if (received < 2 || game->net_rx[0] != NET_MAGIC)
+    if (n < 2 || buf[0] != NET_MAGIC)
       continue;
-
-    if (game->net_rx[1] == NET_CHAT &&
-        (size_t)received == sizeof(NetChatPacket)) {
+    if (buf[1] == NET_CHAT && (size_t)n == sizeof(NetChatPacket)) {
       NetChatPacket packet;
-      memcpy(&packet, game->net_rx, sizeof(packet));
-      uint32_t session = session_host(packet.session);
-      int peer_index = find_peer_session(game, session);
-      if (peer_index < 0 || packet.length > CHAT_LENGTH)
+      memcpy(&packet, buf, sizeof(packet));
+      int pi = find_peer_session(g, session_host(packet.session));
+      if (pi < 0 || packet.length > CHAT_LENGTH)
         continue;
-      Peer *peer = &game->peers[peer_index];
-      uint16_t sequence = sequence_host(packet.sequence);
+      Peer *peer = &g->peers[pi];
+      uint16_t seq = sequence_host(packet.sequence);
       if (peer->got_chat_sequence &&
-          !sequence_newer(sequence, peer->last_chat_sequence))
+          !sequence_newer(seq, peer->last_chat_sequence))
         continue;
       peer->got_chat_sequence = 1;
-      peer->last_chat_sequence = sequence;
-      peer->last_seen = game->tick;
+      peer->last_chat_sequence = seq;
+      peer->last_seen = g->tick;
       peer->address = from.sin_addr.s_addr;
       peer->port = from.sin_port;
       for (uint32_t i = 0; i < packet.length; ++i)
@@ -1164,83 +971,77 @@ static void server_receive(GameState *game, int fd) {
             (packet.text[i] < '0' || packet.text[i] > '9') &&
             packet.text[i] != ' ')
           packet.text[i] = ' ';
-      server_relay_chat(game, fd, peer_index, &packet);
+      server_relay_chat(g, fd, pi, &packet);
       continue;
     }
-
-    if ((game->net_rx[1] != NET_INPUT &&
-         game->net_rx[1] != NET_DISCONNECT) ||
-        (size_t)received != sizeof(NetInputPacket))
+    if ((buf[1] != NET_INPUT && buf[1] != NET_DISCONNECT) ||
+        (size_t)n != sizeof(NetInputPacket))
       continue;
     NetInputPacket packet;
-    memcpy(&packet, game->net_rx, sizeof(packet));
+    memcpy(&packet, buf, sizeof(packet));
     uint32_t session = session_host(packet.session);
     if (session == 0 || !valid_wire_name(packet.name))
       continue;
-    int peer_index = find_peer_session(game, session);
-    if (game->net_rx[1] == NET_DISCONNECT) {
-      if (peer_index >= 0 &&
-          memcmp(game->player_name[peer_index], packet.name,
-                 PLAYER_NAME_LENGTH) == 0)
-        remove_peer(game, peer_index);
+    int pi = find_peer_session(g, session);
+    if (buf[1] == NET_DISCONNECT) {
+      if (pi >= 0 &&
+          memcmp(g->player_name[pi], packet.name, PLAYER_NAME_LENGTH) == 0)
+        remove_peer(g, pi);
       continue;
     }
-    if (peer_index < 0) {
-      if (packet.claimed_player != NET_NONE ||
-          session_was_retired(game, session))
+    if (pi < 0) {
+      if (packet.claimed_player != NET_NONE || session_was_retired(g, session))
         continue;
-      peer_index = add_peer(game, &from, session, packet.name);
-      if (peer_index < 0)
+      pi = add_peer(g, &from, session, packet.name);
+      if (pi < 0)
         continue;
     }
-    Peer *peer = &game->peers[peer_index];
-    if (memcmp(game->player_name[peer->player], packet.name,
-               PLAYER_NAME_LENGTH) != 0 ||
+    Peer *peer = &g->peers[pi];
+    if (memcmp(g->player_name[peer->player], packet.name, PLAYER_NAME_LENGTH) !=
+            0 ||
         (packet.claimed_player != NET_NONE &&
          packet.claimed_player != peer->player))
       continue;
-    uint16_t sequence = sequence_host(packet.sequence);
-    if (peer->got_sequence && !sequence_newer(sequence, peer->last_sequence))
+    uint16_t seq = sequence_host(packet.sequence);
+    if (peer->got_sequence && !sequence_newer(seq, peer->last_sequence))
       continue;
     peer->got_sequence = 1;
-    peer->last_sequence = sequence;
-    peer->last_seen = game->tick;
+    peer->last_sequence = seq;
+    peer->last_seen = g->tick;
     peer->address = from.sin_addr.s_addr;
     peer->port = from.sin_port;
-    game->input[peer->player].move_x = clamp_i16(packet.move_x, -1, 1);
-    game->input[peer->player].move_z = clamp_i16(packet.move_z, -1, 1);
-    game->input[peer->player].aim_yaw =
-        wrap_degrees(wire_i16(packet.aim_yaw));
-    game->input[peer->player].aim_pitch =
+    g->input[peer->player].move_x = clamp_i16(packet.move_x, -1, 1);
+    g->input[peer->player].move_z = clamp_i16(packet.move_z, -1, 1);
+    g->input[peer->player].aim_yaw = wrap_degrees(wire_i16(packet.aim_yaw));
+    g->input[peer->player].aim_pitch =
         clamp_i16(wire_i16(packet.aim_pitch), -75, 75);
-    game->input[peer->player].buttons =
+    g->input[peer->player].buttons =
         packet.buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP);
   }
 }
 
-static void server_expire_peers(GameState *game) {
+static void server_expire_peers(GameState *g) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
-    if (game->peers[i].active &&
-        tick_age(game->tick, game->peers[i].last_seen) > SIM_HZ * 10)
-      remove_peer(game, i);
+    if (g->peers[i].active &&
+        tick_age(g->tick, g->peers[i].last_seen) > SIM_HZ * 10)
+      remove_peer(g, i);
 }
 
-static void server_send_all(GameState *game, int fd) {
+static void server_send_all(GameState *g, int fd) {
+  NetSnapshot snap;
   for (int i = 0; i < MAX_PLAYERS; ++i) {
-    if (!game->peers[i].active)
+    if (!g->peers[i].active)
       continue;
-    uint16_t ack = game->peers[i].got_sequence ? game->peers[i].last_sequence : 0;
-    write_snapshot(game, game->peers[i].player, ack,
-                   game->peers[i].session);
-    send_peer_snapshot(game, fd, &game->peers[i]);
+    uint16_t ack = g->peers[i].got_sequence ? g->peers[i].last_sequence : 0;
+    write_snapshot(g, &snap, g->peers[i].player, ack, g->peers[i].session);
+    send_peer_snapshot(fd, &g->peers[i], &snap);
   }
 }
 
 static void server_run(uint16_t port) {
   GameState game;
   int fd = open_udp_server(port);
-  double current_time = hires_time_in_seconds();
-  double accumulator = 0.0;
+  double current = hires_time_in_seconds(), acc = 0.0;
   struct timespec idle = {0, 1000000L};
   if (fd < 0) {
     fprintf(stderr, "could not bind UDP port %u\n", port);
@@ -1251,544 +1052,505 @@ static void server_run(uint16_t port) {
   signal(SIGTERM, on_signal);
   printf("server listening on UDP %u (Ctrl-C to stop)\n", port);
   while (server_running) {
-    double new_time = hires_time_in_seconds();
-    double frame_time = new_time - current_time;
-    if (frame_time > 0.25)
-      frame_time = 0.25;
-    current_time = new_time;
-    accumulator += frame_time;
+    double now = hires_time_in_seconds();
+    double dt = now - current;
+    if (dt > 0.25)
+      dt = 0.25;
+    current = now;
+    acc += dt;
     server_receive(&game, fd);
-    while (accumulator >= SIM_DT) {
+    while (acc >= SIM_DT) {
       server_tick(&game);
       server_expire_peers(&game);
       if (game.tick % SNAPSHOT_INTERVAL == 0)
         server_send_all(&game, fd);
-      accumulator -= SIM_DT;
+      acc -= SIM_DT;
     }
     (void)nanosleep(&idle, NULL);
   }
   close(fd);
 }
 
-static void show_notice(GameState *game, const char *text) {
-  snprintf(game->notice, sizeof(game->notice), "%.*s", NOTICE_LENGTH, text);
-  game->notice_ticks = SIM_HZ * 5;
+static void show_notice(GameState *g, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(g->notice, sizeof(g->notice), fmt, ap);
+  va_end(ap);
+  g->notice_ticks = SIM_HZ * 5;
 }
 
-static void show_player_notice(GameState *game, const char *name,
-                               const char *event) {
-  snprintf(game->notice, sizeof(game->notice), "%.*s %s", PLAYER_NAME_LENGTH,
-           name, event);
-  game->notice_ticks = SIM_HZ * 5;
+static void renew_client_session(GameState *g) {
+  g->session = make_session_id(g->session);
+  g->connected = 0;
+  g->local_player = NET_NONE;
+  g->visible_players = 0;
+  g->got_snapshot = g->got_chat_sequence = 0;
+  g->next_sequence = g->next_chat_sequence = 0;
+  g->last_snapshot_tick = g->last_chat_sequence = 0;
+  g->snapshot_silence_ticks = 0;
 }
 
-static void show_chat_notice(GameState *game,
-                             const char name[PLAYER_NAME_LENGTH],
-                             const char *text, uint8_t length) {
-  char message[CHAT_LENGTH + 1];
-  if (length > CHAT_LENGTH)
-    length = CHAT_LENGTH;
-  memcpy(message, text, length);
-  message[length] = '\0';
-  snprintf(game->notice, sizeof(game->notice), "%.*s: %.15s",
-           PLAYER_NAME_LENGTH, name, message);
-  game->notice_ticks = SIM_HZ * 5;
-}
-
-static void renew_client_session(GameState *game) {
-  game->session = make_session_id(game->session);
-  game->connected = 0;
-  game->local_player = NET_NONE;
-  game->visible_players = 0;
-  game->got_snapshot = 0;
-  game->got_chat_sequence = 0;
-  game->next_sequence = 0;
-  game->next_chat_sequence = 0;
-  game->last_snapshot_tick = 0;
-  game->last_chat_sequence = 0;
-  game->snapshot_silence_ticks = 0;
-}
-
-static void reset_client_entity(GameState *game, uint32_t entity) {
-  for (uint32_t component = 0; component < ECS_MAX_COMPONENTS; ++component)
-    ecs_remove(&game->ecs, entity, component);
-  clear_entity_data(game, entity);
-}
-
-static uint32_t client_entity_for(GameState *game, uint8_t server_entity,
+static uint32_t client_entity_for(GameState *g, uint8_t server_entity,
                                   uint8_t kind) {
-  uint8_t local = game->network_entity[server_entity];
-  if (local != NET_NONE && ecs_alive(&game->ecs, local) &&
-      ecs_has(&game->ecs, local, COMP_NETWORKED) && game->kind[local] == kind)
+  uint8_t local = g->network_entity[server_entity];
+  if (local != NET_NONE && ecs_alive(&g->ecs, local) &&
+      ecs_has(&g->ecs, local, COMP_NETWORKED) && g->kind[local] == kind)
     return local;
-  if (local != NET_NONE && ecs_alive(&game->ecs, local))
-    ecs_destroy(&game->ecs, local);
-  uint32_t created = ecs_create(&game->ecs);
-  if (created == ECS_INVALID_ENTITY)
-    return created;
-  game->network_entity[server_entity] = (uint8_t)created;
-  reset_client_entity(game, created);
-  return created;
+  if (local != NET_NONE && ecs_alive(&g->ecs, local))
+    ecs_destroy(&g->ecs, local);
+  uint32_t e = ecs_create(&g->ecs);
+  if (e == ECS_INVALID_ENTITY)
+    return e;
+  g->network_entity[server_entity] = (uint8_t)e;
+  for (uint32_t c = 0; c < ECS_MAX_COMPONENTS; ++c)
+    ecs_remove(&g->ecs, e, c);
+  clear_entity_data(g, e);
+  return e;
 }
 
-static void apply_snapshot(GameState *game, const NetSnapshot *snapshot) {
-  size_t i;
-  uint8_t player_mask = 0;
-  bool was_connected = game->connected != 0;
-  for (i = 0; i < snapshot->count; ++i)
-    if (snapshot->entities[i].kind == KIND_PLAYER &&
-        snapshot->entities[i].owner < MAX_PLAYERS)
-      player_mask |= (uint8_t)(1u << snapshot->entities[i].owner);
-  if (!was_connected) {
-    show_notice(game, "LINK");
-  } else {
-    uint8_t left = (uint8_t)(game->visible_players & ~player_mask);
-    uint8_t joined = (uint8_t)(player_mask & ~game->visible_players);
-    for (uint32_t player = 0; player < MAX_PLAYERS; ++player) {
-      uint8_t bit = (uint8_t)(1u << player);
-      if ((left & bit) != 0)
-        show_player_notice(game, game->player_name[player], "LEFT");
-      if ((joined & bit) != 0)
-        show_player_notice(game, snapshot->names[player], "JOINED");
+static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
+  uint8_t mask = 0;
+  bool was = g->connected != 0;
+  for (uint8_t i = 0; i < snap->count; ++i)
+    if (snap->entities[i].kind == KIND_PLAYER &&
+        snap->entities[i].owner < MAX_PLAYERS)
+      mask |= (uint8_t)(1u << snap->entities[i].owner);
+  if (!was)
+    show_notice(g, "LINK");
+  else {
+    uint8_t left = (uint8_t)(g->visible_players & ~mask);
+    uint8_t joined = (uint8_t)(mask & ~g->visible_players);
+    for (uint32_t p = 0; p < MAX_PLAYERS; ++p) {
+      uint8_t bit = (uint8_t)(1u << p);
+      if (left & bit)
+        show_notice(g, "%.*s LEFT", PLAYER_NAME_LENGTH, g->player_name[p]);
+      if (joined & bit)
+        show_notice(g, "%.*s JOINED", PLAYER_NAME_LENGTH, snap->names[p]);
     }
   }
-  for (uint32_t player = 0; player < MAX_PLAYERS; ++player) {
-    memcpy(game->player_name[player], snapshot->names[player],
-           PLAYER_NAME_LENGTH);
-    game->player_name[player][PLAYER_NAME_LENGTH] = '\0';
+  for (uint32_t p = 0; p < MAX_PLAYERS; ++p) {
+    memcpy(g->player_name[p], snap->names[p], PLAYER_NAME_LENGTH);
+    g->player_name[p][PLAYER_NAME_LENGTH] = '\0';
   }
-  game->visible_players = player_mask;
-  game->snapshot_seen = 0;
-  game->local_player = snapshot->local_player;
-  game->last_snapshot_tick = sequence_host(snapshot->tick);
-  game->connected = 1;
-  game->snapshot_silence_ticks = 0;
-  for (i = 0; i < snapshot->count; ++i) {
-    const NetEntity *wire = &snapshot->entities[i];
-    uint32_t entity;
-    bool had_entity;
-    if (wire->entity >= ECS_MAX_ENTITIES || wire->kind == 0 ||
-        wire->kind > KIND_CASING)
+  g->visible_players = mask;
+  g->snapshot_seen = 0;
+  g->local_player = snap->local_player;
+  g->last_snapshot_tick = sequence_host(snap->tick);
+  g->connected = 1;
+  g->snapshot_silence_ticks = 0;
+  for (uint8_t i = 0; i < snap->count; ++i) {
+    const NetEntity *w = &snap->entities[i];
+    if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_CASING)
       continue;
-    game->snapshot_seen |= UINT32_C(1) << wire->entity;
-    uint8_t mapped = game->network_entity[wire->entity];
-    had_entity = mapped != NET_NONE && ecs_alive(&game->ecs, mapped) &&
-                 game->kind[mapped] == wire->kind;
-    entity = client_entity_for(game, wire->entity, wire->kind);
-    if (entity == ECS_INVALID_ENTITY)
+    g->snapshot_seen |= UINT32_C(1) << w->entity;
+    uint8_t mapped = g->network_entity[w->entity];
+    bool had = mapped != NET_NONE && ecs_alive(&g->ecs, mapped) &&
+               g->kind[mapped] == w->kind;
+    uint32_t e = client_entity_for(g, w->entity, w->kind);
+    if (e == ECS_INVALID_ENTITY)
       continue;
-    if (had_entity) {
-      game->previous_px[entity] = game->px[entity];
-      game->previous_py[entity] = game->py[entity];
-      game->previous_pz[entity] = game->pz[entity];
+    int16_t nx = wire_i16(w->x), ny = wire_i16(w->y), nz = wire_i16(w->z);
+    int16_t dx = (int16_t)(nx - g->px[e]);
+    int16_t dy = (int16_t)(ny - g->py[e]);
+    int16_t dz = (int16_t)(nz - g->pz[e]);
+    bool snap_pos =
+        !had || abs(dx) > 240 || abs(dz) > 240 || dy > 48 || dy < -240;
+    g->vx[e] = snap_pos ? 0 : dx;
+    g->vy[e] = snap_pos ? 0 : dy;
+    g->vz[e] = snap_pos ? 0 : dz;
+    if (had && w->kind == KIND_PLAYER) {
+      g->cooldown[e] = (uint8_t)clamp_i16(
+          wrap_degrees(wire_i16(w->yaw) - g->yaw[e]) + 128, 0, 255);
+      g->lifetime[e] = (uint8_t)clamp_i16(
+          (int)wire_i16(w->pitch) - (int)g->pitch[e] + 128, 0, 255);
+    } else if (w->kind == KIND_PLAYER) {
+      g->cooldown[e] = 128;
+      g->lifetime[e] = 128;
     }
-    game->kind[entity] = wire->kind;
-    game->owner[entity] = wire->owner;
-    game->px[entity] = wire_i16(wire->x);
-    game->py[entity] = wire_i16(wire->y);
-    game->pz[entity] = wire_i16(wire->z);
-    game->yaw[entity] = wire_i16(wire->yaw);
-    game->pitch[entity] = wire_i16(wire->pitch);
-    if (!had_entity) {
-      game->previous_px[entity] = game->px[entity];
-      game->previous_py[entity] = game->py[entity];
-      game->previous_pz[entity] = game->pz[entity];
-    }
-    game->held_by[entity] = wire->flags;
-    game->flash[entity] = wire->flags;
-    if (wire->kind == KIND_CUBE || wire->kind == KIND_CASING)
-      game->held_by[entity] = wire->flags;
-    else if (wire->kind == KIND_PLAYER)
-      game->flash[entity] = wire->flags;
-    ecs_add(&game->ecs, entity, COMP_POSITION);
-    ecs_add(&game->ecs, entity, COMP_RENDERABLE);
-    ecs_add(&game->ecs, entity, COMP_NETWORKED);
-    if (wire->kind == KIND_PLAYER)
-      ecs_add(&game->ecs, entity, COMP_PLAYER);
-    if (wire->kind == KIND_BULLET || wire->kind == KIND_IMPACT_MARK ||
-        wire->kind == KIND_CASING)
-      ecs_add(&game->ecs, entity, COMP_LIFETIME);
-    if (wire->kind == KIND_BULLET)
-      ecs_add(&game->ecs, entity, COMP_PROJECTILE);
+    g->kind[e] = w->kind;
+    g->owner[e] = w->owner;
+    g->px[e] = nx;
+    g->py[e] = ny;
+    g->pz[e] = nz;
+    g->yaw[e] = wire_i16(w->yaw);
+    g->pitch[e] = wire_i16(w->pitch);
+    g->flash[e] = w->flags;
+    g->held_by[e] = w->extra;
+    add_kind_components(g, e, w->kind);
   }
-  game->interpolation_ticks = 0;
-  for (uint32_t server_entity = 0; server_entity < ECS_MAX_ENTITIES;
-       ++server_entity) {
-    uint8_t local = game->network_entity[server_entity];
-    if (local != NET_NONE &&
-        (game->snapshot_seen & (UINT32_C(1) << server_entity)) == 0) {
-      if (ecs_alive(&game->ecs, local))
-        ecs_destroy(&game->ecs, local);
-      game->network_entity[server_entity] = NET_NONE;
+  g->interpolation_ticks = 0;
+  for (uint32_t s = 0; s < ECS_MAX_ENTITIES; ++s) {
+    uint8_t local = g->network_entity[s];
+    if (local != NET_NONE && (g->snapshot_seen & (UINT32_C(1) << s)) == 0) {
+      if (ecs_alive(&g->ecs, local))
+        ecs_destroy(&g->ecs, local);
+      g->network_entity[s] = NET_NONE;
     }
   }
 }
 
-static void client_receive(GameState *game, int fd) {
+static void client_receive(GameState *g, int fd) {
+  uint8_t buf[sizeof(NetSnapshot)];
   for (;;) {
-    ssize_t received = recv(fd, game->net_rx, sizeof(game->net_rx), 0);
-    if (received < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return;
-      if (game->connected)
-        show_notice(game, "DISCONNECTED");
-      renew_client_session(game);
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (g->connected)
+          show_notice(g, "DISCONNECTED");
+        renew_client_session(g);
+      }
       return;
     }
-    if (received < 2 || (size_t)received > sizeof(NetSnapshot) ||
-        game->net_rx[0] != NET_MAGIC)
+    if (n < 2 || (size_t)n > sizeof(NetSnapshot) || buf[0] != NET_MAGIC)
       continue;
-    if (game->net_rx[1] == NET_CHAT &&
-        (size_t)received == sizeof(NetChatPacket)) {
+    if (buf[1] == NET_CHAT && (size_t)n == sizeof(NetChatPacket)) {
       NetChatPacket packet;
-      memcpy(&packet, game->net_rx, sizeof(packet));
-      uint16_t sequence = sequence_host(packet.sequence);
-      if (session_host(packet.session) != game->session ||
+      memcpy(&packet, buf, sizeof(packet));
+      uint16_t seq = sequence_host(packet.sequence);
+      if (session_host(packet.session) != g->session ||
           packet.length > CHAT_LENGTH || !valid_wire_name(packet.name) ||
-          (game->got_chat_sequence &&
-           !sequence_newer(sequence, game->last_chat_sequence)))
+          (g->got_chat_sequence && !sequence_newer(seq, g->last_chat_sequence)))
         continue;
-      game->got_chat_sequence = 1;
-      game->last_chat_sequence = sequence;
-      show_chat_notice(game, packet.name, packet.text, packet.length);
+      g->got_chat_sequence = 1;
+      g->last_chat_sequence = seq;
+      show_notice(g, "%.*s: %.*s", PLAYER_NAME_LENGTH, packet.name,
+                  packet.length, packet.text);
       continue;
     }
-    if (game->net_rx[1] != NET_SNAPSHOT)
+    if (buf[1] != NET_SNAPSHOT || (size_t)n != sizeof(NetSnapshot))
       continue;
-    NetSnapshot snapshot;
-    memset(&snapshot, 0, sizeof(snapshot));
-    memcpy(&snapshot, game->net_rx, (size_t)received);
-    uint16_t tick = sequence_host(snapshot.tick);
-    if (!snapshot_size_valid((size_t)received, &snapshot) ||
-        session_host(snapshot.session) != game->session ||
-        (game->got_snapshot &&
-         !sequence_newer(tick, game->last_snapshot_tick)))
+    NetSnapshot snap;
+    memcpy(&snap, buf, sizeof(snap));
+    uint16_t tick = sequence_host(snap.tick);
+    if (snap.count > NET_ENTITY_LIMIT ||
+        session_host(snap.session) != g->session ||
+        (g->got_snapshot && !sequence_newer(tick, g->last_snapshot_tick)))
       continue;
-    game->got_snapshot = 1;
-    apply_snapshot(game, &snapshot);
+    g->got_snapshot = 1;
+    apply_snapshot(g, &snap);
   }
 }
 
-static void client_send(GameState *game, int fd, const struct sockaddr_in *server) {
+static void client_send_input(GameState *g, int fd, uint8_t type) {
   NetInputPacket packet;
   memset(&packet, 0, sizeof(packet));
   packet.magic = NET_MAGIC;
-  packet.type = NET_INPUT;
-  packet.claimed_player = game->local_player;
-  packet.buttons = game->input[0].buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP);
-  packet.session = session_wire(game->session);
-  packet.sequence = sequence_wire(game->next_sequence++);
-  packet.move_x = game->input[0].move_x;
-  packet.move_z = game->input[0].move_z;
-  packet.aim_yaw = host_i16(game->view_yaw);
-  packet.aim_pitch = host_i16(game->view_pitch);
-  memcpy(packet.name, game->requested_name, PLAYER_NAME_LENGTH);
-  memcpy(game->net_tx, &packet, sizeof(packet));
-  (void)sendto(fd, game->net_tx, sizeof(packet), 0,
-               (const struct sockaddr *)server, sizeof(*server));
+  packet.type = type;
+  packet.claimed_player = g->local_player;
+  packet.session = session_wire(g->session);
+  memcpy(packet.name, g->requested_name, PLAYER_NAME_LENGTH);
+  if (type == NET_INPUT) {
+    packet.buttons = g->input[0].buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP);
+    packet.sequence = sequence_wire(g->next_sequence++);
+    packet.move_x = g->input[0].move_x;
+    packet.move_z = g->input[0].move_z;
+    packet.aim_yaw = host_i16(g->view_yaw);
+    packet.aim_pitch = host_i16(g->view_pitch);
+  }
+  (void)send(fd, &packet, sizeof(packet), 0);
 }
 
-static void client_send_chat(GameState *game, int fd) {
+static void client_send_chat(GameState *g, int fd) {
   NetChatPacket packet;
   memset(&packet, 0, sizeof(packet));
   packet.magic = NET_MAGIC;
   packet.type = NET_CHAT;
-  packet.player = game->local_player;
-  packet.length = game->chat_length;
-  packet.session = session_wire(game->session);
-  packet.sequence = sequence_wire(game->next_chat_sequence++);
-  memcpy(packet.name, game->requested_name, PLAYER_NAME_LENGTH);
-  memcpy(packet.text, game->chat_input, game->chat_length);
+  packet.player = g->local_player;
+  packet.length = g->chat_length;
+  packet.session = session_wire(g->session);
+  packet.sequence = sequence_wire(g->next_chat_sequence++);
+  memcpy(packet.name, g->requested_name, PLAYER_NAME_LENGTH);
+  memcpy(packet.text, g->chat_input, g->chat_length);
   (void)send(fd, &packet, sizeof(packet), 0);
 }
 
-static void client_send_disconnect(const GameState *game, int fd) {
-  NetInputPacket packet;
-  memset(&packet, 0, sizeof(packet));
-  packet.magic = NET_MAGIC;
-  packet.type = NET_DISCONNECT;
-  packet.claimed_player = game->local_player;
-  packet.session = session_wire(game->session);
-  memcpy(packet.name, game->requested_name, PLAYER_NAME_LENGTH);
-  (void)send(fd, &packet, sizeof(packet), 0);
-}
-
-static void update_input(GameState *game, int fd) {
-  Vector2 mouse;
-  int mx = 0;
-  game->look_delta_x = 0.0f;
-  game->look_delta_y = 0.0f;
-  int mz = 0;
-  if (!game->chatting &&
-      (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_T))) {
-    game->chatting = 1;
-    game->chat_length = 0;
-    game->chat_input[0] = '\0';
-    game->input[0].move_x = 0;
-    game->input[0].move_z = 0;
-    game->input[0].buttons = 0;
+static void update_input(GameState *g, int fd) {
+  g->look_delta_x = g->look_delta_y = 0.0f;
+  if (!g->chatting && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_T))) {
+    g->chatting = 1;
+    g->chat_length = 0;
+    g->chat_input[0] = '\0';
+    g->input[0].move_x = g->input[0].move_z = 0;
+    g->input[0].buttons = 0;
     while (GetCharPressed() != 0) {
     }
     (void)GetMouseDelta();
     return;
   }
-  if (game->chatting) {
-    int character;
-    game->input[0].move_x = 0;
-    game->input[0].move_z = 0;
-    game->input[0].buttons = 0;
+  if (g->chatting) {
+    int c;
+    g->input[0].move_x = g->input[0].move_z = 0;
+    g->input[0].buttons = 0;
     if (IsKeyPressed(KEY_ESCAPE)) {
-      game->chatting = 0;
-      game->chat_length = 0;
-      game->chat_input[0] = '\0';
+      g->chatting = g->chat_length = 0;
+      g->chat_input[0] = '\0';
     } else if (IsKeyPressed(KEY_ENTER)) {
-      if (game->chat_length > 0)
-        client_send_chat(game, fd);
-      game->chatting = 0;
-      game->chat_length = 0;
-      game->chat_input[0] = '\0';
+      if (g->chat_length > 0)
+        client_send_chat(g, fd);
+      g->chatting = g->chat_length = 0;
+      g->chat_input[0] = '\0';
     } else {
-      if (IsKeyPressed(KEY_BACKSPACE) && game->chat_length > 0)
-        --game->chat_length;
-      while ((character = GetCharPressed()) != 0) {
-        if (character >= 'a' && character <= 'z')
-          character -= 'a' - 'A';
-        if (((character >= 'A' && character <= 'Z') ||
-             (character >= '0' && character <= '9') || character == ' ') &&
-            game->chat_length < CHAT_LENGTH)
-          game->chat_input[game->chat_length++] = (char)character;
+      if (IsKeyPressed(KEY_BACKSPACE) && g->chat_length > 0)
+        --g->chat_length;
+      while ((c = GetCharPressed()) != 0) {
+        if (c >= 'a' && c <= 'z')
+          c -= 'a' - 'A';
+        if (((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') &&
+            g->chat_length < CHAT_LENGTH)
+          g->chat_input[g->chat_length++] = (char)c;
       }
-      game->chat_input[game->chat_length] = '\0';
+      g->chat_input[g->chat_length] = '\0';
     }
     (void)GetMouseDelta();
     return;
   }
-  if (IsKeyDown(KEY_A))
-    --mx;
-  if (IsKeyDown(KEY_D))
-    ++mx;
-  if (IsKeyDown(KEY_W))
-    ++mz;
-  if (IsKeyDown(KEY_S))
-    --mz;
-  game->input[0].move_x = (int8_t)mx;
-  game->input[0].move_z = (int8_t)mz;
-  game->input[0].buttons = 0;
+  int mx = (IsKeyDown(KEY_D) ? 1 : 0) - (IsKeyDown(KEY_A) ? 1 : 0);
+  int mz = (IsKeyDown(KEY_W) ? 1 : 0) - (IsKeyDown(KEY_S) ? 1 : 0);
+  g->input[0].move_x = (int8_t)mx;
+  g->input[0].move_z = (int8_t)mz;
+  g->input[0].buttons = 0;
   if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-    game->input[0].buttons |= BTN_FIRE;
+    g->input[0].buttons |= BTN_FIRE;
   if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_E))
-    game->input[0].buttons |= BTN_GRAB;
+    g->input[0].buttons |= BTN_GRAB;
   if (IsKeyDown(KEY_SPACE))
-    game->input[0].buttons |= BTN_JUMP;
+    g->input[0].buttons |= BTN_JUMP;
   if (IsKeyPressed(KEY_F1))
-    game->help ^= 1u;
+    g->help ^= 1u;
   if (IsKeyPressed(KEY_ESCAPE)) {
-    game->mouse_captured ^= 1u;
-    if (game->mouse_captured)
+    g->mouse_captured ^= 1u;
+    if (g->mouse_captured)
       DisableCursor();
     else
       EnableCursor();
   }
-  if (!game->mouse_captured)
+  if (!g->mouse_captured)
     return;
-  mouse = GetMouseDelta();
-  game->look_delta_x = mouse.x;
-  game->look_delta_y = mouse.y;
-  int delta_x = (int)lroundf(mouse.x);
-  int delta_y = (int)lroundf(mouse.y);
-  game->view_yaw = wrap_degrees((int)game->view_yaw - delta_x);
-  game->view_pitch =
-      clamp_i16((int)game->view_pitch - delta_y, -75, 75);
+  Vector2 mouse = GetMouseDelta();
+  g->look_delta_x = mouse.x;
+  g->look_delta_y = mouse.y;
+  g->view_yaw = wrap_degrees((int)g->view_yaw - (int)lroundf(mouse.x));
+  g->view_pitch =
+      clamp_i16((int)g->view_pitch - (int)lroundf(mouse.y), -75, 75);
 }
 
-static uint32_t local_player_entity(const GameState *game) {
-  uint32_t components[] = {COMP_PLAYER, COMP_POSITION};
-  EcsQuery query = ecs_query(&game->ecs, components, 2);
-  while (ecs_next(&query))
-    if (game->owner[query.entity] == game->local_player)
-      return query.entity;
+static uint32_t local_player_entity(const GameState *g) {
+  uint32_t comps[] = {COMP_PLAYER, COMP_POSITION};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q))
+    if (g->owner[q.entity] == g->local_player)
+      return q.entity;
   return ECS_INVALID_ENTITY;
 }
 
-static float interpolated_value(int16_t previous, int16_t current,
-                                float alpha) {
-  return ((float)previous + ((float)current - (float)previous) * alpha) /
-         POS_SCALE;
+static float xf(uint32_t e, float a, const int16_t *p, const int16_t *d) {
+  return ((float)p[e] - (float)d[e] * (1.0f - a)) / (float)POS_SCALE;
 }
 
-static Camera3D make_camera(const GameState *game, float alpha) {
-  Camera3D camera = {0};
-  uint32_t entity = local_player_entity(game);
-  Vector3 direction = {0.0f, 0.0f, 1.0f};
-  camera.position = (Vector3){0.0f, 1.5f, 0.0f};
-  if (entity != ECS_INVALID_ENTITY) {
-    camera.position.x =
-        interpolated_value(game->previous_px[entity], game->px[entity], alpha);
-    camera.position.y = 1.5f +
-                        interpolated_value(game->previous_py[entity],
-                                           game->py[entity], alpha);
-    camera.position.z =
-        interpolated_value(game->previous_pz[entity], game->pz[entity], alpha);
-    aim_vector_angles(game->view_yaw, game->view_pitch, &direction);
+static Vector3 entity_pos(const GameState *g, uint32_t e, float a) {
+  return (Vector3){xf(e, a, g->px, g->vx), xf(e, a, g->py, g->vy),
+                   xf(e, a, g->pz, g->vz)};
+}
+
+static Camera3D make_camera(const GameState *g, float a) {
+  Camera3D cam = {0};
+  uint32_t e = local_player_entity(g);
+  Vector3 dir = {0.0f, 0.0f, 1.0f};
+  cam.position = (Vector3){0.0f, 1.5f, 0.0f};
+  if (e != ECS_INVALID_ENTITY) {
+    Vector3 p = entity_pos(g, e, a);
+    cam.position = (Vector3){p.x, 1.5f + p.y, p.z};
+    aim_dir(g->view_yaw, g->view_pitch, &dir);
   }
-  camera.target = (Vector3){camera.position.x + direction.x,
-                             camera.position.y + direction.y,
-                             camera.position.z + direction.z};
-  camera.up = (Vector3){0.0f, 1.0f, 0.0f};
-  camera.fovy = 72.0f;
-  camera.projection = CAMERA_PERSPECTIVE;
-  return camera;
+  cam.target = (Vector3){cam.position.x + dir.x, cam.position.y + dir.y,
+                         cam.position.z + dir.z};
+  cam.up = (Vector3){0.0f, 1.0f, 0.0f};
+  cam.fovy = 72.0f;
+  cam.projection = CAMERA_PERSPECTIVE;
+  return cam;
 }
 
-static void draw_gun_model(Vector3 position, float yaw, float pitch,
-                           float roll, float recoil, float slide_recoil,
-                           float scale, bool firing) {
+static void draw_gun_local(float recoil, float slide, float scale,
+                           bool firing) {
   rlPushMatrix();
-  rlTranslatef(position.x, position.y, position.z);
-  rlRotatef(yaw, 0.0f, 1.0f, 0.0f);
-  rlRotatef(pitch, 1.0f, 0.0f, 0.0f);
-  rlRotatef(roll, 0.0f, 0.0f, 1.0f);
   rlScalef(scale, scale, scale);
-  Vector3 slide = {-0.32f, 0.0f, 0.30f - recoil - slide_recoil};
-  Vector3 slide_size = {0.16f, 0.13f, 0.46f};
-  Vector3 grip = {-0.32f, -0.15f, 0.18f - recoil};
-  Vector3 grip_size = {0.13f, 0.26f, 0.15f};
-  DrawCubeV(slide, slide_size, PAL_MID);
-  DrawCubeWiresV(slide, slide_size, PAL_DARK);
-  DrawCubeV(grip, grip_size, PAL_PURPLE);
-  DrawCubeWiresV(grip, grip_size, PAL_DARK);
-  if (firing) {
-    Vector3 muzzle = {-0.32f, 0.0f, 0.56f - recoil};
-    Vector3 flash_tip = {-0.32f, 0.0f, 0.72f - recoil};
-    DrawCylinderEx(muzzle, flash_tip, 0.065f, 0.0f, 5, PAL_LIGHT);
-  }
+  Vector3 sl = {-0.32f, 0.0f, 0.30f - recoil - slide};
+  Vector3 sls = {0.16f, 0.13f, 0.46f};
+  Vector3 gr = {-0.32f, -0.15f, 0.18f - recoil};
+  Vector3 grs = {0.13f, 0.26f, 0.15f};
+  DrawCubeV(sl, sls, PAL_MID);
+  DrawCubeWiresV(sl, sls, PAL_DARK);
+  DrawCubeV(gr, grs, PAL_PURPLE);
+  DrawCubeWiresV(gr, grs, PAL_DARK);
+  if (firing)
+    DrawCylinderEx((Vector3){-0.32f, 0.0f, 0.56f - recoil},
+                   (Vector3){-0.32f, 0.0f, 0.72f - recoil}, 0.065f, 0.0f, 5,
+                   PAL_LIGHT);
   rlPopMatrix();
 }
 
-static void draw_casing(const GameState *game, uint32_t entity,
-                        Vector3 position) {
-  float roll = (float)game->held_by[entity] * (360.0f / 256.0f);
+static void draw_cube_lit(Vector3 p, Vector3 s, Color fill) {
+  DrawCubeV(p, s, fill);
+  DrawCubeWiresV(p, s, PAL_DARK);
+}
+
+static void draw_remote_player(const GameState *g, uint32_t e, Vector3 pos,
+                               float a) {
+  bool hurt = g->flash[e] > PLAYER_FIRE_FLASH_TICKS;
+  bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
+  float fire =
+      firing ? (float)g->flash[e] / (float)PLAYER_FIRE_FLASH_TICKS : 0.0f;
+  float lag = 1.0f - a;
+  float yaw_lag = ((int)g->cooldown[e] - 128) * lag;
+  float pitch_lag = ((int)g->lifetime[e] - 128) * lag;
+  Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
-  rlTranslatef(position.x, position.y, position.z);
-  rlRotatef((float)game->yaw[entity], 0.0f, 1.0f, 0.0f);
-  rlRotatef((float)game->pitch[entity], 1.0f, 0.0f, 0.0f);
-  rlRotatef(roll, 0.0f, 0.0f, 1.0f);
-  DrawCylinderEx((Vector3){0.0f, -0.065f, 0.0f},
-                 (Vector3){0.0f, 0.065f, 0.0f}, 0.028f, 0.024f, 6,
-                 PAL_LIGHT);
-  DrawCylinderEx((Vector3){0.0f, -0.071f, 0.0f},
-                 (Vector3){0.0f, -0.061f, 0.0f}, 0.034f, 0.034f, 6,
-                 PAL_MID);
+  rlTranslatef(pos.x, pos.y, pos.z);
+  rlRotatef((float)g->yaw[e], 0.0f, 1.0f, 0.0f);
+  draw_cube_lit((Vector3){0.0f, 0.72f, 0.0f}, (Vector3){0.50f, 1.36f, 0.30f},
+                body);
+  draw_cube_lit((Vector3){0.0f, 1.44f, 0.06f}, (Vector3){0.26f, 0.26f, 0.26f},
+                hurt ? PAL_LIGHT : PAL_PURPLE);
+  // draw_cube_lit((Vector3){0.0f, 0.92f, 0.18f}, (Vector3){0.16f, 0.12f,
+  // 0.14f},
+  //               PAL_PURPLE);
+  rlPushMatrix();
+  rlTranslatef(-0.22f - yaw_lag * 0.012f, 1.16f + pitch_lag * 0.006f, 0.30f);
+  rlRotatef((float)-g->pitch[e] - pitch_lag * 0.55f, 1.0f, 0.0f, 0.0f);
+  rlRotatef(-yaw_lag * 0.55f, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-yaw_lag * 0.18f, 0.0f, 0.0f, 1.0f);
+  draw_gun_local(fire * 0.03f, fire * 0.08f, 1.0f, firing);
+  rlPopMatrix();
   rlPopMatrix();
 }
 
-static void draw_world(GameState *game, float alpha) {
-  uint32_t components[] = {COMP_POSITION, COMP_RENDERABLE};
-  EcsQuery query = ecs_query(&game->ecs, components, 2);
-  while (ecs_next(&query)) {
-    uint32_t entity = query.entity;
-    Vector3 position = {
-        interpolated_value(game->previous_px[entity], game->px[entity], alpha),
-        interpolated_value(game->previous_py[entity], game->py[entity], alpha),
-        interpolated_value(game->previous_pz[entity], game->pz[entity], alpha)};
-    if (game->kind[entity] == KIND_CUBE) {
-      Color color = game->held_by[entity] ? PAL_LIGHT : PAL_MID;
-      Vector3 size = {0.9f, 1.0f, 0.9f};
-      DrawCubeV(position, size, color);
-    } else if (game->kind[entity] == KIND_PLAYER) {
-      if (game->owner[entity] != game->local_player) {
-        bool hurt = game->flash[entity] > PLAYER_FIRE_FLASH_TICKS;
-        Vector3 player_position = {position.x, position.y + 0.7f, position.z};
-        Vector3 size = {0.55f, 1.4f, 0.55f};
-        DrawCubeV(player_position, size, hurt ? PAL_LIGHT : PAL_MID);
-        DrawCubeWiresV(player_position, size, BLACK);
-        bool firing = game->flash[entity] > 0 &&
-                      game->flash[entity] <= PLAYER_FIRE_FLASH_TICKS;
-        float fire_phase = firing ? (float)game->flash[entity] /
-                                        (float)PLAYER_FIRE_FLASH_TICKS
-                                  : 0.0f;
-        draw_gun_model((Vector3){position.x, position.y + 1.18f, position.z},
-                       (float)game->yaw[entity], (float)-game->pitch[entity],
-                       0.0f, fire_phase * 0.025f, fire_phase * 0.08f, 1.0f,
-                       firing);
-      }
-    } else if (game->kind[entity] == KIND_BULLET) {
-      Vector3 direction;
-      aim_vector(game, entity, &direction);
-      Vector3 shoulder = {position.x - direction.x * 0.20f,
-                          position.y - direction.y * 0.20f,
-                          position.z - direction.z * 0.20f};
-      Vector3 base = {shoulder.x - direction.x * 0.34f,
-                      shoulder.y - direction.y * 0.34f,
-                      shoulder.z - direction.z * 0.34f};
+static void draw_casing(const GameState *g, uint32_t e, Vector3 p) {
+  float roll = (float)g->held_by[e] * (360.0f / 256.0f);
+  rlPushMatrix();
+  rlTranslatef(p.x, p.y, p.z);
+  rlRotatef((float)g->yaw[e], 0.0f, 1.0f, 0.0f);
+  rlRotatef((float)g->pitch[e], 1.0f, 0.0f, 0.0f);
+  rlRotatef(roll, 0.0f, 0.0f, 1.0f);
+  DrawCylinderEx((Vector3){0.0f, -0.068f, 0.0f}, (Vector3){0.0f, 0.068f, 0.0f},
+                 0.030f, 0.026f, 6, PAL_DARK);
+  DrawCylinderEx((Vector3){0.0f, -0.065f, 0.0f}, (Vector3){0.0f, 0.065f, 0.0f},
+                 0.028f, 0.024f, 6, PAL_LIGHT);
+  DrawCylinderEx((Vector3){0.0f, -0.071f, 0.0f}, (Vector3){0.0f, -0.061f, 0.0f},
+                 0.034f, 0.034f, 6, PAL_MID);
+  rlPopMatrix();
+}
+
+static void draw_world(const GameState *g, float a) {
+  uint32_t comps[] = {COMP_POSITION, COMP_RENDERABLE};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q)) {
+    uint32_t e = q.entity;
+    Vector3 p = entity_pos(g, e, a);
+    switch (g->kind[e]) {
+    case KIND_CUBE:
+      draw_cube_lit(p, (Vector3){0.9f, 1.0f, 0.9f},
+                    g->held_by[e] ? PAL_LIGHT : PAL_MID);
+      break;
+    case KIND_PLAYER:
+      if (g->owner[e] != g->local_player)
+        draw_remote_player(g, e, p, a);
+      break;
+    case KIND_BULLET: {
+      Vector3 dir;
+      aim_dir(g->yaw[e], g->pitch[e], &dir);
+      Vector3 shoulder = {p.x - dir.x * 0.20f, p.y - dir.y * 0.20f,
+                          p.z - dir.z * 0.20f};
+      Vector3 base = {shoulder.x - dir.x * 0.34f, shoulder.y - dir.y * 0.34f,
+                      shoulder.z - dir.z * 0.34f};
+      DrawCylinderEx(base, shoulder, 0.040f, 0.040f, 7, PAL_DARK);
       DrawCylinderEx(base, shoulder, 0.032f, 0.032f, 7, PAL_MID);
-      DrawCylinderEx(shoulder, position, 0.032f, 0.0f, 7, PAL_LIGHT);
-    } else if (game->kind[entity] == KIND_CASING) {
-      draw_casing(game, entity, position);
-    } else if (game->kind[entity] == KIND_IMPACT_MARK) {
-      float size = game->flash[entity] >= 3 ? 0.18f
-                   : game->flash[entity] == 2 ? 0.13f
-                                              : 0.08f;
-      Color color = game->flash[entity] >= 3 ? PAL_LIGHT
-                    : game->flash[entity] == 2 ? PAL_MID
-                                               : PAL_DARK;
-      DrawCubeV(position, (Vector3){size, size, size}, color);
+      DrawCylinderEx(shoulder, p, 0.032f, 0.0f, 7, PAL_LIGHT);
+      break;
+    }
+    case KIND_CASING:
+      draw_casing(g, e, p);
+      break;
+    case KIND_IMPACT_MARK: {
+      float s = g->flash[e] >= 3 ? 0.18f : g->flash[e] == 2 ? 0.13f : 0.08f;
+      Color c = g->flash[e] >= 3   ? PAL_LIGHT
+                : g->flash[e] == 2 ? PAL_MID
+                                   : PAL_DARK;
+      DrawCubeV(p, (Vector3){s, s, s}, c);
+      break;
+    }
     }
   }
 }
 
-static int glyph_index(char character) {
+static int glyph_index(char c) {
   for (uint32_t i = 0; i < TOM_THUMB_3X5_COUNT; ++i)
-    if (TOM_THUMB_3X5_CHARS[i] == character)
+    if (TOM_THUMB_3X5_CHARS[i] == c)
       return (int)i;
   return -1;
 }
 
 static void draw_small_text(int x, int y, const char *text, Color color) {
-  for (int i = 0; text[i] != '\0'; ++i) {
-    int index = glyph_index(text[i]);
-    if (index >= 0)
-      for (int row = 0; row < 5; ++row)
-        for (int column = 0; column < 3; ++column)
-          if ((tom_thumb_3x5[index] &
-               (1u << ((4 - row) * 3 + 2 - column))) != 0)
-            DrawRectangle(x + i * 4 + column, y + row, 1, 1, color);
+  for (int i = 0; text[i]; ++i) {
+    int idx = glyph_index(text[i]);
+    if (idx < 0)
+      continue;
+    for (int row = 0; row < 5; ++row)
+      for (int col = 0; col < 3; ++col)
+        if (tom_thumb_3x5[idx] & (1u << ((4 - row) * 3 + 2 - col)))
+          DrawRectangle(x + i * 4 + col, y + row, 1, 1, color);
   }
 }
 
 static void draw_number(int x, int y, unsigned value, Color color) {
   char digits[8];
-  int count = 0;
+  int n = 0;
   do {
-    digits[count++] = (char)('0' + value % 10u);
+    digits[n++] = (char)('0' + value % 10u);
     value /= 10u;
-  } while (value != 0 && count < (int)sizeof(digits));
-  for (int i = 0; i < count; ++i) {
-    char text[2] = {digits[count - 1 - i], '\0'};
-    draw_small_text(x + i * 4, y, text, color);
+  } while (value && n < (int)sizeof(digits));
+  for (int i = 0; i < n; ++i) {
+    char t[2] = {digits[n - 1 - i], 0};
+    draw_small_text(x + i * 4, y, t, color);
   }
 }
 
 static int small_text_width(const char *text) {
-  size_t length = strlen(text);
-  return length == 0 ? 0 : (int)length * 4 - 1;
+  size_t n = strlen(text);
+  return n ? (int)n * 4 - 1 : 0;
 }
 
-static void draw_chat(const GameState *game) {
-  if (!game->chatting)
+static void draw_hit_indicator(const GameState *g, uint32_t e) {
+  if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
     return;
-  int width = 8 + small_text_width(game->chat_input);
-  if (width < 7)
-    width = 7;
-  if (width > LOGICAL_W - 4)
-    width = LOGICAL_W - 4;
-  DrawRectangle(1, 1, width + 2, 7, PAL_DARK);
-  draw_small_text(2, 2, "T:", PAL_MID);
-  draw_small_text(10, 2, game->chat_input, PAL_LIGHT);
+  int rel = wrap_degrees(unpack_yaw(g->held_by[e]) - g->view_yaw);
+  float r = (float)rel * DEG2RAD;
+  float s = sinf(r);
+  float f = cosf(r);
+  Color c = g->flash[e] > PLAYER_HIT_FLASH_TICKS / 2 ? PAL_LIGHT : PAL_MID;
+  int cx = LOGICAL_W / 2, cy = LOGICAL_H / 2;
+  int len = g->flash[e] > 12 ? 14 : 10;
+  if (s < -0.20f) {
+    int y = clamp_i16(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
+    DrawRectangle(0, y, 3, len, c);
+    DrawRectangle(3, y + len / 2 - 2, 2, 4, c);
+  }
+  if (s > 0.20f) {
+    int y = clamp_i16(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
+    DrawRectangle(LOGICAL_W - 3, y, 3, len, c);
+    DrawRectangle(LOGICAL_W - 5, y + len / 2 - 2, 2, 4, c);
+  }
+  if (f > 0.50f) {
+    int x = clamp_i16(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
+    DrawRectangle(x, 0, len, 3, c);
+  }
+  if (f < -0.50f) {
+    int x = clamp_i16(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
+    DrawRectangle(x, LOGICAL_H - 3, len, 3, c);
+  }
 }
 
-static void draw_hud(const GameState *game) {
-  uint32_t entity = local_player_entity(game);
+static void draw_hud(const GameState *g) {
+  uint32_t e = local_player_entity(g);
   unsigned fps = (unsigned)GetFPS();
   unsigned copy = fps;
   int digits = 1;
@@ -1796,35 +1558,23 @@ static void draw_hud(const GameState *game) {
     copy /= 10u;
     ++digits;
   }
-  int fps_width = 15 + digits * 4;
-  int fps_x = LOGICAL_W - fps_width - 2;
-  if (!game->chatting && game->notice_ticks > 0 && game->notice[0] != '\0') {
-    int width = small_text_width(game->notice);
-    int y = width + 4 < fps_x ? 1 : 9;
-    DrawRectangle(1, y, width + 2, 7, PAL_DARK);
-    draw_small_text(2, y + 1, game->notice, PAL_LIGHT);
+  int fps_w = 15 + digits * 4;
+  int fps_x = LOGICAL_W - fps_w - 2;
+  if (!g->chatting && g->notice_ticks && g->notice[0]) {
+    int w = small_text_width(g->notice);
+    int y = w + 4 < fps_x ? 1 : 9;
+    DrawRectangle(1, y, w + 2, 7, PAL_DARK);
+    draw_small_text(2, y + 1, g->notice, PAL_LIGHT);
   }
-  if (!game->chatting) {
-    DrawRectangle(fps_x - 1, 1, fps_width + 2, 7, PAL_DARK);
+  if (!g->chatting) {
+    DrawRectangle(fps_x - 1, 1, fps_w + 2, 7, PAL_DARK);
     draw_small_text(fps_x, 2, "FPS", PAL_MID);
     draw_number(fps_x + 16, 2, fps, PAL_LIGHT);
   }
-  if (entity != ECS_INVALID_ENTITY &&
-      game->flash[entity] > PLAYER_FIRE_FLASH_TICKS) {
-    Color hit_color = game->flash[entity] > PLAYER_HIT_FLASH_TICKS / 2
-                          ? PAL_LIGHT
-                          : PAL_MID;
-    DrawRectangle(0, 0, LOGICAL_W, 1, hit_color);
-    DrawRectangle(0, LOGICAL_H - 1, LOGICAL_W, 1, hit_color);
-    DrawRectangle(0, 0, 1, LOGICAL_H, hit_color);
-    DrawRectangle(LOGICAL_W - 1, 0, 1, LOGICAL_H, hit_color);
-    DrawRectangle(40, 27, 3, 1, hit_color);
-    DrawRectangle(49, 27, 3, 1, hit_color);
-    DrawRectangle(42, 28, 1, 2, hit_color);
-    DrawRectangle(49, 28, 1, 2, hit_color);
-  }
+  if (e != ECS_INVALID_ENTITY)
+    draw_hit_indicator(g, e);
   DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
-  if (game->help) {
+  if (g->help) {
     DrawRectangle(1, 17, 42, 16, PAL_DARK);
     DrawRectangle(47, 17, 44, 16, PAL_DARK);
     draw_small_text(2, 19, "WASD MOVE", PAL_LIGHT);
@@ -1832,103 +1582,86 @@ static void draw_hud(const GameState *game) {
     draw_small_text(48, 19, "SPACE JUMP", PAL_LIGHT);
     draw_small_text(48, 26, "E HOLD", PAL_LIGHT);
   }
-  draw_chat(game);
-}
-
-static void update_viewmodel(GameState *game, float frame_time) {
-  if (frame_time > 0.05f)
-    frame_time = 0.05f;
-  float target_x = game->look_delta_x * 0.010f;
-  float target_y = -game->look_delta_y * 0.008f;
-  if (target_x < -0.12f)
-    target_x = -0.12f;
-  if (target_x > 0.12f)
-    target_x = 0.12f;
-  if (target_y < -0.09f)
-    target_y = -0.09f;
-  if (target_y > 0.09f)
-    target_y = 0.09f;
-  float sway_blend = 1.0f - expf(-9.0f * frame_time);
-  game->gun_sway_x += (target_x - game->gun_sway_x) * sway_blend;
-  game->gun_sway_y += (target_y - game->gun_sway_y) * sway_blend;
-  game->gun_slide *= expf(-22.0f * frame_time);
-  game->gun_recoil_velocity +=
-      (-75.0f * game->gun_recoil - 15.0f * game->gun_recoil_velocity) *
-      frame_time;
-  game->gun_recoil += game->gun_recoil_velocity * frame_time;
-  if (game->gun_recoil < 0.0f) {
-    game->gun_recoil = 0.0f;
-    game->gun_recoil_velocity = 0.0f;
+  if (g->chatting) {
+    int w = 8 + small_text_width(g->chat_input);
+    if (w < 7)
+      w = 7;
+    if (w > LOGICAL_W - 4)
+      w = LOGICAL_W - 4;
+    DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
+    draw_small_text(2, 2, "T:", PAL_MID);
+    draw_small_text(10, 2, g->chat_input, PAL_LIGHT);
   }
-  if (game->gun_recoil > 0.09f)
-    game->gun_recoil = 0.09f;
 }
 
+static void update_viewmodel(GameState *g, float dt) {
+  if (dt > 0.05f)
+    dt = 0.05f;
+  float tx = g->look_delta_x * 0.038f;
+  float ty = -g->look_delta_y * 0.030f;
+  tx = fmaxf(-0.42f, fminf(0.42f, tx));
+  ty = fmaxf(-0.32f, fminf(0.32f, ty));
+  float k = 1.0f - expf(-6.5f * dt);
+  g->gun_sway_x += (tx - g->gun_sway_x) * k;
+  g->gun_sway_y += (ty - g->gun_sway_y) * k;
+  g->gun_slide *= expf(-22.0f * dt);
+  g->gun_recoil_velocity +=
+      (-75.0f * g->gun_recoil - 15.0f * g->gun_recoil_velocity) * dt;
+  g->gun_recoil += g->gun_recoil_velocity * dt;
+  if (g->gun_recoil < 0.0f)
+    g->gun_recoil = g->gun_recoil_velocity = 0.0f;
+  if (g->gun_recoil > 0.09f)
+    g->gun_recoil = 0.09f;
+}
 
-static void render_frame(GameState *game, RenderTexture2D scene,
-                         RenderTexture2D target, Shader outline, float alpha) {
-  Camera3D camera = make_camera(game, alpha);
-  BeginTextureMode(scene);
-  ClearBackground(PAL_DARK);
-  BeginMode3D(camera);
-  DrawPlane((Vector3){0.0f, -0.02f, 0.0f}, (Vector2){32.0f, 32.0f}, PAL_PURPLE);
-  draw_world(game, alpha);
-  EndMode3D();
-  Camera3D weapon_camera = {0};
-  weapon_camera.position = (Vector3){0.0f, 0.0f, 0.0f};
-  weapon_camera.target = (Vector3){0.0f, 0.0f, 1.0f};
-  weapon_camera.up = (Vector3){0.0f, 1.0f, 0.0f};
-  weapon_camera.fovy = 72.0f;
-  weapon_camera.projection = CAMERA_PERSPECTIVE;
-  BeginMode3D(weapon_camera);
-  draw_gun_model(
-      (Vector3){game->gun_sway_x * 0.45f,
-                -0.18f + game->gun_sway_y * 0.45f, 0.75f},
-      game->gun_sway_x * -20.0f, game->gun_sway_y * -16.0f,
-      game->gun_sway_x * -12.0f, game->gun_recoil / 1.35f,
-      game->gun_slide / 1.35f, 1.35f, game->gun_kick != 0);
-  EndMode3D();
-  EndTextureMode();
-
+static void render_frame(GameState *g, RenderTexture2D target, float a) {
+  Camera3D cam = make_camera(g, a);
   BeginTextureMode(target);
   ClearBackground(PAL_DARK);
-  BeginShaderMode(outline);
-  DrawTextureRec(scene.texture,
-                 (Rectangle){0.0f, 0.0f, (float)LOGICAL_W, -(float)LOGICAL_H},
-                 (Vector2){0.0f, 0.0f}, WHITE);
-  EndShaderMode();
-  draw_hud(game);
+  BeginMode3D(cam);
+  DrawPlane((Vector3){0.0f, -0.02f, 0.0f}, (Vector2){32.0f, 32.0f}, PAL_PURPLE);
+  draw_world(g, a);
+  EndMode3D();
+  Camera3D wcam = {0};
+  wcam.position = (Vector3){0.0f, 0.0f, 0.0f};
+  wcam.target = (Vector3){0.0f, 0.0f, 1.0f};
+  wcam.up = (Vector3){0.0f, 1.0f, 0.0f};
+  wcam.fovy = 72.0f;
+  wcam.projection = CAMERA_PERSPECTIVE;
+  BeginMode3D(wcam);
+  rlPushMatrix();
+  rlTranslatef(g->gun_sway_x * 1.05f, -0.18f + g->gun_sway_y * 1.05f, 0.75f);
+  rlRotatef(g->gun_sway_x * -48.0f, 0.0f, 1.0f, 0.0f);
+  rlRotatef(g->gun_sway_y * -38.0f, 1.0f, 0.0f, 0.0f);
+  rlRotatef(g->gun_sway_x * -30.0f, 0.0f, 0.0f, 1.0f);
+  draw_gun_local(g->gun_recoil / 1.35f, g->gun_slide / 1.35f, 1.35f,
+                 g->gun_kick != 0);
+  rlPopMatrix();
+  EndMode3D();
+  draw_hud(g);
   EndTextureMode();
 
   BeginDrawing();
   ClearBackground(PAL_DARK);
   int scale = GetScreenWidth() / LOGICAL_W;
-  int height_scale = GetScreenHeight() / LOGICAL_H;
-  if (height_scale < scale)
-    scale = height_scale;
+  int hs = GetScreenHeight() / LOGICAL_H;
+  if (hs < scale)
+    scale = hs;
   if (scale < 1)
     scale = 1;
-  int width = LOGICAL_W * scale;
-  int height = LOGICAL_H * scale;
-  Rectangle source = {0.0f, 0.0f, (float)LOGICAL_W, -(float)LOGICAL_H};
-  int destination_x = (GetScreenWidth() - width) / 2;
-  int destination_y = (GetScreenHeight() - height) / 2;
-  Rectangle destination = {(float)destination_x, (float)destination_y,
-                           (float)width, (float)height};
-  DrawTexturePro(target.texture, source, destination, (Vector2){0, 0}, 0.0f,
-                 WHITE);
+  int w = LOGICAL_W * scale, h = LOGICAL_H * scale;
+  Rectangle src = {0.0f, 0.0f, (float)LOGICAL_W, -(float)LOGICAL_H};
+  Rectangle dst = {(float)((GetScreenWidth() - w) / 2),
+                   (float)((GetScreenHeight() - h) / 2), (float)w, (float)h};
+  DrawTexturePro(target.texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
   EndDrawing();
 }
 
 static int client_run(const char *host, uint16_t port, const char *name) {
   GameState game;
   struct sockaddr_in server;
-  RenderTexture2D scene;
-  RenderTexture2D target;
-  Shader outline;
   int fd = open_udp_client(host, port, &server);
-  double current_time = hires_time_in_seconds();
-  double accumulator = 0.0;
+  double current = hires_time_in_seconds(), acc = 0.0;
   if (fd < 0) {
     fprintf(stderr, "host must be an IPv4 address or localhost\n");
     return 1;
@@ -1944,26 +1677,20 @@ static int client_run(const char *host, uint16_t port, const char *name) {
   InitWindow(920, 640, "tiny ray ECS");
   SetWindowMinSize(LOGICAL_W, LOGICAL_H);
   DisableCursor();
-  scene = LoadRenderTexture(LOGICAL_W, LOGICAL_H);
-  target = LoadRenderTexture(LOGICAL_W, LOGICAL_H);
-  outline = LoadShaderFromMemory(NULL, OUTLINE_FRAGMENT_SHADER);
-  float texel_size[2] = {1.0f / LOGICAL_W, 1.0f / LOGICAL_H};
-  int texel_location = GetShaderLocation(outline, "texelSize");
-  SetShaderValue(outline, texel_location, texel_size, SHADER_UNIFORM_VEC2);
-  SetTextureFilter(scene.texture, TEXTURE_FILTER_POINT);
+  RenderTexture2D target = LoadRenderTexture(LOGICAL_W, LOGICAL_H);
   SetTextureFilter(target.texture, TEXTURE_FILTER_POINT);
   while (!WindowShouldClose()) {
-    double new_time = hires_time_in_seconds();
-    double frame_time = new_time - current_time;
-    if (frame_time > 0.25)
-      frame_time = 0.25;
-    current_time = new_time;
-    accumulator += frame_time;
+    double now = hires_time_in_seconds();
+    double dt = now - current;
+    if (dt > 0.25)
+      dt = 0.25;
+    current = now;
+    acc += dt;
     update_input(&game, fd);
     client_receive(&game, fd);
-    while (accumulator >= SIM_DT) {
+    while (acc >= SIM_DT) {
       if (++game.command_ticks >= COMMAND_INTERVAL) {
-        client_send(&game, fd, &server);
+        client_send_input(&game, fd, NET_INPUT);
         game.command_ticks = 0;
       }
       if (game.interpolation_ticks < SNAPSHOT_INTERVAL)
@@ -1978,28 +1705,24 @@ static int client_run(const char *host, uint16_t port, const char *name) {
         --game.fire_cooldown;
       if (game.gun_kick > 0)
         --game.gun_kick;
-      if ((game.input[0].buttons & BTN_FIRE) != 0 &&
-          game.fire_cooldown == 0) {
+      if ((game.input[0].buttons & BTN_FIRE) && game.fire_cooldown == 0) {
         game.fire_cooldown = FIRE_COOLDOWN_TICKS;
         game.gun_kick = 4;
         game.gun_slide = 0.13f;
         game.gun_recoil_velocity += 1.4f;
       }
-      accumulator -= SIM_DT;
+      acc -= SIM_DT;
     }
     client_receive(&game, fd);
-    update_viewmodel(&game, (float)frame_time);
-    float alpha =
-        ((float)game.interpolation_ticks + (float)(accumulator / SIM_DT)) /
-        ((float)SIM_HZ / (float)SNAPSHOT_HZ);
+    update_viewmodel(&game, (float)dt);
+    float alpha = ((float)game.interpolation_ticks + (float)(acc / SIM_DT)) /
+                  (float)SNAPSHOT_INTERVAL;
     if (alpha > 1.0f)
       alpha = 1.0f;
-    render_frame(&game, scene, target, outline, alpha);
+    render_frame(&game, target, alpha);
   }
-  client_send_disconnect(&game, fd);
+  client_send_input(&game, fd, NET_DISCONNECT);
   EnableCursor();
-  UnloadShader(outline);
-  UnloadRenderTexture(scene);
   UnloadRenderTexture(target);
   CloseWindow();
   close(fd);

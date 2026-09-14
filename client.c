@@ -37,6 +37,10 @@ static void renew_client_session(GameState *g) {
   g->next_sequence = g->next_chat_sequence = 0;
   g->last_snapshot_tick = g->last_chat_sequence = 0;
   g->snapshot_silence_ticks = 0;
+  g->gun_kick = 0;
+  g->gun_recoil = g->gun_recoil_velocity = 0.0f;
+  g->gun_rise = g->gun_rise_velocity = 0.0f;
+  g->gun_slide = 0.0f;
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
@@ -111,13 +115,11 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
     g->vy[e] = snap_pos ? 0 : dy;
     g->vz[e] = snap_pos ? 0 : dz;
     if (had && w->kind == KIND_PLAYER) {
-      g->cooldown[e] =
-          (u8)clamp_i16(wrap_degrees(w->yaw - g->yaw[e]) + 128, 0, 255);
-      g->lifetime[e] =
-          (u8)clamp_i16((int)w->pitch - (int)g->pitch[e] + 128, 0, 255);
+      g->lag_yaw[e] = lag_encode(wrap_degrees(w->yaw - g->yaw[e]));
+      g->lag_pitch[e] = lag_encode((int)w->pitch - (int)g->pitch[e]);
     } else if (w->kind == KIND_PLAYER) {
-      g->cooldown[e] = 128;
-      g->lifetime[e] = 128;
+      g->lag_yaw[e] = LAG_NEUTRAL;
+      g->lag_pitch[e] = LAG_NEUTRAL;
     }
     g->kind[e] = w->kind;
     g->owner[e] = w->owner;
@@ -128,6 +130,14 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
     g->pitch[e] = w->pitch;
     g->flash[e] = w->flags;
     g->held_by[e] = w->extra;
+    if (w->kind == KIND_PLAYER) {
+      if (!had)
+        weapon_set_from_snapshot(g, e, w->weapon, w->ammo,
+                                 w->reloading != 0);
+      else
+        weapon_apply_snapshot(g, e, w->weapon, w->ammo,
+                              w->reloading != 0);
+    }
     add_kind_components(g, e, w->kind);
   }
   g->interpolation_ticks = 0;
@@ -347,8 +357,9 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
   f32 lag = 1.0f - a;
-  f32 yaw_lag = ((int)g->cooldown[e] - 128) * lag;
-  f32 pitch_lag = ((int)g->lifetime[e] - 128) * lag;
+  f32 yaw_lag = (f32)lag_decode(g->lag_yaw[e]) * lag;
+  f32 pitch_lag = (f32)lag_decode(g->lag_pitch[e]) * lag;
+  bool reloading = weapon_is_reloading(g, e);
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
@@ -358,10 +369,17 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   draw_cube_lit((Vector3){0.0f, 1.44f, 0.06f}, (Vector3){0.26f, 0.26f, 0.26f},
                 hurt ? PAL_LIGHT : PAL_PURPLE);
   rlPushMatrix();
-  rlTranslatef(-0.22f - yaw_lag * 0.012f, 1.16f + pitch_lag * 0.006f, 0.30f);
-  rlRotatef((f32)-g->pitch[e] - pitch_lag * 0.55f, 1.0f, 0.0f, 0.0f);
-  rlRotatef(-yaw_lag * 0.55f, 0.0f, 1.0f, 0.0f);
-  rlRotatef(-yaw_lag * 0.18f, 0.0f, 0.0f, 1.0f);
+  rlTranslatef(-0.22f - yaw_lag * 0.018f, 1.16f + pitch_lag * 0.009f +
+                                              fire * 0.05f -
+                                              (reloading ? 0.10f : 0.0f),
+               0.30f - fire * 0.02f);
+  // True recoil climb for remotes plus stronger turn bob with up/down
+  // cross-coupling from yaw motion.
+  rlRotatef((f32)-g->pitch[e] - pitch_lag * 0.80f - yaw_lag * 0.28f -
+                fire * 13.0f + (reloading ? 26.0f : 0.0f),
+            1.0f, 0.0f, 0.0f);
+  rlRotatef(-yaw_lag * 0.85f, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-yaw_lag * 0.30f, 0.0f, 0.0f, 1.0f);
   draw_gun_local(fire * 0.03f, fire * 0.08f, 1.0f, firing);
   rlPopMatrix();
   rlPopMatrix();
@@ -374,12 +392,12 @@ static void draw_casing(const GameState *g, u32 e, Vector3 p) {
   rlRotatef((f32)g->yaw[e], 0.0f, 1.0f, 0.0f);
   rlRotatef((f32)g->pitch[e], 1.0f, 0.0f, 0.0f);
   rlRotatef(roll, 0.0f, 0.0f, 1.0f);
-  DrawCylinderEx((Vector3){0.0f, -0.068f, 0.0f}, (Vector3){0.0f, 0.068f, 0.0f},
-                 0.030f, 0.026f, 6, PAL_DARK);
-  DrawCylinderEx((Vector3){0.0f, -0.065f, 0.0f}, (Vector3){0.0f, 0.065f, 0.0f},
-                 0.028f, 0.024f, 6, PAL_LIGHT);
-  DrawCylinderEx((Vector3){0.0f, -0.071f, 0.0f}, (Vector3){0.0f, -0.061f, 0.0f},
-                 0.034f, 0.034f, 6, PAL_MID);
+  DrawCylinderEx((Vector3){0.0f, -0.085f, 0.0f}, (Vector3){0.0f, 0.085f, 0.0f},
+                 0.048f, 0.042f, 6, PAL_DARK);
+  DrawCylinderEx((Vector3){0.0f, -0.082f, 0.0f}, (Vector3){0.0f, 0.082f, 0.0f},
+                 0.044f, 0.038f, 6, PAL_LIGHT);
+  DrawCylinderEx((Vector3){0.0f, -0.089f, 0.0f}, (Vector3){0.0f, -0.075f, 0.0f},
+                 0.052f, 0.052f, 6, PAL_MID);
   rlPopMatrix();
 }
 
@@ -518,6 +536,25 @@ static void draw_hud(GameState *g) {
   if (e != ECS_INVALID_ENTITY)
     draw_hit_indicator(g, e);
   DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
+  if (e != ECS_INVALID_ENTITY && g->connected) {
+    bool reloading = weapon_is_reloading(g, e);
+    unsigned ammo = weapon_ammo(g, e);
+    unsigned mag = weapon_mag_size(g, e);
+    if (ammo > mag)
+      ammo = mag;
+    if (reloading) {
+      DrawRectangle(LOGICAL_W - 32, LOGICAL_H - 9, 30, 7, PAL_DARK);
+      draw_small_text(LOGICAL_W - 31, LOGICAL_H - 8, STR("R"), PAL_MID);
+      draw_small_text(LOGICAL_W - 26, LOGICAL_H - 8, STR("RELOAD"), PAL_LIGHT);
+    } else {
+      DrawRectangle(LOGICAL_W - 26, LOGICAL_H - 9, 24, 7, PAL_DARK);
+      draw_number(LOGICAL_W - 25, LOGICAL_H - 8, ammo, PAL_LIGHT);
+      int num_w = ammo >= 10 ? 7 : 3;
+      int slash_x = LOGICAL_W - 25 + num_w + 2;
+      draw_small_text(slash_x, LOGICAL_H - 8, STR("/"), PAL_MID);
+      draw_number(slash_x + 4, LOGICAL_H - 8, mag, PAL_MID);
+    }
+  }
   if (g->help) {
     DrawRectangle(1, 17, 42, 16, PAL_DARK);
     DrawRectangle(47, 17, 44, 16, PAL_DARK);
@@ -542,11 +579,12 @@ static void draw_hud(GameState *g) {
 static void update_viewmodel(GameState *g, f32 dt) {
   if (dt > 0.05f)
     dt = 0.05f;
-  f32 tx = g->look_delta_x * 0.038f;
-  f32 ty = -g->look_delta_y * 0.030f;
-  tx = fmaxf(-0.42f, fminf(0.42f, tx));
-  ty = fmaxf(-0.32f, fminf(0.32f, ty));
-  f32 k = 1.0f - expf(-6.5f * dt);
+  // Stronger turn bob: larger target, slightly slower follow for more lag.
+  f32 tx = g->look_delta_x * 0.062f;
+  f32 ty = -g->look_delta_y * 0.045f;
+  tx = fmaxf(-0.65f, fminf(0.65f, tx));
+  ty = fmaxf(-0.45f, fminf(0.45f, ty));
+  f32 k = 1.0f - expf(-5.2f * dt);
   g->gun_sway_x += (tx - g->gun_sway_x) * k;
   g->gun_sway_y += (ty - g->gun_sway_y) * k;
   g->gun_slide *= expf(-22.0f * dt);
@@ -557,6 +595,14 @@ static void update_viewmodel(GameState *g, f32 dt) {
     g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   if (g->gun_recoil > 0.09f)
     g->gun_recoil = 0.09f;
+  // True recoil climb: separate upward spring for muzzle rise.
+  g->gun_rise_velocity +=
+      (-95.0f * g->gun_rise - 13.0f * g->gun_rise_velocity) * dt;
+  g->gun_rise += g->gun_rise_velocity * dt;
+  if (g->gun_rise < 0.0f)
+    g->gun_rise = g->gun_rise_velocity = 0.0f;
+  if (g->gun_rise > 0.085f)
+    g->gun_rise = 0.085f;
 }
 
 static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
@@ -574,10 +620,21 @@ static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
                    .projection = CAMERA_PERSPECTIVE};
   BeginMode3D(wcam);
   rlPushMatrix();
-  rlTranslatef(g->gun_sway_x * 1.05f, -0.18f + g->gun_sway_y * 1.05f, 0.75f);
-  rlRotatef(g->gun_sway_x * -48.0f, 0.0f, 1.0f, 0.0f);
-  rlRotatef(g->gun_sway_y * -38.0f, 1.0f, 0.0f, 0.0f);
-  rlRotatef(g->gun_sway_x * -30.0f, 0.0f, 0.0f, 1.0f);
+  f32 rise = g->gun_rise;
+  u32 local_e = local_player_entity(g);
+  bool local_reloading = local_e != ECS_INVALID_ENTITY &&
+                         weapon_is_reloading(g, local_e);
+  f32 reload_dip = local_reloading ? 0.09f : 0.0f;
+  rlTranslatef(g->gun_sway_x * 1.28f, -0.18f + g->gun_sway_y * 1.28f +
+                                        rise * 0.70f - reload_dip,
+               0.75f);
+  rlRotatef(g->gun_sway_x * -68.0f, 0.0f, 1.0f, 0.0f);
+  // Up/down rotation: direct pitch response plus a smaller cross-coupling
+  // from turning so yaw motion also tilts the gun vertically.
+  rlRotatef(g->gun_sway_y * -46.0f + g->gun_sway_x * -14.0f - rise * 230.0f +
+                (local_reloading ? 24.0f : 0.0f),
+            1.0f, 0.0f, 0.0f);
+  rlRotatef(g->gun_sway_x * -38.0f, 0.0f, 0.0f, 1.0f);
   draw_gun_local(g->gun_recoil / 1.35f, g->gun_slide / 1.35f, 1.35f,
                  g->gun_kick != 0);
   rlPopMatrix();
@@ -599,6 +656,29 @@ static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
                    (f32)((GetScreenHeight() - h) / 2), (f32)w, (f32)h};
   DrawTexturePro(target.texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
   EndDrawing();
+}
+
+static void client_predict_weapon(GameState *g) {
+  u32 e = local_player_entity(g);
+  if (e == ECS_INVALID_ENTITY)
+    return;
+  bool want = (g->input[0].buttons & BTN_FIRE) != 0;
+  bool holding = weapon_holding(g, e, want);
+  weapon_tick(g, e);
+  if (weapon_can_fire(g, e, want)) {
+    const WeaponDef *def = weapon_def(g->weapon_id[e]);
+    u8 wid = g->weapon_id[e];
+    weapon_on_fired(g, e, holding);
+    g->gun_kick = 4;
+    // Tap is soft, holding dumps the mag faster with a harder kick.
+    g->gun_slide = holding ? def->slide_hold : def->slide_tap;
+    g->gun_recoil_velocity += holding ? def->recoil_vel_hold : def->recoil_vel_tap;
+    g->gun_rise_velocity += holding ? def->rise_vel_hold : def->rise_vel_tap;
+    // True recoil: muzzle climbs, so push the aim up. Same step the server
+    // applies to the authoritative pitch on confirmation.
+    g->view_pitch = weapon_recoil_pitch(g->view_pitch, wid, holding);
+  }
+  weapon_set_prev(g, e, want);
 }
 
 static int client_run(String host, u16 port, String name) {
@@ -647,16 +727,9 @@ static int client_run(String host, u16 port, String name) {
         renew_client_session(&game);
         notice_set(&game, STR("DROPPED"));
       }
-      if (game.fire_cooldown > 0)
-        --game.fire_cooldown;
       if (game.gun_kick > 0)
         --game.gun_kick;
-      if ((game.input[0].buttons & BTN_FIRE) && game.fire_cooldown == 0) {
-        game.fire_cooldown = FIRE_COOLDOWN_TICKS;
-        game.gun_kick = 4;
-        game.gun_slide = 0.13f;
-        game.gun_recoil_velocity += 1.4f;
-      }
+      client_predict_weapon(&game);
       acc -= SIM_DT;
     }
     client_receive(&game, fd);

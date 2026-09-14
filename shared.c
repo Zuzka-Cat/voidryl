@@ -77,7 +77,48 @@ enum NetPacketKind {
 #define BTN_GRAB 2u
 #define BTN_JUMP 4u
 
-#define FIRE_COOLDOWN_TICKS 16
+// Weapon catalog: single source of truth for fire rate, mag size, reload and
+// recoil. To add a weapon, append a WeaponId and a WeaponDef entry; the
+// server, client prediction and snapshot code all read from here so no
+// per-weapon branching is needed elsewhere.
+enum WeaponId { WEAPON_P99 = 0, WEAPON_COUNT };
+
+typedef struct WeaponDef {
+  u8 mag_size;
+  u8 cooldown_tap_ticks;
+  u8 cooldown_hold_ticks;
+  u8 recoil_pitch_tap_deg;
+  u8 recoil_pitch_hold_deg;
+  u16 reload_ticks;
+  f32 slide_tap;
+  f32 slide_hold;
+  f32 recoil_vel_tap;
+  f32 recoil_vel_hold;
+  f32 rise_vel_tap;
+  f32 rise_vel_hold;
+} WeaponDef;
+
+static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
+    [WEAPON_P99] =
+        {
+            .mag_size = 15,
+            .cooldown_tap_ticks = 16,
+            .cooldown_hold_ticks = 8,
+            .recoil_pitch_tap_deg = 1,
+            .recoil_pitch_hold_deg = 2,
+            .reload_ticks = 160,
+            .slide_tap = 0.10f,
+            .slide_hold = 0.14f,
+            .recoil_vel_tap = 1.0f,
+            .recoil_vel_hold = 1.9f,
+            .rise_vel_tap = 1.05f,
+            .rise_vel_hold = 2.1f,
+        },
+};
+
+static const WeaponDef *weapon_def(u8 id) {
+  return &WEAPON_DEFS[id < WEAPON_COUNT ? id : WEAPON_P99];
+}
 #define PLAYER_FIRE_FLASH_TICKS 6
 #define PLAYER_HIT_FLASH_TICKS 24
 #define BULLET_LIFETIME_TICKS 128
@@ -132,7 +173,7 @@ typedef struct NetInputPacket {
 } NetInputPacket;
 
 typedef struct NetEntity {
-  u8 entity, kind, owner, flags, extra, _pad;
+  u8 entity, kind, owner, flags, extra, weapon, ammo, reloading;
   i16 x, y, z, yaw, pitch;
 } NetEntity;
 
@@ -257,8 +298,20 @@ typedef struct GameState {
   i16 vx[ECS_MAX_ENTITIES], vy[ECS_MAX_ENTITIES], vz[ECS_MAX_ENTITIES];
   i16 yaw[ECS_MAX_ENTITIES], pitch[ECS_MAX_ENTITIES];
   u8 kind[ECS_MAX_ENTITIES], lifetime[ECS_MAX_ENTITIES];
-  u8 owner[ECS_MAX_ENTITIES], cooldown[ECS_MAX_ENTITIES];
+  // Client-side interpolation scratch, never simulated or snapshotted.
+  // lag_yaw/lag_pitch hold the encoded yaw/pitch delta (+LAG_NEUTRAL) from
+  // the last snapshot so remotes can exaggerate turn bob between snapshots.
+  // lifetime stays purely an expiry counter for bullets/casings/marks.
+  u8 owner[ECS_MAX_ENTITIES], lag_yaw[ECS_MAX_ENTITIES];
+  u8 lag_pitch[ECS_MAX_ENTITIES];
   u8 flash[ECS_MAX_ENTITIES], held_by[ECS_MAX_ENTITIES];
+  // Per-entity weapon state (player entities only). Single source of truth
+  // for ammo / reload / fire-rate; no parallel per-player arrays.
+  u8 weapon_id[ECS_MAX_ENTITIES];
+  u8 weapon_ammo[ECS_MAX_ENTITIES];
+  u8 weapon_cooldown[ECS_MAX_ENTITIES];
+  u8 weapon_prev[ECS_MAX_ENTITIES];
+  u16 weapon_reload[ECS_MAX_ENTITIES];
   InputCommand input[MAX_PLAYERS];
   Peer peers[MAX_PLAYERS];
   u8 player_entity[MAX_PLAYERS];
@@ -268,7 +321,7 @@ typedef struct GameState {
   u16 last_snapshot_tick, last_chat_sequence, notice_ticks;
   u16 snapshot_silence_ticks;
   u8 local_player, connected, mouse_captured, help, chatting, chat_length;
-  u8 interpolation_ticks, command_ticks, gun_kick, fire_cooldown;
+  u8 interpolation_ticks, command_ticks, gun_kick;
   u8 visible_players, got_snapshot, got_chat_sequence, notice_length;
   u8 requested_name[PLAYER_NAME_LENGTH];
   u8 player_name[MAX_PLAYERS][PLAYER_NAME_LENGTH];
@@ -276,6 +329,7 @@ typedef struct GameState {
   u8 notice[NOTICE_LENGTH];
   i16 view_yaw, view_pitch;
   f32 gun_recoil, gun_recoil_velocity, gun_slide;
+  f32 gun_rise, gun_rise_velocity;
   f32 gun_sway_x, gun_sway_y, look_delta_x, look_delta_y;
 } GameState;
 
@@ -356,6 +410,169 @@ static u8 pack_yaw(int deg) {
 }
 
 static int unpack_yaw(u8 packed) { return (int)packed * 360 / 256 - 180; }
+
+// Client interp lag codec: encoded yaw/pitch delta centred on LAG_NEUTRAL
+// so 128 means "no turn since last snapshot". Only ever stored in
+// lag_yaw/lag_pitch, never in lifetime or weapon state.
+#define LAG_NEUTRAL 128
+
+static u8 lag_encode(int delta) {
+  return (u8)clamp_i16(delta + LAG_NEUTRAL, 0, 255);
+}
+
+static int lag_decode(u8 v) { return (int)v - LAG_NEUTRAL; }
+
+// Weapon state helpers: single source of truth for server simulation and
+// client prediction. All weapon state lives on the player entity itself
+// (weapon_id/ammo/weapon_cooldown/weapon_reload/weapon_prev arrays indexed
+// by entity), never in a parallel per-player slot. All firing, reload and
+// snapshot reconciliation goes through here so adding a WeaponDef entry is
+// enough for a new weapon.
+static bool weapon_entity_valid(u32 e) { return e < ECS_MAX_ENTITIES; }
+
+static void weapon_init_entity(GameState *g, u32 e) {
+  if (!weapon_entity_valid(e))
+    return;
+  g->weapon_id[e] = WEAPON_P99;
+  g->weapon_ammo[e] = weapon_def(WEAPON_P99)->mag_size;
+  g->weapon_cooldown[e] = 0;
+  g->weapon_reload[e] = 0;
+  g->weapon_prev[e] = 0;
+}
+
+// Authoritative overwrite from a snapshot (fresh entities, remotes).
+static void weapon_set_from_snapshot(GameState *g, u32 e, u8 srv_weapon,
+                                     u8 srv_ammo, bool srv_reloading) {
+  if (!weapon_entity_valid(e))
+    return;
+  if (srv_weapon >= WEAPON_COUNT)
+    srv_weapon = WEAPON_P99;
+  const WeaponDef *srv_def = weapon_def(srv_weapon);
+  if (srv_ammo > srv_def->mag_size)
+    srv_ammo = srv_def->mag_size;
+  g->weapon_id[e] = srv_weapon;
+  g->weapon_ammo[e] = srv_ammo;
+  g->weapon_reload[e] = srv_reloading ? srv_def->reload_ticks : 0;
+  g->weapon_cooldown[e] = 0;
+  g->weapon_prev[e] = 0;
+}
+
+static bool weapon_is_reloading(const GameState *g, u32 e) {
+  return weapon_entity_valid(e) && g->weapon_reload[e] != 0;
+}
+
+static u8 weapon_ammo(const GameState *g, u32 e) {
+  return weapon_entity_valid(e) ? g->weapon_ammo[e] : 0;
+}
+
+static u8 weapon_mag_size(const GameState *g, u32 e) {
+  u8 id = weapon_entity_valid(e) ? g->weapon_id[e] : WEAPON_P99;
+  return weapon_def(id)->mag_size;
+}
+
+static bool weapon_holding(const GameState *g, u32 e, bool want) {
+  return want && weapon_entity_valid(e) && g->weapon_prev[e] != 0;
+}
+
+// Tick reload and fire cooldown. Auto-starts a reload when the mag is empty
+// so callers never need their own ammo==0 branches.
+static void weapon_tick(GameState *g, u32 e) {
+  if (!weapon_entity_valid(e))
+    return;
+  const WeaponDef *def = weapon_def(g->weapon_id[e]);
+  if (g->weapon_reload[e] > 0) {
+    if (--g->weapon_reload[e] == 0)
+      g->weapon_ammo[e] = def->mag_size;
+  } else if (g->weapon_ammo[e] == 0) {
+    g->weapon_reload[e] = def->reload_ticks;
+  }
+  if (g->weapon_cooldown[e] > 0)
+    --g->weapon_cooldown[e];
+}
+
+static bool weapon_can_fire(const GameState *g, u32 e, bool want) {
+  if (!want || !weapon_entity_valid(e))
+    return false;
+  return g->weapon_cooldown[e] == 0 && g->weapon_reload[e] == 0 &&
+         g->weapon_ammo[e] > 0;
+}
+
+static void weapon_on_fired(GameState *g, u32 e, bool holding) {
+  if (!weapon_entity_valid(e))
+    return;
+  const WeaponDef *def = weapon_def(g->weapon_id[e]);
+  if (g->weapon_ammo[e] > 0)
+    --g->weapon_ammo[e];
+  g->weapon_cooldown[e] =
+      holding ? def->cooldown_hold_ticks : def->cooldown_tap_ticks;
+  if (g->weapon_ammo[e] == 0 && g->weapon_reload[e] == 0)
+    g->weapon_reload[e] = def->reload_ticks;
+}
+
+// Server ran out of bullet slots: rate-limit without consuming ammo.
+static void weapon_on_blocked(GameState *g, u32 e) {
+  if (!weapon_entity_valid(e))
+    return;
+  g->weapon_cooldown[e] =
+      weapon_def(g->weapon_id[e])->cooldown_tap_ticks;
+}
+
+static void weapon_set_prev(GameState *g, u32 e, bool want) {
+  if (weapon_entity_valid(e))
+    g->weapon_prev[e] = (u8)(want ? 1 : 0);
+}
+
+// Shared recoil step so client prediction (view_pitch) and server
+// confirmation (authoritative entity/input pitch) stay in sync.
+static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
+  const WeaponDef *def = weapon_def(weapon_id);
+  int kick = holding ? (int)def->recoil_pitch_hold_deg
+                     : (int)def->recoil_pitch_tap_deg;
+  return clamp_i16((int)pitch + kick, -75, 75);
+}
+
+// Reconcile a snapshot weapon state onto a client entity. Remote entities
+// are fully authoritative. The local entity keeps its prediction and only
+// moves towards the server: starting a reload it missed, finishing one the
+// server confirmed, or adopting a lower ammo count.
+static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
+                                  u8 srv_ammo, bool srv_reloading) {
+  if (!weapon_entity_valid(e))
+    return;
+  if (srv_weapon >= WEAPON_COUNT)
+    srv_weapon = WEAPON_P99;
+  const WeaponDef *srv_def = weapon_def(srv_weapon);
+  if (srv_ammo > srv_def->mag_size)
+    srv_ammo = srv_def->mag_size;
+  bool is_local = g->local_player < MAX_PLAYERS && g->owner[e] == g->local_player;
+  if (!is_local) {
+    weapon_set_from_snapshot(g, e, srv_weapon, srv_ammo, srv_reloading);
+    return;
+  }
+  g->weapon_id[e] = srv_weapon;
+  const WeaponDef *def = weapon_def(g->weapon_id[e]);
+  if (srv_ammo > def->mag_size)
+    srv_ammo = def->mag_size;
+  if (g->weapon_ammo[e] > def->mag_size)
+    g->weapon_ammo[e] = srv_ammo;
+  if (srv_reloading) {
+    if (g->weapon_reload[e] == 0 && g->weapon_ammo[e] == def->mag_size) {
+      // Predicted reload finished earlier than the server; ignore the stale
+      // snapshot instead of flickering back to reloading.
+    } else {
+      g->weapon_ammo[e] = 0;
+      if (g->weapon_reload[e] == 0)
+        g->weapon_reload[e] = def->reload_ticks;
+    }
+  } else if (g->weapon_reload[e] != 0) {
+    if (srv_ammo == def->mag_size) {
+      g->weapon_ammo[e] = def->mag_size;
+      g->weapon_reload[e] = 0;
+    }
+  } else if (srv_ammo < g->weapon_ammo[e]) {
+    g->weapon_ammo[e] = srv_ammo;
+  }
+}
 
 // string validation
 
@@ -546,7 +763,13 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->vx[e] = g->vy[e] = g->vz[e] = 0;
   g->yaw[e] = g->pitch[e] = 0;
   g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
-  g->cooldown[e] = g->flash[e] = g->held_by[e] = 0;
+  g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
+  g->flash[e] = g->held_by[e] = 0;
+  g->weapon_id[e] = WEAPON_P99;
+  g->weapon_ammo[e] = 0;
+  g->weapon_cooldown[e] = 0;
+  g->weapon_prev[e] = 0;
+  g->weapon_reload[e] = 0;
 }
 
 static void add_kind_components(GameState *g, u32 e, u8 kind) {

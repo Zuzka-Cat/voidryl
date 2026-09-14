@@ -188,15 +188,21 @@ static void spawn_casing(GameState *g, u32 pe) {
   port =
       gun_point(g, pe, f, r, u, (Vector3){0.72f, GUN_MUZZLE_OFFSET.y, 0.03f});
   h = mix32(g->tick * 33u + e * 17u + (u32)g->owner[pe] * 91u + (u32)g->px[pe]);
-  f32 jx = ((int)(h & 255u) - 128) / 64.0f;
-  f32 jy = ((int)((h >> 8) & 255u) - 128) / 96.0f;
-  f32 jz = ((int)((h >> 16) & 255u) - 128) / 64.0f;
+  // Small jitter only: natural ejection pops slightly right/up/back and falls
+  // nearby instead of flying far sideways.
+  f32 jx = ((int)(h & 255u) - 128) / 320.0f;
+  f32 jy = ((int)((h >> 8) & 255u) - 128) / 300.0f;
+  f32 jz = ((int)((h >> 16) & 255u) - 128) / 320.0f;
+  f32 side = 1.15f + jx;
+  f32 up = 2.10f + jy;
+  f32 back = 0.70f + jz * 0.25f;
   g->px[e] = (i16)lroundf(port.x * POS_SCALE);
   g->py[e] = (i16)lroundf(port.y * POS_SCALE);
   g->pz[e] = (i16)lroundf(port.z * POS_SCALE);
-  g->vx[e] = (i16)lroundf(r.x * (4.2f + jx) + u.x * (4.5f + jy) - f.x * 0.6f);
-  g->vy[e] = (i16)lroundf(5.4f + jy * 2.8f + ((h >> 24) & 7u) * 0.15f);
-  g->vz[e] = (i16)lroundf(r.z * (4.2f + jz) + u.z * (4.5f + jy) - f.z * 0.6f);
+  // Note: gun_basis r points left, so eject right with -r for visibility.
+  g->vx[e] = (i16)lroundf(-r.x * side + u.x * up - f.x * back);
+  g->vy[e] = (i16)lroundf(-r.y * side + u.y * up - f.y * back);
+  g->vz[e] = (i16)lroundf(-r.z * side + u.z * up - f.z * back);
   g->yaw[e] = wrap_degrees(g->yaw[pe] + 50 + (int)(h % 41u));
   g->pitch[e] = (i16)(18 + (int)((h >> 5) % 29u));
   g->held_by[e] = (u8)h;
@@ -212,15 +218,29 @@ static void weapon_system(GameState *g) {
   while (ecs_next(&q)) {
     u32 e = q.entity;
     u8 p = g->owner[e];
-    if (g->cooldown[e] > 0)
-      --g->cooldown[e];
-    if ((g->input[p].buttons & BTN_FIRE) != 0 && g->cooldown[e] == 0 &&
-        spawn_bullet(g, e) != ECS_INVALID_ENTITY) {
-      g->cooldown[e] = FIRE_COOLDOWN_TICKS;
-      if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
-        g->flash[e] = PLAYER_FIRE_FLASH_TICKS;
-      spawn_casing(g, e);
+    if (p >= MAX_PLAYERS)
+      continue;
+    bool want = (g->input[p].buttons & BTN_FIRE) != 0;
+    bool holding = weapon_holding(g, e, want);
+    weapon_tick(g, e);
+    if (weapon_can_fire(g, e, want)) {
+      if (spawn_bullet(g, e) != ECS_INVALID_ENTITY) {
+        u8 wid = g->weapon_id[e];
+        weapon_on_fired(g, e, holding);
+        // Authoritative recoil: same pitch step the client predicts, so
+        // bullets and snapshots stay in sync even before the echoed input
+        // arrives. Persist it in the input so aim_system keeps it.
+        g->pitch[e] = weapon_recoil_pitch(g->pitch[e], wid, holding);
+        g->input[p].aim_pitch =
+            weapon_recoil_pitch(g->input[p].aim_pitch, wid, holding);
+        if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
+          g->flash[e] = PLAYER_FIRE_FLASH_TICKS;
+        spawn_casing(g, e);
+      } else {
+        weapon_on_blocked(g, e);
+      }
     }
+    weapon_set_prev(g, e, want);
     if (g->flash[e] > 0)
       --g->flash[e];
   }
@@ -254,7 +274,7 @@ static void casing_system(GameState *g) {
     g->px[e] = (i16)(g->px[e] + g->vx[e]);
     g->py[e] = (i16)(g->py[e] + g->vy[e]);
     g->pz[e] = (i16)(g->pz[e] + g->vz[e]);
-    if (g->tick % 3u == 0 && g->vy[e] > -8)
+    if (g->tick % 6u == 0 && g->vy[e] > -8)
       --g->vy[e];
     if (g->py[e] <= 4) {
       g->py[e] = 4;
@@ -374,12 +394,21 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
     u32 e = q.entity;
+    u8 weapon = WEAPON_P99, ammo = 0, reloading = 0;
+    if (g->kind[e] == KIND_PLAYER) {
+      weapon = g->weapon_id[e];
+      ammo = g->weapon_ammo[e];
+      reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
+    }
     snap->entities[snap->count++] =
         (NetEntity){.entity = (u8)e,
                     .kind = g->kind[e],
                     .owner = g->owner[e],
                     .flags = g->flash[e],
                     .extra = g->held_by[e],
+                    .weapon = weapon,
+                    .ammo = ammo,
+                    .reloading = reloading,
                     .x = g->px[e],
                     .y = g->py[e],
                     .z = g->pz[e],
@@ -435,6 +464,7 @@ static u32 create_player(GameState *g, u8 player) {
   g->kind[e] = KIND_PLAYER;
   g->owner[e] = player;
   g->player_entity[player] = (u8)e;
+  weapon_init_entity(g, e);
   add_kind_components(g, e, KIND_PLAYER);
   return e;
 }

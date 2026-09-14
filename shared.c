@@ -77,6 +77,7 @@ enum NetPacketKind {
 #define BTN_GRAB 2u
 #define BTN_JUMP 4u
 #define BTN_AIM 8u
+#define BTN_SPRINT 16u
 
 // Weapon catalog: single source of truth for fire rate, mag size, reload and
 // recoil. To add a weapon, append a WeaponId and a WeaponDef entry; the
@@ -103,6 +104,22 @@ typedef struct WeaponDef {
   f32 aim_fov;
   f32 aim_sens_scale;
   f32 aim_move_scale;
+  // Viewmodel ADS pose: hip base + ADS base (sight-near, intentionally
+  // slightly off-center) + ADS cant in degrees, per gun, so each future
+  // weapon ships its own zoom view with no per-weapon branching in the
+  // renderer.
+  f32 hip_off_x;
+  f32 hip_off_y;
+  f32 ads_off_x;
+  f32 ads_off_y;
+  f32 ads_cant_deg;
+  // Static ADS pitch trim in degrees, blended in with aim. Positive tips
+  // the muzzle down, negative raises it. Purely cosmetic (bullets follow
+  // the view angles); one number to re-zero the zoomed sight picture.
+  f32 ads_pitch_deg;
+  // Sprint pose: static pitch added with the sprint blend. Negative raises
+  // the muzzle skyward classic-sprint style. Cosmetic only, per gun.
+  f32 sprint_tilt_deg;
 } WeaponDef;
 
 static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
@@ -113,7 +130,7 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .cooldown_hold_ticks = 8,
             .recoil_pitch_tap_deg = 1,
             .recoil_pitch_hold_deg = 2,
-            .reload_ticks = 160,
+            .reload_ticks = 120,
             .slide_tap = 0.09f,
             .slide_hold = 0.126f,
             .recoil_vel_tap = 0.9f,
@@ -126,6 +143,13 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .aim_fov = 45.0f,
             .aim_sens_scale = 0.55f,
             .aim_move_scale = 0.5f,
+            .hip_off_x = 0.06f,
+            .hip_off_y = -0.18f,
+            .ads_off_x = 0.398f,
+            .ads_off_y = -0.128f,
+            .ads_cant_deg = -12.0f,
+            .ads_pitch_deg = -3.0f,
+            .sprint_tilt_deg = -32.0f,
         },
 };
 
@@ -187,6 +211,10 @@ typedef struct NetInputPacket {
 
 typedef struct NetEntity {
   u8 entity, kind, owner, flags, extra, weapon, ammo, reloading;
+  // Replicated presentation: server-smoothed pose so remotes show the same
+  // ADS/bob/lean/reload/sprint flavor with no second animation codebase.
+  u8 aim_q, walk_phase_q, walk_blend_q, reload_q, sprint_q;
+  i8 lean_x_q, lean_z_q;
   i16 x, y, z, yaw, pitch;
 } NetEntity;
 
@@ -345,6 +373,20 @@ typedef struct GameState {
   f32 gun_rise, gun_rise_velocity;
   f32 gun_sway_x, gun_sway_y, look_delta_x, look_delta_y;
   f32 aim_blend, screen_shake;
+  f32 walk_phase, walk_blend;
+  f32 move_sway_x, move_sway_z;
+  f32 move_vel_x, move_vel_z;
+  f32 sprint_blend;
+  // Server-side per-player presentation smoothing (replicated to remotes).
+  f32 sv_aim[MAX_PLAYERS], sv_phase[MAX_PLAYERS], sv_blend[MAX_PLAYERS];
+  f32 sv_sprint[MAX_PLAYERS];
+  f32 sv_leanx[MAX_PLAYERS], sv_leanz[MAX_PLAYERS];
+  f32 sv_velx[MAX_PLAYERS], sv_velz[MAX_PLAYERS];
+  // Client-side per-entity replicated presentation (decoded snapshot).
+  u8 r_aim[ECS_MAX_ENTITIES], r_phase[ECS_MAX_ENTITIES];
+  u8 r_blend[ECS_MAX_ENTITIES], r_reload[ECS_MAX_ENTITIES];
+  u8 r_sprint[ECS_MAX_ENTITIES];
+  i8 r_leanx[ECS_MAX_ENTITIES], r_leanz[ECS_MAX_ENTITIES];
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
@@ -583,6 +625,98 @@ static f32 weapon_reload_progress(const GameState *g, u32 e) {
     t = 1.0f;
   return t;
 }
+
+// ---- shared presentation tick/pose helpers (single source of truth) ----
+// The client (local prediction) and the server (per-player smoothing for
+// replication) both step through these, and both render paths pose through
+// the ones below. No private copies anywhere.
+static void present_blend_tick(f32 *b, bool want, f32 rate, f32 dt) {
+  f32 k = 1.0f - expf(-rate * dt);
+  *b += ((want ? 1.0f : 0.0f) - *b) * k;
+  if (*b < 0.001f && !want)
+    *b = 0.0f;
+  if (*b > 0.999f && want)
+    *b = 1.0f;
+}
+
+static void present_walk_tick(f32 *phase, f32 *blend, i8 mx, i8 mz, f32 dt) {
+  bool moving = mx != 0 || mz != 0;
+  present_blend_tick(blend, moving, 8.0f, dt);
+  if (moving) {
+    *phase += dt * 11.0f;
+    if (*phase > 2.0f * PI)
+      *phase -= 2.0f * PI;
+  }
+}
+
+static void present_lean_tick(f32 *pos, f32 *vel, f32 target, f32 dt) {
+  *vel += ((target - *pos) * 90.0f - *vel * 14.0f) * dt;
+  *pos += *vel * dt;
+}
+
+// Sprint wants forward motion without ADS held (ADS wins if both held).
+static bool present_sprint_want(u8 buttons, i8 mx, i8 mz) {
+  (void)mx;
+  return (buttons & BTN_SPRINT) != 0 && mz > 0 &&
+         (buttons & BTN_AIM) == 0;
+}
+
+static bool present_aim_want(u8 buttons, bool reloading) {
+  return (buttons & BTN_AIM) != 0 && !reloading;
+}
+
+// Hip->ADS viewmodel base from the WeaponDef.
+static void present_ads_pos(const WeaponDef *def, f32 blend, f32 *x, f32 *y) {
+  *x = def->hip_off_x * (1.0f - blend) + def->ads_off_x * blend;
+  *y = def->hip_off_y * (1.0f - blend) + def->ads_off_y * blend;
+}
+
+// Walk bob offsets; ads_damp is (1 - 0.5*aim) on both render paths.
+static void present_bob_offsets(f32 phase, f32 blend, f32 ads_damp, f32 *x,
+                                f32 *y, f32 *z, f32 *roll) {
+  f32 s = blend * ads_damp;
+  *x = sinf(phase) * 0.014f * s;
+  *y = -fabsf(cosf(phase)) * 0.012f * s;
+  *z = sinf(phase * 2.0f) * 0.008f * s;
+  *roll = sinf(phase) * 2.5f * s;
+}
+
+// Steady lean from smoothed strafe/push (screen-right is viewmodel -X).
+static void present_lean_offsets(f32 sx, f32 sz, f32 *ox, f32 *oz) {
+  *ox = -sx * 0.045f;
+  *oz = sz * 0.05f;
+}
+
+static u8 present_q01(f32 v) {
+  if (v <= 0.0f)
+    return 0;
+  if (v >= 1.0f)
+    return 255;
+  return (u8)(v * 255.0f + 0.5f);
+}
+
+static i8 present_q11(f32 v) {
+  if (v <= -1.0f)
+    return -127;
+  if (v >= 1.0f)
+    return 127;
+  return (i8)(v * 127.0f);
+}
+
+// Reload progress quantized: 0 means not reloading, otherwise 1..255.
+static u8 present_reload_q(bool reloading, f32 t) {
+  if (!reloading)
+    return 0;
+  if (t < 0.0f)
+    t = 0.0f;
+  if (t > 1.0f)
+    t = 1.0f;
+  return (u8)(1 + t * 254.0f);
+}
+
+static f32 present_unq01(u8 q) { return (f32)q / 255.0f; }
+
+static f32 present_unq11(i8 q) { return (f32)q / 127.0f; }
 
 // Reconcile a snapshot weapon state onto a client entity. Remote entities
 // are fully authoritative. The local entity keeps its prediction and only
@@ -823,6 +957,9 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->weapon_cooldown[e] = 0;
   g->weapon_prev[e] = 0;
   g->weapon_reload[e] = 0;
+  g->r_aim[e] = g->r_phase[e] = g->r_blend[e] = 0;
+  g->r_reload[e] = g->r_sprint[e] = 0;
+  g->r_leanx[e] = g->r_leanz[e] = 0;
 }
 
 static void add_kind_components(GameState *g, u32 e, u8 kind) {

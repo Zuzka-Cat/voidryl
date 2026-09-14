@@ -42,9 +42,13 @@ static void movement_system(GameState *g) {
       dz /= len;
     }
     bool aiming = (in->buttons & BTN_AIM) != 0;
+    bool sprinting =
+        present_sprint_want(in->buttons, in->move_x, in->move_z);
     f32 speed = 3.0f;
     if (aiming)
       speed *= weapon_aim_move_scale(g->weapon_id[e]);
+    else if (sprinting)
+      speed = 4.5f;
     i16 step_x = (i16)lroundf(dx * speed);
     i16 step_z = (i16)lroundf(dz * speed);
     g->vx[e] = step_x;
@@ -396,11 +400,38 @@ static void lifetime_system(GameState *g) {
   }
 }
 
+// Authoritative presentation smoothing per player, replicated so remotes
+// render the same ADS/bob/lean/reload/sprint flavor. Steps the shared
+// present_* helpers — the exact ones the client uses for local prediction.
+static void present_system(GameState *g) {
+  for (u32 p = 0; p < MAX_PLAYERS; ++p) {
+    u32 e = g->player_entity[p];
+    if (e == NET_PACKET_NONE || !ecs_alive(&g->ecs, e) ||
+        g->kind[e] != KIND_PLAYER)
+      continue;
+    u8 buttons = g->input[p].buttons;
+    bool reloading = g->weapon_reload[e] != 0;
+    present_blend_tick(&g->sv_aim[p],
+                       present_aim_want(buttons, reloading), 12.0f, SIM_DT);
+    present_walk_tick(&g->sv_phase[p], &g->sv_blend[p], g->input[p].move_x,
+                      g->input[p].move_z, SIM_DT);
+    present_lean_tick(&g->sv_leanx[p], &g->sv_velx[p],
+                      (f32)g->input[p].move_x, SIM_DT);
+    present_lean_tick(&g->sv_leanz[p], &g->sv_velz[p],
+                      (f32)g->input[p].move_z, SIM_DT);
+    present_blend_tick(&g->sv_sprint[p],
+                       present_sprint_want(buttons, g->input[p].move_x,
+                                           g->input[p].move_z),
+                       8.0f, SIM_DT);
+  }
+}
+
 static void server_tick(GameState *g) {
   aim_system(g);
   movement_system(g);
   holding_system(g);
   weapon_system(g);
+  present_system(g);
   casing_system(g);
   projectile_system(g);
   lifetime_system(g);
@@ -424,10 +455,23 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
   while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
     u32 e = q.entity;
     u8 weapon = WEAPON_P99, ammo = 0, reloading = 0;
+    u8 aim_q = 0, phase_q = 0, blend_q = 0, reload_q = 0, sprint_q = 0;
+    i8 lean_x_q = 0, lean_z_q = 0;
     if (g->kind[e] == KIND_PLAYER) {
       weapon = g->weapon_id[e];
       ammo = g->weapon_ammo[e];
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
+      if (g->owner[e] < MAX_PLAYERS) {
+        u8 p = g->owner[e];
+        aim_q = present_q01(g->sv_aim[p]);
+        phase_q = present_q01(g->sv_phase[p] / (2.0f * PI));
+        blend_q = present_q01(g->sv_blend[p]);
+        sprint_q = present_q01(g->sv_sprint[p]);
+        lean_x_q = present_q11(g->sv_leanx[p]);
+        lean_z_q = present_q11(g->sv_leanz[p]);
+        reload_q =
+            present_reload_q(reloading != 0, weapon_reload_progress(g, e));
+      }
     }
     snap->entities[snap->count++] =
         (NetEntity){.entity = (u8)e,
@@ -438,6 +482,13 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
                     .weapon = weapon,
                     .ammo = ammo,
                     .reloading = reloading,
+                    .aim_q = aim_q,
+                    .walk_phase_q = phase_q,
+                    .walk_blend_q = blend_q,
+                    .reload_q = reload_q,
+                    .sprint_q = sprint_q,
+                    .lean_x_q = lean_x_q,
+                    .lean_z_q = lean_z_q,
                     .x = g->px[e],
                     .y = g->py[e],
                     .z = g->pz[e],
@@ -644,7 +695,8 @@ static void server_receive(GameState *g, int fd) {
     g->input[peer->player].aim_yaw = wrap_degrees(packet.aim_yaw);
     g->input[peer->player].aim_pitch = clamp_i16(packet.aim_pitch, -75, 75);
     g->input[peer->player].buttons =
-        packet.buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM);
+        packet.buttons &
+        (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM | BTN_SPRINT);
   }
 }
 

@@ -33,15 +33,17 @@ The final client argument is the player's name and must contain exactly four let
 - `WASD`: move
 - mouse: aim (the cursor starts captured)
 - `Space`: jump
+- `Shift` + `W`: sprint (faster, gun tilts up, ADS blocked while held)
 - left mouse: fire
-- right mouse or `E`: hold the cube in the center view; release to drop it
+- right mouse: aim down sights (zoom, slower move/look, tighter spread)
+- `E`: hold the cube in the center view; release to drop it
 - `Enter` or `T`: open chat; `Enter` sends and `Esc` cancels
 - `Esc`: release/capture the mouse when chat is closed
 - `F1`: show/hide the small help overlay
 
 ## Rendering and palette
 
-The scene, pose-driven gun model, and HUD are rendered directly to exactly `92 x 64`, then presented with integer nearest-neighbor scaling and centered letterboxing in a resizable `920 x 640` window. Local and remote weapons share the same geometry renderer; position, yaw, pitch, roll, scale, recoil, slide recoil, and firing state define each rendered pose. The render loop has no software FPS target; raylib's vsync hint controls presentation. No external assets are used. Geometry and HUD marks use these exact colors, darkest to lightest, with pure black reserved for the requested remote-player wire outline:
+The scene and pose-driven gun model render to one exactly `92 x 64` target and the HUD to a second one, then both are presented with integer nearest-neighbor scaling and centered letterboxing in a resizable `920 x 640` window; screen shake offsets only the scene layer. Local and remote weapons share the same per-weapon geometry renderers; position, yaw, pitch, roll, scale, recoil, slide recoil, firing state, and the weapon's own reload animation define each rendered pose. The server replicates quantized ADS/bob/lean/reload/sprint presentation per player, stepped through the same shared helpers the client uses for local prediction, so remotes show the same gun flavor. The render loop has no software FPS target; raylib's vsync hint controls presentation. No external assets are used. Geometry and HUD marks use these exact colors, darkest to lightest, with pure black reserved for the requested remote-player wire outline:
 
 - `#100818` / `(16, 8, 24)`
 - `#3c1e66` / `(60, 30, 102)`
@@ -75,4 +77,4 @@ _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
 
 The build-time assertion keeps the complete mutable game state within 4 KiB. This includes the ECS arrays, interpolation state, fixed player names and notification text, input/peer records, and two fixed packet buffers.
 
-`NetInputPacket` is 20 bytes, `NetChatPacket` is 32 bytes, `NetEntity` is 14 bytes, and a full fixed `NetSnapshot` is 416 bytes. There is no `malloc`, `calloc`, `realloc`, `free`, `strdup`, VLA, runtime-loaded asset, or application-owned growable container. Raylib's render target is a GPU/render handle and is outside the requested CPU gameplay-state budget.
+`NetInputPacket` is 24 bytes, `NetChatPacket` is 36 bytes, `NetEntity` is 26 bytes (including quantized ADS/bob/lean/reload/sprint presentation per player), and a full fixed `NetSnapshot` is 884 bytes. There is no `malloc`, `calloc`, `realloc`, `free`, `strdup`, VLA, runtime-loaded asset, or application-owned growable container. Raylib's render targets are GPU/render handles and are outside the requested CPU gameplay-state budget.

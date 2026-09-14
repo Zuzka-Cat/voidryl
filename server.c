@@ -12,15 +12,13 @@ static void on_signal(int sig) {
 
 static int open_udp_server(u16 port) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  struct sockaddr_in address;
+  struct sockaddr_in address = {.sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_ANY),
+                                .sin_port = htons(port)};
   int reuse = 1;
   if (fd < 0)
     return -1;
   (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-  memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_ANY);
-  address.sin_port = htons(port);
   if (bind(fd, (const struct sockaddr *)&address, sizeof(address)) < 0) {
     close(fd);
     return -1;
@@ -363,42 +361,38 @@ static void server_tick(GameState *g) {
 static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
                            u16 ack, u32 session) {
   u32 comps[] = {COMP_POSITION, COMP_NETWORKED, COMP_RENDERABLE};
-  EcsQuery q;
-  memset(snap, 0, sizeof(*snap));
-  snap->magic = NET_MAGIC;
-  snap->type = NET_PACKET_SNAPSHOT;
-  snap->local_player = recipient;
-  snap->session = session;
-  snap->tick = g->tick;
-  snap->acknowledged_sequence = ack;
+  *snap = (NetSnapshot){.magic = NET_MAGIC,
+                        .type = NET_PACKET_SNAPSHOT,
+                        .local_player = recipient,
+                        .session = session,
+                        .tick = g->tick,
+                        .acknowledged_sequence = ack};
   for (u32 p = 0; p < MAX_PLAYERS; ++p) {
     String name = game_player_name(g, p);
     memcpy(snap->names[p], name.items, PLAYER_NAME_LENGTH);
   }
-  q = ecs_query(&g->ecs, comps, 3);
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
     u32 e = q.entity;
-    NetEntity *w = &snap->entities[snap->count++];
-    w->entity = (u8)e;
-    w->kind = g->kind[e];
-    w->owner = g->owner[e];
-    w->flags = g->flash[e];
-    w->extra = g->held_by[e];
-    w->x = g->px[e];
-    w->y = g->py[e];
-    w->z = g->pz[e];
-    w->yaw = g->yaw[e];
-    w->pitch = g->pitch[e];
+    snap->entities[snap->count++] =
+        (NetEntity){.entity = (u8)e,
+                    .kind = g->kind[e],
+                    .owner = g->owner[e],
+                    .flags = g->flash[e],
+                    .extra = g->held_by[e],
+                    .x = g->px[e],
+                    .y = g->py[e],
+                    .z = g->pz[e],
+                    .yaw = g->yaw[e],
+                    .pitch = g->pitch[e]};
   }
 }
 
 static void send_peer_snapshot(int fd, const Peer *peer,
                                const NetSnapshot *snap) {
-  struct sockaddr_in address;
-  memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = peer->address;
-  address.sin_port = peer->port;
+  struct sockaddr_in address = {.sin_family = AF_INET,
+                                .sin_addr.s_addr = peer->address,
+                                .sin_port = peer->port};
   (void)sendto(fd, snap, sizeof(*snap), 0, (const struct sockaddr *)&address,
                sizeof(address));
 }
@@ -462,19 +456,17 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
   u32 e = create_player(g, (u8)slot);
   if (e == ECS_INVALID_ENTITY)
     return -1;
-  Peer *peer = &g->peers[slot];
-  if (peer->session != session)
-    peer->retired_session = peer->session;
-  peer->session = session;
-  peer->address = from->sin_addr.s_addr;
-  peer->port = from->sin_port;
-  peer->last_sequence = peer->last_chat_sequence = 0;
-  peer->last_seen = g->tick;
-  peer->active = 1;
-  peer->got_sequence = peer->got_chat_sequence = 0;
-  peer->player = (u8)slot;
-  memset(&g->input[slot], 0, sizeof(g->input[slot]));
-  g->input[slot].aim_yaw = g->yaw[e];
+  u32 retired_session = g->peers[slot].session != session
+                            ? g->peers[slot].session
+                            : g->peers[slot].retired_session;
+  g->peers[slot] = (Peer){.session = session,
+                          .retired_session = retired_session,
+                          .address = from->sin_addr.s_addr,
+                          .port = from->sin_port,
+                          .last_seen = g->tick,
+                          .active = 1,
+                          .player = (u8)slot};
+  g->input[slot] = (InputCommand){.aim_yaw = g->yaw[e]};
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
     g->player_name[slot][i] = name.items[i];
   return slot;
@@ -490,7 +482,7 @@ static void remove_peer(GameState *g, int peer_index) {
     if (g->held_by[i] == player + 1u)
       g->held_by[i] = 0;
   g->player_entity[player] = NET_PACKET_NONE;
-  memset(&g->input[player], 0, sizeof(g->input[player]));
+  g->input[player] = (InputCommand){0};
   peer->active = peer->got_sequence = peer->got_chat_sequence = 0;
 }
 
@@ -503,11 +495,9 @@ static void server_relay_chat(GameState *g, int fd, int sender,
   for (int i = 0; i < MAX_PLAYERS; ++i) {
     if (!g->peers[i].active)
       continue;
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = g->peers[i].address;
-    address.sin_port = g->peers[i].port;
+    struct sockaddr_in address = {.sin_family = AF_INET,
+                                  .sin_addr.s_addr = g->peers[i].address,
+                                  .sin_port = g->peers[i].port};
     packet->session = g->peers[i].session;
     (void)sendto(fd, packet, sizeof(*packet), 0,
                  (const struct sockaddr *)&address, sizeof(address));

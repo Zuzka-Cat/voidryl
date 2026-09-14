@@ -17,10 +17,9 @@ static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
       close(fd);
     return -1;
   }
-  memset(server, 0, sizeof(*server));
-  server->sin_family = AF_INET;
-  server->sin_addr = address;
-  server->sin_port = htons(port);
+  *server = (struct sockaddr_in){.sin_family = AF_INET,
+                                 .sin_addr = address,
+                                 .sin_port = htons(port)};
   if (connect(fd, (const struct sockaddr *)server, sizeof(*server)) < 0) {
     close(fd);
     return -1;
@@ -189,12 +188,10 @@ static void client_receive(GameState *g, int fd) {
 }
 
 static void client_send_input(GameState *g, int fd, u8 type) {
-  NetInputPacket packet;
-  memset(&packet, 0, sizeof(packet));
-  packet.magic = NET_MAGIC;
-  packet.type = type;
-  packet.claimed_player = g->local_player;
-  packet.session = g->session;
+  NetInputPacket packet = {.magic = NET_MAGIC,
+                           .type = type,
+                           .claimed_player = g->local_player,
+                           .session = g->session};
   String req = game_requested_name(g);
   memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
   if (type == NET_PACKET_INPUT) {
@@ -209,14 +206,12 @@ static void client_send_input(GameState *g, int fd, u8 type) {
 }
 
 static void client_send_chat(GameState *g, int fd) {
-  NetChatPacket packet;
-  memset(&packet, 0, sizeof(packet));
-  packet.magic = NET_MAGIC;
-  packet.type = NET_PACKET_CHAT;
-  packet.player = g->local_player;
-  packet.length = g->chat_length;
-  packet.session = g->session;
-  packet.sequence = g->next_chat_sequence++;
+  NetChatPacket packet = {.magic = NET_MAGIC,
+                          .type = NET_PACKET_CHAT,
+                          .player = g->local_player,
+                          .length = g->chat_length,
+                          .session = g->session,
+                          .sequence = g->next_chat_sequence++};
   String req = game_requested_name(g);
   String chat = game_chat_input(g);
   memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
@@ -308,10 +303,12 @@ static Vector3 entity_pos(const GameState *g, u32 e, f32 a) {
 }
 
 static Camera3D make_camera(const GameState *g, f32 a) {
-  Camera3D cam = {0};
   u32 e = local_player_entity(g);
   Vector3 dir = {0.0f, 0.0f, 1.0f};
-  cam.position = (Vector3){0.0f, 1.5f, 0.0f};
+  Camera3D cam = {.position = (Vector3){0.0f, 1.5f, 0.0f},
+                  .up = (Vector3){0.0f, 1.0f, 0.0f},
+                  .fovy = 72.0f,
+                  .projection = CAMERA_PERSPECTIVE};
   if (e != ECS_INVALID_ENTITY) {
     Vector3 p = entity_pos(g, e, a);
     cam.position = (Vector3){p.x, 1.5f + p.y, p.z};
@@ -319,9 +316,6 @@ static Camera3D make_camera(const GameState *g, f32 a) {
   }
   cam.target = (Vector3){cam.position.x + dir.x, cam.position.y + dir.y,
                          cam.position.z + dir.z};
-  cam.up = (Vector3){0.0f, 1.0f, 0.0f};
-  cam.fovy = 72.0f;
-  cam.projection = CAMERA_PERSPECTIVE;
   return cam;
 }
 
@@ -573,12 +567,11 @@ static void render_frame(GameState *g, RenderTexture2D target, f32 a) {
   DrawPlane((Vector3){0.0f, -0.02f, 0.0f}, (Vector2){32.0f, 32.0f}, PAL_PURPLE);
   draw_world(g, a);
   EndMode3D();
-  Camera3D wcam = {0};
-  wcam.position = (Vector3){0.0f, 0.0f, 0.0f};
-  wcam.target = (Vector3){0.0f, 0.0f, 1.0f};
-  wcam.up = (Vector3){0.0f, 1.0f, 0.0f};
-  wcam.fovy = 72.0f;
-  wcam.projection = CAMERA_PERSPECTIVE;
+  Camera3D wcam = {.position = (Vector3){0.0f, 0.0f, 0.0f},
+                   .target = (Vector3){0.0f, 0.0f, 1.0f},
+                   .up = (Vector3){0.0f, 1.0f, 0.0f},
+                   .fovy = 72.0f,
+                   .projection = CAMERA_PERSPECTIVE};
   BeginMode3D(wcam);
   rlPushMatrix();
   rlTranslatef(g->gun_sway_x * 1.05f, -0.18f + g->gun_sway_y * 1.05f, 0.75f);

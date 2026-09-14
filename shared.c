@@ -536,8 +536,7 @@ static String game_notice(GameState *g) {
 // entity lifecycle
 
 static void game_zero(GameState *g) {
-  memset(g, 0, sizeof(*g));
-  g->local_player = NET_PACKET_NONE;
+  *g = (GameState){.local_player = NET_PACKET_NONE};
   memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
   memset(g->player_entity, NET_PACKET_NONE, sizeof(g->player_entity));
 }

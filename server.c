@@ -353,16 +353,21 @@ static void weapon_system(GameState *g) {
   }
 }
 
-static void make_impact_mark(GameState *g, u32 e, bool floor_impact) {
+// Backoff from the exact contact point along travel, in fixed-point units:
+// the flat splat then sits just off the face instead of inside the solid.
+#define MARK_BACKOFF 2.0f
+
+static void make_impact_mark(GameState *g, u32 e, i16 x, i16 y, i16 z,
+                             u8 extra) {
   if (count_kind(g, KIND_IMPACT_MARK) >= MAX_IMPACT_MARKS)
     destroy_oldest(g, KIND_IMPACT_MARK);
-  if (floor_impact)
-    g->py[e] = 1;
-  else {
-    g->px[e] = (i16)(g->px[e] - g->vx[e]);
-    g->py[e] = (i16)(g->py[e] - g->vy[e]);
-    g->pz[e] = (i16)(g->pz[e] - g->vz[e]);
-  }
+  g->px[e] = x;
+  g->py[e] = y;
+  g->pz[e] = z;
+  // Packed face normal + strength + spatter material. Yaw/pitch are left
+  // untouched: they still carry the bullet's travel dir, which the client
+  // reflects for the spatter cone.
+  g->held_by[e] = extra;
   g->kind[e] = KIND_IMPACT_MARK;
   g->lifetime[e] = IMPACT_MARK_LIFETIME_TICKS;
   g->flash[e] = 3;
@@ -430,61 +435,83 @@ static void mark_hit_dir(GameState *g, u32 victim, u32 from) {
   g->flash[victim] = PLAYER_HIT_FLASH_TICKS;
 }
 
+// Exact hitscan lives in shared.c (seg_box_hit over COMP_SOLID).
 static void projectile_system(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PROJECTILE, COMP_LIFETIME};
   EcsQuery q = ecs_query(&g->ecs, comps, 4);
   int bound = ARENA * POS_SCALE;
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    g->px[e] = (i16)(g->px[e] + g->vx[e]);
-    g->py[e] = (i16)(g->py[e] + g->vy[e]);
-    g->pz[e] = (i16)(g->pz[e] + g->vz[e]);
-    bool floor_hit = g->py[e] < 0;
-    bool leave = floor_hit;
-    bool hit = floor_hit || g->py[e] > bound || g->px[e] < -bound ||
-               g->px[e] > bound || g->pz[e] < -bound || g->pz[e] > bound;
-    u32 solids[] = {COMP_POSITION, COMP_RENDERABLE};
-    EcsQuery sq = ecs_query(&g->ecs, solids, 2);
-    while (!hit && ecs_next(&sq)) {
-      u32 c = sq.entity;
-      if (g->kind[c] == KIND_CUBE && g->held_by[c] == 0) {
-        f32 s = scale_value(g, c);
-        int rxz = (int)(42.0f * s);
-        int ry = (int)(48.0f * s);
-        if (rxz < 8)
-          rxz = 8;
-        if (ry < 8)
-          ry = 8;
-        if (abs((int)g->px[e] - g->px[c]) < rxz &&
-            abs((int)g->py[e] - g->py[c]) < ry &&
-            abs((int)g->pz[e] - g->pz[c]) < rxz) {
-          hit = true;
-          leave = true;
-        }
-      }
-    }
-    u32 players[] = {COMP_POSITION, COMP_PLAYER};
-    EcsQuery pq = ecs_query(&g->ecs, players, 2);
-    while (!hit && ecs_next(&pq)) {
-      u32 p = pq.entity;
-      if (g->owner[p] != g->owner[e] && abs((int)g->px[e] - g->px[p]) < 32 &&
-          g->py[e] < 128 && g->py[e] > 0 &&
-          abs((int)g->pz[e] - g->pz[p]) < 32) {
-        u32 src = e;
-        u8 ow = g->owner[e];
-        if (ow < MAX_PLAYERS && g->player_entity[ow] != NET_PACKET_NONE &&
-            ecs_alive(&g->ecs, g->player_entity[ow]))
-          src = g->player_entity[ow];
-        mark_hit_dir(g, p, src);
+    Vector3 p0 = {(float)g->px[e], (float)g->py[e], (float)g->pz[e]};
+    Vector3 d = {(float)g->vx[e], (float)g->vy[e], (float)g->vz[e]};
+    // Nearest solid along the tick segment. Floor, cubes and players all
+    // answer the same segment query, so contact resolution below never
+    // branches on what was hit. Held cubes ride their holder and the owner
+    // cannot hit themselves: both are hit-eligibility rules, not mark logic.
+    bool hit = false;
+    float best = 1.0f;
+    Vector3 bn = {0.0f, 1.0f, 0.0f};
+    u32 bs = ECS_INVALID_ENTITY;
+    u32 solids[] = {COMP_SOLID};
+    EcsQuery sq = ecs_query(&g->ecs, solids, 1);
+    while (ecs_next(&sq)) {
+      u32 s = sq.entity;
+      if (s == e)
+        continue;
+      if (g->kind[s] == KIND_CUBE && g->held_by[s] != 0)
+        continue;
+      if (g->kind[s] == KIND_PLAYER && g->owner[s] == g->owner[e])
+        continue;
+      Vector3 bmin, bmax, n;
+      float t;
+      solid_bounds(g, s, &bmin, &bmax);
+      if (seg_box_hit(p0, d, bmin, bmax, &t, &n) && (!hit || t < best)) {
         hit = true;
+        best = t;
+        bn = n;
+        bs = s;
       }
     }
-    if (hit) {
-      if (leave)
-        make_impact_mark(g, e, floor_hit);
-      else
+    if (!hit) {
+      g->px[e] = (i16)((int)g->px[e] + g->vx[e]);
+      g->py[e] = (i16)((int)g->py[e] + g->vy[e]);
+      g->pz[e] = (i16)((int)g->pz[e] + g->vz[e]);
+      if (g->py[e] > bound || g->px[e] < -bound || g->px[e] > bound ||
+          g->pz[e] < -bound || g->pz[e] > bound)
         ecs_destroy(&g->ecs, e);
+      continue;
     }
+    // Victim hit-feedback (direction indicator). Players are the only
+    // entities carrying flash state, so this stays type-aware; the mark
+    // itself is built uniformly below.
+    if (bs != ECS_INVALID_ENTITY && g->kind[bs] == KIND_PLAYER) {
+      u32 src = e;
+      u8 ow = g->owner[e];
+      if (ow < MAX_PLAYERS && g->player_entity[ow] != NET_PACKET_NONE &&
+          ecs_alive(&g->ecs, g->player_entity[ow]))
+        src = g->player_entity[ow];
+      mark_hit_dir(g, bs, src);
+    }
+    float spd = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+    float back = spd > 0.001f ? MARK_BACKOFF / spd : 0.0f;
+    float bt = best - back;
+    if (bt < 0.0f)
+      bt = 0.0f;
+    i16 mx = (i16)lroundf(p0.x + d.x * bt);
+    i16 my = (i16)lroundf(p0.y + d.y * bt);
+    i16 mz = (i16)lroundf(p0.z + d.z * bt);
+    // Strength is the normal share of the impact velocity: dead-on hits
+    // splat big, grazes leave a dot.
+    float frac = spd > 0.001f
+                     ? fabsf(d.x * bn.x + d.y * bn.y + d.z * bn.z) / spd
+                     : 0.0f;
+    u8 str = (u8)(frac * (float)MARK_STR_LEVELS);
+    if (str >= MARK_STR_LEVELS)
+      str = MARK_STR_LEVELS - 1u;
+    u8 skind = g->kind[bs];
+    u8 mat = skind < sizeof(SOLID_MAT) ? SOLID_MAT[skind] : MARK_MAT_PURPLE;
+    make_impact_mark(g, e, mx, my, mz,
+                     mark_extra_pack(mark_code_for_vec(bn), str, mat));
   }
 }
 

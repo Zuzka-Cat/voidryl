@@ -62,6 +62,11 @@ static void renew_client_session(GameState *g) {
   g->move_vel_x = 0.0f;
   g->move_vel_z = 0.0f;
   g->sprint_blend = 0.0f;
+  // New session invalidates all outstanding sequence send times: acks from
+  // the next session live in a different sequence domain.
+  memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
+  g->ping.rtt_ms = 0.0;
+  g->ping.have = 0;
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
@@ -124,7 +129,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   g->snapshot_silence_ticks = 0;
   for (u8 i = 0; i < snap->count; ++i) {
     const NetEntity *w = &snap->entities[i];
-    if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_CASING)
+    if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_FLOOR)
       continue;
     if (w->owner >= MAX_PLAYERS)
       continue;
@@ -245,6 +250,27 @@ static void client_receive(GameState *g, int fd) {
     if (!net_validate_snapshot_fields(&snap, g->session, g->got_snapshot != 0,
                                       g->last_snapshot_tick))
       continue;
+    // RTT sample: the ack proves the server had seen this input sequence.
+    // Look up when we sent it; smooth to keep the TAB readout readable.
+    {
+      u16 ack = snap.acknowledged_sequence;
+      u32 slot = (u32)ack & PING_WINDOW_MASK;
+      if (g->ping.slot_valid[slot] && g->ping.send_seq[slot] == ack) {
+        double now = hires_time_in_seconds();
+        double sample = (now - g->ping.send_time[slot]) * PING_MS_PER_SEC;
+        if (sample < 0.0)
+          sample = 0.0;
+        if (sample > PING_MAX_MS)
+          sample = PING_MAX_MS;
+        if (!g->ping.have) {
+          g->ping.rtt_ms = sample;
+          g->ping.have = 1;
+        } else {
+          g->ping.rtt_ms = g->ping.rtt_ms * (1.0 - PING_SMOOTH_NEW) +
+                           sample * PING_SMOOTH_NEW;
+        }
+      }
+    }
     g->got_snapshot = 1;
     apply_snapshot(g, &snap);
   }
@@ -266,6 +292,11 @@ static void client_send_input(GameState *g, int fd, u8 type) {
     packet.move_z = g->input[0].move_z;
     packet.aim_yaw = g->view_yaw;
     packet.aim_pitch = g->view_pitch;
+    // Timestamp for TAB ping: slot by low bits, validated by full sequence.
+    u32 slot = (u32)packet.sequence & PING_WINDOW_MASK;
+    g->ping.send_time[slot] = hires_time_in_seconds();
+    g->ping.send_seq[slot] = packet.sequence;
+    g->ping.slot_valid[slot] = 1;
   }
   (void)send(fd, &packet, sizeof(packet), 0);
 }
@@ -706,6 +737,118 @@ static void draw_casing(const GameState *g, u32 e, Vector3 p) {
   rlPopMatrix();
 }
 
+// Impact marks: one small flat black 2D splat on the hit face (strength-
+// sized, 1-N px radius) plus material-colored spatter along the reflection.
+// No 3D cube, no second blotch.
+#define MARK_SPLAT_BASE 0.08f
+#define MARK_SPLAT_STEP 0.04f
+#define MARK_SPATTER_BASE 2
+#define MARK_SPATTER_LIFE 12
+#define MARK_SPATTER_LIFE_STEP 4
+
+static void mark_basis(Vector3 n, Vector3 *u, Vector3 *v) {
+  if (n.y != 0.0f) {
+    *u = (Vector3){1.0f, 0.0f, 0.0f};
+    *v = (Vector3){0.0f, 0.0f, 1.0f};
+  } else if (n.x != 0.0f) {
+    *u = (Vector3){0.0f, 0.0f, 1.0f};
+    *v = (Vector3){0.0f, 1.0f, 0.0f};
+  } else {
+    *u = (Vector3){1.0f, 0.0f, 0.0f};
+    *v = (Vector3){0.0f, 1.0f, 0.0f};
+  }
+}
+
+// Flat quad, drawn double-sided so the splat reads from any view angle.
+static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size) {
+  f32 h = size * 0.5f;
+  Vector3 a = {c.x + (u.x + v.x) * h, c.y + (u.y + v.y) * h,
+               c.z + (u.z + v.z) * h};
+  Vector3 b = {c.x + (u.x - v.x) * h, c.y + (u.y - v.y) * h,
+               c.z + (u.z - v.z) * h};
+  Vector3 cc = {c.x - (u.x + v.x) * h, c.y - (u.y + v.y) * h,
+                c.z - (u.z + v.z) * h};
+  Vector3 d = {c.x - (u.x - v.x) * h, c.y - (u.y - v.y) * h,
+               c.z - (u.z - v.z) * h};
+  DrawTriangle3D(a, b, cc, PAL_DARK);
+  DrawTriangle3D(a, cc, d, PAL_DARK);
+  DrawTriangle3D(a, cc, b, PAL_DARK);
+  DrawTriangle3D(a, d, cc, PAL_DARK);
+}
+
+static Vector3 vcross(Vector3 a, Vector3 b) {
+  return (Vector3){a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+                   a.x * b.y - a.y * b.x};
+}
+
+static Vector3 vnorm(Vector3 a) {
+  f32 l = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+  if (l < 1e-6f)
+    return (Vector3){1.0f, 0.0f, 0.0f};
+  return (Vector3){a.x / l, a.y / l, a.z / l};
+}
+
+// Orthonormal pair around r for spreading the spatter cone.
+static void reflect_basis(Vector3 r, Vector3 *u, Vector3 *v) {
+  Vector3 ref =
+      fabsf(r.y) < 0.9f ? (Vector3){0.0f, 1.0f, 0.0f} : (Vector3){1.0f, 0.0f, 0.0f};
+  *u = vnorm(vcross(r, ref));
+  *v = vcross(r, *u);
+}
+
+static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
+  u8 ex = g->held_by[e];
+  Vector3 n = mark_normal_vec(mark_ex_norm(ex));
+  u8 str = mark_ex_str(ex);
+  if (str >= MARK_STR_LEVELS)
+    str = MARK_STR_LEVELS - 1u;
+  Color mat = mark_ex_mat(ex) == MARK_MAT_MID ? PAL_MID : PAL_PURPLE;
+  Vector3 u, v;
+  mark_basis(n, &u, &v);
+  // Nudge off the face so the flat splat never z-fights the surface. The
+  // server already backs the contact point just off the face, so this stays
+  // tight on every solid (floor, cubes, players).
+  Vector3 c = {p.x + n.x * 0.012f, p.y + n.y * 0.012f, p.z + n.z * 0.012f};
+  // Random in-plane rotation per mark so the splat reads as spatter, not a
+  // stamp. Deterministic from the entity so it stays put while it lives.
+  u32 seed = mix32((u32)e * 2654435761u + 7u);
+  f32 ang = (f32)(seed % 360u) * DEG2RAD;
+  f32 ca = cosf(ang), sa = sinf(ang);
+  Vector3 ru = {u.x * ca + v.x * sa, u.y * ca + v.y * sa, u.z * ca + v.z * sa};
+  Vector3 rv = {v.x * ca - u.x * sa, v.y * ca - u.y * sa, v.z * ca - u.z * sa};
+  draw_mark_quad(c, ru, rv, MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str);
+  // Spatter in the impacted material's color, along the reflection of the
+  // incoming travel dir (yaw/pitch survive on the mark from the bullet).
+  // Mark lifetime ticks down every 2nd tick, so age back into tick units.
+  Vector3 d;
+  aim_dir(g->yaw[e], g->pitch[e], &d);
+  float dn = d.x * n.x + d.y * n.y + d.z * n.z;
+  Vector3 r = {d.x - 2.0f * dn * n.x, d.y - 2.0f * dn * n.y,
+               d.z - 2.0f * dn * n.z};
+  Vector3 cu, cv;
+  reflect_basis(r, &cu, &cv);
+  int age = (IMPACT_MARK_LIFETIME_TICKS - (int)g->lifetime[e]) * 2;
+  int life = MARK_SPATTER_LIFE + MARK_SPATTER_LIFE_STEP * (int)str;
+  if (age >= 0 && age < life) {
+    f32 t = (f32)age * SIM_DT;
+    f32 fade = 1.0f - (f32)age / (f32)life;
+    int count = MARK_SPATTER_BASE + (int)str;
+    for (int i = 0; i < count; ++i) {
+      u32 h = mix32(seed + (u32)i * 2246822519u);
+      f32 a = ((f32)(h % 100u) / 100.0f - 0.5f) * 0.9f;
+      f32 b = ((f32)((h >> 7) % 100u) / 100.0f - 0.5f) * 0.9f;
+      Vector3 dir = vnorm((Vector3){r.x + cu.x * a + cv.x * b,
+                                    r.y + cu.y * a + cv.y * b,
+                                    r.z + cu.z * a + cv.z * b});
+      f32 sp = 1.0f + (f32)((h >> 14) % 100u) / 100.0f * 2.0f;
+      Vector3 dp = {c.x + dir.x * sp * t, c.y + dir.y * sp * t - 4.9f * t * t,
+                    c.z + dir.z * sp * t};
+      f32 s = (0.030f + 0.010f * (f32)((h >> 21) & 3u)) * fade + 0.008f;
+      DrawCubeV(dp, (Vector3){s, s, s}, mat);
+    }
+  }
+}
+
 static void draw_world(const GameState *g, f32 a) {
   u32 comps[] = {COMP_POSITION, COMP_RENDERABLE};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
@@ -738,14 +881,13 @@ static void draw_world(const GameState *g, f32 a) {
     case KIND_CASING:
       draw_casing(g, e, p);
       break;
-    case KIND_IMPACT_MARK: {
-      f32 s = g->flash[e] >= 3 ? 0.18f : g->flash[e] == 2 ? 0.13f : 0.08f;
-      Color c = g->flash[e] >= 3   ? PAL_LIGHT
-                : g->flash[e] == 2 ? PAL_MID
-                                   : PAL_DARK;
-      DrawCubeV(p, (Vector3){s, s, s}, c);
+    case KIND_IMPACT_MARK:
+      draw_impact_mark(g, e, p);
       break;
-    }
+    case KIND_FLOOR:
+      // The ground plane is drawn separately; the floor solid exists only
+      // for the universal hitscan path.
+      break;
     }
   }
 }
@@ -861,36 +1003,50 @@ static void draw_hit_indicator(const GameState *g, u32 e) {
   }
 }
 
-static void draw_help_line(int y, String text, Color color) {
-  int w = small_text_width(text);
-  int x = (LOGICAL_W - w) / 2;
-  if (x < 1)
-    x = 1;
-  draw_small_text(x, y, text, color);
+// Help overlay: left-aligned, two bindings per row (key + action on each
+// half: four visual columns). Keys are display strings matching the KEY_* /
+// MOUSE_BUTTON_* bindings in update_input, which always use the raylib
+// constants (never raw codes).
+#define HELP_COL0_X 2
+#define HELP_COL1_X (LOGICAL_W / 2 + 1)
+#define HELP_TITLE_Y 3
+#define HELP_ROWS_Y 11
+#define HELP_ROW_DY 6
+#define HELP_KEY_ADV 24
+
+// TAB stats: values start past the widest (4-letter) label + space so FPS
+// lines up with PING; the readout latches at 10 Hz so it stays readable.
+#define STAT_NUM_ADV 20
+#define STAT_UPDATE_DT 0.1
+
+typedef struct HelpEntry {
+  const char *key;
+  const char *action;
+} HelpEntry;
+
+static const HelpEntry HELP_ENTRIES[] = {
+    {"WASD", "MOVE"},  {"MOUSE", "LOOK"}, {"LMB", "FIRE"},  {"RMB", "AIM"},
+    {"SPACE", "JUMP"}, {"SHIFT", "RUN"},  {"E", "GRAB"},    {"ENTER", "CHAT"},
+    {"T", "CHAT"},     {"ESC", "MOUSE"},  {"TAB", "STATS"}, {"F1", "HELP"},
+};
+#define HELP_COUNT (sizeof(HELP_ENTRIES) / sizeof(HELP_ENTRIES[0]))
+
+static void draw_help_entry(int x, int y, const char *key, const char *action) {
+  i32 klen = cstr_len(key);
+  i32 alen = cstr_len(action);
+  String ks = {(u8 *)key, klen, klen};
+  String as = {(u8 *)action, alen, alen};
+  draw_small_text(x, y, ks, PAL_MID);
+  draw_small_text(x + HELP_KEY_ADV, y, as, PAL_LIGHT);
 }
 
 static void draw_hud(GameState *g) {
   u32 e = local_player_entity(g);
-  unsigned fps = (unsigned)GetFPS();
-  unsigned copy = fps;
-  int digits = 1;
-  while (copy >= 10u) {
-    copy /= 10u;
-    ++digits;
-  }
-  int fps_w = 15 + digits * 4;
-  int fps_x = LOGICAL_W - fps_w - 2;
   if (!g->chatting && g->notice_ticks && g->notice_length) {
     String note = game_notice(g);
     int w = small_text_width(note);
-    int y = w + 4 < fps_x ? 1 : 9;
-    DrawRectangle(1, y, w + 2, 7, PAL_DARK);
-    draw_small_text(2, y + 1, note, PAL_LIGHT);
-  }
-  if (!g->chatting) {
-    DrawRectangle(fps_x - 1, 1, fps_w + 2, 7, PAL_DARK);
-    draw_small_text(fps_x, 2, STR("FPS"), PAL_MID);
-    draw_number(fps_x + 16, 2, fps, PAL_LIGHT);
+    DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
+    draw_small_text(2, 2, note, PAL_LIGHT);
   }
   if (e != ECS_INVALID_ENTITY)
     draw_hit_indicator(g, e);
@@ -917,22 +1073,57 @@ static void draw_hud(GameState *g) {
     if (w > LOGICAL_W - 4)
       w = LOGICAL_W - 4;
     DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
-    draw_small_text(2, 2, STR("T:"), PAL_MID);
+    draw_small_text(2, 2, STR("T"), PAL_MID);
     draw_small_text(10, 2, chat, PAL_LIGHT);
+  }
+  // TAB-only debug stats, drawn last (over notice/chat, which may become
+  // temporarily unreadable while held). Line 1: FPS, one line below: PING.
+  if (IsKeyDown(KEY_TAB)) {
+    static unsigned shown_fps, shown_ping;
+    static double last_stat_update = -1.0;
+    double now = GetTime();
+    if (now - last_stat_update >= STAT_UPDATE_DT) {
+      shown_fps = (unsigned)GetFPS();
+      shown_ping = (g->connected && g->ping.have)
+                       ? (unsigned)(g->ping.rtt_ms + 0.5)
+                       : 0;
+      last_stat_update = now;
+    }
+    unsigned fps = shown_fps;
+    unsigned ping = shown_ping;
+    unsigned fps_copy = fps;
+    int fps_digits = 1;
+    while (fps_copy >= 10u) {
+      fps_copy /= 10u;
+      ++fps_digits;
+    }
+    unsigned ping_copy = ping;
+    int ping_digits = 1;
+    while (ping_copy >= 10u) {
+      ping_copy /= 10u;
+      ++ping_digits;
+    }
+    int fps_w = STAT_NUM_ADV - 1 + fps_digits * 4;
+    int ping_w = STAT_NUM_ADV - 1 + ping_digits * 4;
+    DrawRectangle(1, 1, fps_w + 2, 7, PAL_DARK);
+    draw_small_text(2, 2, STR("FPS"), PAL_MID);
+    draw_number(2 + STAT_NUM_ADV, 2, fps, PAL_LIGHT);
+    DrawRectangle(1, 9, ping_w + 2, 7, PAL_DARK);
+    draw_small_text(2, 10, STR("PING"), PAL_MID);
+    draw_number(2 + STAT_NUM_ADV, 10, ping, PAL_LIGHT);
   }
   if (g->help) {
     DrawRectangle(0, 0, LOGICAL_W, LOGICAL_H, PAL_DARK);
     DrawRectangleLines(0, 0, LOGICAL_W, LOGICAL_H, PAL_MID);
-    draw_help_line(3, STR("HOLD F1 PAUSED HELP"), PAL_MID);
-    draw_help_line(9, STR("WASD MOVE"), PAL_LIGHT);
-    draw_help_line(15, STR("MOUSE LOOK"), PAL_LIGHT);
-    draw_help_line(21, STR("LMB FIRE"), PAL_LIGHT);
-    draw_help_line(27, STR("RMB AIM"), PAL_LIGHT);
-    draw_help_line(33, STR("SPACE JUMP"), PAL_LIGHT);
-    draw_help_line(39, STR("SHIFT+W SPRINT"), PAL_LIGHT);
-    draw_help_line(45, STR("E HOLD CUBE"), PAL_LIGHT);
-    draw_help_line(51, STR("ENTER/T CHAT"), PAL_LIGHT);
-    draw_help_line(57, STR("ESC MOUSE"), PAL_LIGHT);
+    draw_small_text(HELP_COL0_X, HELP_TITLE_Y, STR("HELP"), PAL_MID);
+    for (u32 i = 0; i < HELP_COUNT; i += 2) {
+      int y = HELP_ROWS_Y + (int)(i / 2u) * HELP_ROW_DY;
+      draw_help_entry(HELP_COL0_X, y, HELP_ENTRIES[i].key,
+                      HELP_ENTRIES[i].action);
+      if (i + 1u < HELP_COUNT)
+        draw_help_entry(HELP_COL1_X, y, HELP_ENTRIES[i + 1u].key,
+                        HELP_ENTRIES[i + 1u].action);
+    }
   }
 }
 

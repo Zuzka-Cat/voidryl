@@ -211,7 +211,11 @@ static const ShellDef *shell_def(u8 id) {
 #define IMPACT_MARK_LIFETIME_TICKS 128
 
 #define ARENA 32
-#define BULLET_SPEED 32.0f
+// Muzzle velocity in fixed-point units/tick (POS_SCALE units == 1 m, so 64
+// is 1 m/tick == 100 m/s at SIM_HZ). Kept well above sprint speed so tracers
+// read as hitscan-fast; projectile_system substeps so it still cannot tunnel
+// thin targets.
+#define BULLET_SPEED 64.0f
 #define BULLET_ZERO_DISTANCE 12.0f
 #define ARENA_POS (15 * POS_SCALE)
 
@@ -259,12 +263,76 @@ static f32 scale_decode(u8 q) {
 
 static const Vector3 GUN_MUZZLE_OFFSET = {1.46f, 0.42f, -0.18f};
 
+// Impact-mark surface orientation. The server stores the hit face normal in
+// the mark's held_by slot (free: marks never hold cubes), so the client can
+// draw a flat 2D splat on the surface instead of a 3D cube. No protocol
+// change: held_by already rides NetEntity.extra.
+enum MarkNormal {
+  MARK_NORM_NONE = 0,
+  MARK_NORM_PX = 1,
+  MARK_NORM_NX = 2,
+  MARK_NORM_PY = 3,
+  MARK_NORM_NY = 4,
+  MARK_NORM_PZ = 5,
+  MARK_NORM_NZ = 6
+};
+
+// Face normal opposing the dominant vector axis. Used both ways: the slab
+// test yields a face vector, this folds it back to a code.
+static u8 mark_code_for_vec(Vector3 n) {
+  float ax = fabsf(n.x), ay = fabsf(n.y), az = fabsf(n.z);
+  if (ax >= ay && ax >= az)
+    return n.x > 0.0f ? MARK_NORM_PX : MARK_NORM_NX;
+  if (az >= ax && az >= ay)
+    return n.z > 0.0f ? MARK_NORM_PZ : MARK_NORM_NZ;
+  return n.y > 0.0f ? MARK_NORM_PY : MARK_NORM_NY;
+}
+
+static Vector3 mark_normal_vec(u8 code) {
+  switch (code) {
+  case MARK_NORM_PX:
+    return (Vector3){1.0f, 0.0f, 0.0f};
+  case MARK_NORM_NX:
+    return (Vector3){-1.0f, 0.0f, 0.0f};
+  case MARK_NORM_NY:
+    return (Vector3){0.0f, -1.0f, 0.0f};
+  case MARK_NORM_PZ:
+    return (Vector3){0.0f, 0.0f, 1.0f};
+  case MARK_NORM_NZ:
+    return (Vector3){0.0f, 0.0f, -1.0f};
+  case MARK_NORM_PY:
+  default:
+    return (Vector3){0.0f, 1.0f, 0.0f};
+  }
+}
+
+// Impact extra packing (held_by / NetEntity.extra): face normal in bits
+// 0-2, impact-strength level in bits 3-4, spatter material in bits 5-6.
+// Strength is the normal share of the impact velocity: dead-on hits splat
+// big, grazes leave a dot.
+#define MARK_STR_LEVELS 4u
+#define MARK_EXTRA_STR_SHIFT 3
+#define MARK_EXTRA_MAT_SHIFT 5
+enum MarkMaterial { MARK_MAT_PURPLE = 0, MARK_MAT_MID = 1 };
+
+static u8 mark_extra_pack(u8 norm, u8 strength, u8 mat) {
+  return (u8)((norm & 0x07u) | ((strength & 0x03u) << MARK_EXTRA_STR_SHIFT) |
+              ((mat & 0x03u) << MARK_EXTRA_MAT_SHIFT));
+}
+
+static u8 mark_ex_norm(u8 ex) { return (u8)(ex & 0x07u); }
+
+static u8 mark_ex_str(u8 ex) { return (u8)((ex >> MARK_EXTRA_STR_SHIFT) & 0x03u); }
+
+static u8 mark_ex_mat(u8 ex) { return (u8)((ex >> MARK_EXTRA_MAT_SHIFT) & 0x03u); }
+
 enum EntityKind {
   KIND_CUBE = 1,
   KIND_PLAYER,
   KIND_BULLET,
   KIND_IMPACT_MARK,
-  KIND_CASING
+  KIND_CASING,
+  KIND_FLOOR
 };
 
 enum {
@@ -276,7 +344,8 @@ enum {
   COMP_LIFETIME,
   COMP_RENDERABLE,
   COMP_NETWORKED,
-  COMP_SCALE
+  COMP_SCALE,
+  COMP_SOLID
 } ComponentKind;
 
 typedef struct InputCommand {
@@ -352,7 +421,7 @@ static i32 net_snapshot_wire_size(u8 count) {
 }
 
 #define ECS_MAX_ENTITIES 32u
-#define ECS_MAX_COMPONENTS 9u
+#define ECS_MAX_COMPONENTS 10u
 #define ECS_INVALID_ENTITY UINT32_MAX
 
 typedef struct ECS {
@@ -450,6 +519,22 @@ static const uint16_t tom_thumb_3x5[TOM_THUMB_3X5_COUNT] = {
     0x388E, 0x7492, 0x5B6B, 0x5B52, 0x5BFD, 0x5AAD, 0x5A92, 0x72A7,
 };
 
+// TAB ping estimator (client-only presentation, never simulated or
+// snapshotted). Ring of input-sequence send times keyed by low bits;
+// snapshots carry acknowledged_sequence so the client can sample RTT.
+#define PING_WINDOW 64u
+#define PING_WINDOW_MASK (PING_WINDOW - 1u)
+#define PING_MS_PER_SEC 1000.0
+#define PING_MAX_MS 9999.0
+#define PING_SMOOTH_NEW 0.2
+typedef struct PingState {
+  double send_time[PING_WINDOW];
+  u16 send_seq[PING_WINDOW];
+  u8 slot_valid[PING_WINDOW];
+  double rtt_ms;
+  u8 have;
+} PingState;
+
 typedef struct GameState {
   ECS ecs;
   i16 px[ECS_MAX_ENTITIES], py[ECS_MAX_ENTITIES], pz[ECS_MAX_ENTITIES];
@@ -479,6 +564,8 @@ typedef struct GameState {
   // the last applied snapshot, for debugging/future predicted fields.
   u16 weapon_dirty_seq[ECS_MAX_ENTITIES];
   u16 last_snapshot_ack;
+  // RTT estimator ring for the TAB overlay (client-only, see PingState).
+  PingState ping;
   InputCommand input[MAX_PLAYERS];
   Peer peers[MAX_PLAYERS];
   u8 player_entity[MAX_PLAYERS];
@@ -1261,10 +1348,12 @@ static void add_kind_components(GameState *g, u32 e, u8 kind) {
   ecs_add(&g->ecs, e, COMP_NETWORKED);
   if (kind == KIND_CUBE) {
     ecs_add(&g->ecs, e, COMP_SCALE);
+    ecs_add(&g->ecs, e, COMP_SOLID);
   } else if (kind == KIND_PLAYER) {
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_AIM);
     ecs_add(&g->ecs, e, COMP_PLAYER);
+    ecs_add(&g->ecs, e, COMP_SOLID);
   } else if (kind == KIND_BULLET) {
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_PROJECTILE);
@@ -1274,6 +1363,8 @@ static void add_kind_components(GameState *g, u32 e, u8 kind) {
     ecs_add(&g->ecs, e, COMP_LIFETIME);
   } else if (kind == KIND_IMPACT_MARK) {
     ecs_add(&g->ecs, e, COMP_LIFETIME);
+  } else if (kind == KIND_FLOOR) {
+    ecs_add(&g->ecs, e, COMP_SOLID);
   }
 }
 
@@ -1328,11 +1419,28 @@ static u32 create_cube(GameState *g, u32 index) {
   return e;
 }
 
+// The arena floor as a solid entity: an arena-wide slab from deep below up
+// to y=0. Never rendered (the ground plane is drawn separately) and never
+// destroyed; it exists only so the hitscan segment test covers the ground
+// with zero special cases.
+static u32 create_floor(GameState *g) {
+  u32 e = ecs_create(&g->ecs);
+  if (e == ECS_INVALID_ENTITY)
+    return e;
+  clear_entity_data(g, e);
+  g->kind[e] = KIND_FLOOR;
+  add_kind_components(g, e, KIND_FLOOR);
+  return e;
+}
+
 static void game_init(GameState *g) {
-  // Server-only world init: authoritative cubes live here.
+  // Server-only world init: authoritative cubes plus the floor slab live
+  // here. The floor is a real solid entity so hitscan treats ground, cubes
+  // and players through one universal path.
   game_zero(g);
   for (u32 i = 0; i < MAX_CUBES; ++i)
     (void)create_cube(g, i);
+  (void)create_floor(g);
 }
 
 // Client world lifecycle (proper place for world resets, not a patch in
@@ -1398,12 +1506,152 @@ static void gun_basis(const GameState *g, u32 e, Vector3 *f, Vector3 *r,
 }
 
 static Vector3 gun_point(const GameState *g, u32 e, Vector3 f, Vector3 r,
-                         Vector3 u, Vector3 off) {
+                          Vector3 u, Vector3 off) {
   return (Vector3){
       (f32)g->px[e] / POS_SCALE + f.x * off.x + r.x * off.y + u.x * off.z,
       (f32)g->py[e] / POS_SCALE + 1.5f + f.y * off.x + r.y * off.y +
           u.y * off.z,
       (f32)g->pz[e] / POS_SCALE + f.z * off.x + r.z * off.y + u.z * off.z};
+}
+
+// ---- universal hitscan (single path for floor, cubes and players) ----
+// Every solid answers the same question: where does the segment p0->p0+d
+// enter my box, and through which face? The projectile loop takes the
+// nearest entry over all solids, so mark placement, orientation, strength
+// and spatter never branch on what was hit. Differences between hittables
+// are data below (bounds, material), not code paths.
+
+// Spatter material per kind, indexed table so resolving it is a lookup.
+// Cubes and players chip the mid tone, the floor chips purple.
+static const u8 SOLID_MAT[] = {
+    MARK_MAT_PURPLE, // 0: unused
+    MARK_MAT_MID,    // KIND_CUBE
+    MARK_MAT_MID,    // KIND_PLAYER
+    MARK_MAT_PURPLE, // KIND_BULLET (never solid)
+    MARK_MAT_PURPLE, // KIND_IMPACT_MARK (never solid)
+    MARK_MAT_PURPLE, // KIND_CASING (never solid)
+    MARK_MAT_PURPLE, // KIND_FLOOR
+};
+
+// World-space bounds of a solid, in fixed-point units as floats. Cube
+// extents follow world scale exactly like the old discrete test; players
+// keep the same 64-wide, 0..128-tall hitbox; the floor is the arena slab.
+static void solid_bounds(const GameState *g, u32 e, Vector3 *bmin,
+                         Vector3 *bmax) {
+  if (g->kind[e] == KIND_FLOOR) {
+    float a = (float)(ARENA * POS_SCALE);
+    *bmin = (Vector3){-a, -a, -a};
+    *bmax = (Vector3){a, 0.0f, a};
+    return;
+  }
+  if (g->kind[e] == KIND_PLAYER) {
+    *bmin = (Vector3){(float)g->px[e] - 32.0f, 0.0f,
+                      (float)g->pz[e] - 32.0f};
+    *bmax = (Vector3){(float)g->px[e] + 32.0f, 128.0f,
+                      (float)g->pz[e] + 32.0f};
+    return;
+  }
+  float s = scale_value(g, e);
+  float rxz = 42.0f * s, ry = 48.0f * s;
+  if (rxz < 8.0f)
+    rxz = 8.0f;
+  if (ry < 8.0f)
+    ry = 8.0f;
+  *bmin = (Vector3){(float)g->px[e] - rxz, (float)g->py[e] - ry,
+                    (float)g->pz[e] - rxz};
+  *bmax = (Vector3){(float)g->px[e] + rxz, (float)g->py[e] + ry,
+                    (float)g->pz[e] + rxz};
+}
+
+// Slab test: entry t in [0,1] plus entry-face normal. Exact, so fast
+// bullets cannot tunnel and the contact point sits on the face (no sampling
+// grid, no backoff tables). A segment starting inside reports t=0 with the
+// face opposing travel (point-blank shots still mark).
+static bool seg_box_hit(Vector3 p0, Vector3 d, Vector3 bmin, Vector3 bmax,
+                        float *t_out, Vector3 *n_out) {
+  float tmin = 0.0f, tmax = 1.0f;
+  Vector3 n = {0.0f, 0.0f, 0.0f};
+  if (fabsf(d.x) < 1e-9f) {
+    if (p0.x < bmin.x || p0.x > bmax.x)
+      return false;
+  } else {
+    float inv = 1.0f / d.x;
+    float t1 = (bmin.x - p0.x) * inv;
+    float t2 = (bmax.x - p0.x) * inv;
+    Vector3 f1 = {-1.0f, 0.0f, 0.0f}, f2 = {1.0f, 0.0f, 0.0f};
+    if (t1 > t2) {
+      float tt = t1;
+      t1 = t2;
+      t2 = tt;
+      Vector3 tf = f1;
+      f1 = f2;
+      f2 = tf;
+    }
+    if (t1 > tmin) {
+      tmin = t1;
+      n = f1;
+    }
+    if (t2 < tmax)
+      tmax = t2;
+    if (tmin > tmax)
+      return false;
+  }
+  if (fabsf(d.y) < 1e-9f) {
+    if (p0.y < bmin.y || p0.y > bmax.y)
+      return false;
+  } else {
+    float inv = 1.0f / d.y;
+    float t1 = (bmin.y - p0.y) * inv;
+    float t2 = (bmax.y - p0.y) * inv;
+    Vector3 f1 = {0.0f, -1.0f, 0.0f}, f2 = {0.0f, 1.0f, 0.0f};
+    if (t1 > t2) {
+      float tt = t1;
+      t1 = t2;
+      t2 = tt;
+      Vector3 tf = f1;
+      f1 = f2;
+      f2 = tf;
+    }
+    if (t1 > tmin) {
+      tmin = t1;
+      n = f1;
+    }
+    if (t2 < tmax)
+      tmax = t2;
+    if (tmin > tmax)
+      return false;
+  }
+  if (fabsf(d.z) < 1e-9f) {
+    if (p0.z < bmin.z || p0.z > bmax.z)
+      return false;
+  } else {
+    float inv = 1.0f / d.z;
+    float t1 = (bmin.z - p0.z) * inv;
+    float t2 = (bmax.z - p0.z) * inv;
+    Vector3 f1 = {0.0f, 0.0f, -1.0f}, f2 = {0.0f, 0.0f, 1.0f};
+    if (t1 > t2) {
+      float tt = t1;
+      t1 = t2;
+      t2 = tt;
+      Vector3 tf = f1;
+      f1 = f2;
+      f2 = tf;
+    }
+    if (t1 > tmin) {
+      tmin = t1;
+      n = f1;
+    }
+    if (t2 < tmax)
+      tmax = t2;
+    if (tmin > tmax)
+      return false;
+  }
+  if (n.x == 0.0f && n.y == 0.0f && n.z == 0.0f)
+    n = mark_normal_vec(mark_code_for_vec(
+        (Vector3){-d.x, -d.y, -d.z}));
+  *t_out = tmin;
+  *n_out = n;
+  return true;
 }
 
 #endif

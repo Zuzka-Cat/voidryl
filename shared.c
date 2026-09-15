@@ -163,17 +163,14 @@ static const WeaponDef *weapon_def(u8 id) {
 //   [WEAPON_P90] = { .len = 0.06f, ... },
 // The server spawns (spawn_casing) and the client renders (draw_casing)
 // both read through shell_def(), so no per-shell branching is needed
-// elsewhere. Units are meters and m/s; port offsets are in gun_basis
-// space (forward, side with +right along gun_basis r, up).
+// elsewhere. Units are meters and m/s; eject_* kick along the gun's own
+// forward/right/up at the moment of the shot.
 // body_pal/rim_pal select the palette for the brass: 0 dark, 1 purple,
 // 2 mid, 3 light. The dark outline is always drawn for readability.
 typedef struct ShellDef {
   f32 len;
   f32 radius;
   f32 rim_radius;
-  f32 port_fwd;
-  f32 port_side;
-  f32 port_up;
   f32 eject_right;
   f32 eject_up;
   f32 eject_back;
@@ -188,9 +185,6 @@ static const ShellDef SHELL_DEFS[WEAPON_COUNT] = {
             .len = 0.07f,
             .radius = 0.014f,
             .rim_radius = 0.017f,
-            .port_fwd = 0.55f,
-            .port_side = 0.14f,
-            .port_up = -0.06f,
             .eject_right = 2.4f,
             .eject_up = 1.9f,
             .eject_back = 0.55f,
@@ -216,7 +210,6 @@ static const ShellDef *shell_def(u8 id) {
 // read as hitscan-fast; projectile_system substeps so it still cannot tunnel
 // thin targets.
 #define BULLET_SPEED 64.0f
-#define BULLET_ZERO_DISTANCE 12.0f
 #define ARENA_POS (15 * POS_SCALE)
 
 // Perspective-hold tuning. While holding E the cube slides on the ground
@@ -261,7 +254,25 @@ static f32 scale_decode(u8 q) {
   return (f32)q / 64.0f;
 }
 
-static const Vector3 GUN_MUZZLE_OFFSET = {1.46f, 0.42f, -0.18f};
+// Unified third-person gun: hip carry on the shooter's right, converged onto
+// the sight ray at a fixed zero. Pose is a pure function of feet/yaw/pitch —
+// never of what is aimed at — so sweeping across a person never snaps the
+// gun, and server (bullets, brass) and client (render) share one helper.
+#define EYE_HEIGHT_M 1.5f
+// Hip carry in body space (feet origin, yaw-only frame): shooter's right is
+// -X (screen-right is -X), so -X sits the gun beside the torso with a visible
+// gap like a real stance — above the hip, clear of the chest.
+#define GUN_HIP_SIDE_M 0.36f
+#define GUN_HIP_UP_M 0.98f
+#define GUN_HIP_FWD_M 0.24f
+// Zero distance is the true eye-ray distance (see sight_zero_m): the muzzle
+// axis meets the eye ray exactly where the crosshair sits, at any range —
+// aiming at a head zeroes on the head, so shots land where aimed.
+// Recenters the P99 mesh (barrel x -0.32) onto the gun axis for remote
+// rendering; the server applies the same shift in its muzzle/port math.
+#define GUN_CENTER_X_M 0.32f
+// Muzzle forward in (recentered) mesh space: flash front z 0.72.
+#define GUN_MUZZLE_Z_M 0.72f
 
 // Impact-mark surface orientation. The server stores the hit face normal in
 // the mark's held_by slot (free: marks never hold cubes), so the client can
@@ -375,10 +386,8 @@ typedef struct NetInputPacket {
 
 typedef struct NetEntity {
   u8 entity, kind, owner, flags, extra, weapon, ammo, reloading;
-  // Replicated presentation: server-smoothed pose so remotes show the same
-  // ADS/bob/lean/reload/sprint flavor with no second animation codebase.
-  u8 aim_q, walk_phase_q, walk_blend_q, reload_q, sprint_q;
-  i8 lean_x_q, lean_z_q;
+  // Quantized reload progress for the remote reload whip (0 == not reloading).
+  u8 reload_q;
   // World scale for scaled entities (cubes). Quantized like the other
   // presentation fields; 0 means 1.0 for backwards-tolerant decode.
   // Proper protocol field, not padding reuse.
@@ -594,16 +603,8 @@ typedef struct GameState {
   // 1.0 == normal). Authoritative on the server, replicated via
   // NetEntity.scale, applied by renderer/collision through scale_value().
   f32 scale[ECS_MAX_ENTITIES];
-  // Server-side per-player presentation smoothing (replicated to remotes).
-  f32 sv_aim[MAX_PLAYERS], sv_phase[MAX_PLAYERS], sv_blend[MAX_PLAYERS];
-  f32 sv_sprint[MAX_PLAYERS];
-  f32 sv_leanx[MAX_PLAYERS], sv_leanz[MAX_PLAYERS];
-  f32 sv_velx[MAX_PLAYERS], sv_velz[MAX_PLAYERS];
-  // Client-side per-entity replicated presentation (decoded snapshot).
-  u8 r_aim[ECS_MAX_ENTITIES], r_phase[ECS_MAX_ENTITIES];
-  u8 r_blend[ECS_MAX_ENTITIES], r_reload[ECS_MAX_ENTITIES];
-  u8 r_sprint[ECS_MAX_ENTITIES];
-  i8 r_leanx[ECS_MAX_ENTITIES], r_leanz[ECS_MAX_ENTITIES];
+  // Reload progress per entity for the remote reload whip (0 == not reloading).
+  u8 r_reload[ECS_MAX_ENTITIES];
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
@@ -883,23 +884,6 @@ static void present_lean_offsets(f32 sx, f32 sz, f32 *ox, f32 *oz) {
   *ox = -sx * 0.045f;
   *oz = sz * 0.05f;
 }
-
-// Wire quantizers for replicated presentation (0..1 and -1..1 floats).
-// Single source of truth: encode clamps via clamp_float, rounds with
-// lroundf, then range-checks via clamp_int; decode is the exact inverse.
-static u8 encode_01(f32 v) {
-  return (u8)clamp_int((int)lroundf(clamp_float(v, 0.0f, 1.0f) * 255.0f), 0,
-                       255);
-}
-
-static f32 decode_01(u8 q) { return (f32)q / 255.0f; }
-
-static i8 encode_11(f32 v) {
-  return (i8)clamp_int((int)lroundf(clamp_float(v, -1.0f, 1.0f) * 127.0f),
-                       -127, 127);
-}
-
-static f32 decode_11(i8 q) { return (f32)q / 127.0f; }
 
 // Reload progress quantized: 0 means not reloading, otherwise 1..255.
 static u8 encode_reload_q(bool reloading, f32 t) {
@@ -1334,9 +1318,7 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->flash[e] = g->held_by[e] = 0;
   g->weapon_ammo[e] = g->weapon_cooldown[e] = g->weapon_prev[e] = 0;
   g->weapon_reload[e] = g->weapon_dirty_seq[e] = 0;
-  g->r_aim[e] = g->r_phase[e] = g->r_blend[e] = g->r_reload[e] =
-      g->r_sprint[e] = 0;
-  g->r_leanx[e] = g->r_leanz[e] = 0;
+  g->r_reload[e] = 0;
   g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
   g->scale[e] = 1.0f;
   g->weapon_id[e] = WEAPON_P99;
@@ -1496,22 +1478,65 @@ static void aim_dir(i16 yaw_deg, i16 pitch_deg, Vector3 *out) {
   out->z = cosf(yaw) * h;
 }
 
-static void gun_basis(const GameState *g, u32 e, Vector3 *f, Vector3 *r,
-                      Vector3 *u) {
-  aim_dir(g->yaw[e], g->pitch[e], f);
-  f32 yaw = (f32)g->yaw[e] * DEG2RAD;
-  *r = (Vector3){-cosf(yaw), 0.0f, sinf(yaw)};
-  *u = (Vector3){r->y * f->z - r->z * f->y, r->z * f->x - r->x * f->z,
-                 r->x * f->y - r->y * f->x};
+// Float-angle look direction; gun local +Z maps to this after yaw/pitch.
+static Vector3 sight_dir(f32 yaw_deg, f32 pitch_deg) {
+  f32 h = cosf(pitch_deg * DEG2RAD);
+  return (Vector3){sinf(yaw_deg * DEG2RAD) * h, sinf(pitch_deg * DEG2RAD),
+                   cosf(yaw_deg * DEG2RAD) * h};
 }
 
-static Vector3 gun_point(const GameState *g, u32 e, Vector3 f, Vector3 r,
-                          Vector3 u, Vector3 off) {
-  return (Vector3){
-      (f32)g->px[e] / POS_SCALE + f.x * off.x + r.x * off.y + u.x * off.z,
-      (f32)g->py[e] / POS_SCALE + 1.5f + f.y * off.x + r.y * off.y +
-          u.y * off.z,
-      (f32)g->pz[e] / POS_SCALE + f.z * off.x + r.z * off.y + u.z * off.z};
+// Full third-person pose from feet/yaw/pitch plus the eye-ray distance.
+// Origin at the hip carry; yaw_g/pitch_g aim the (recentered) barrel at the
+// eye-ray point at zero_m, so the muzzle axis meets the crosshair exactly
+// there. Closed form, no iteration; a pure function of its inputs, so the
+// gun glides instead of snapping.
+static void sight_gun_pose_m(Vector3 feet, f32 yaw_deg, f32 pitch_deg,
+                             f32 zero_m, Vector3 *origin, f32 *yaw_g,
+                             f32 *pitch_g) {
+  f32 cy = cosf(yaw_deg * DEG2RAD), sy = sinf(yaw_deg * DEG2RAD);
+  // Body-local (-SIDE, UP, FWD) through yaw-only rotation, so the gun keeps
+  // its carry height while the view pitches.
+  Vector3 a = {feet.x - GUN_HIP_SIDE_M * cy + GUN_HIP_FWD_M * sy,
+               feet.y + GUN_HIP_UP_M,
+               feet.z + GUN_HIP_SIDE_M * sy + GUN_HIP_FWD_M * cy};
+  Vector3 f = sight_dir(yaw_deg, pitch_deg);
+  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
+  Vector3 s = {eye.x + f.x * zero_m, eye.y + f.y * zero_m,
+               eye.z + f.z * zero_m};
+  // Recentered mesh has the barrel on the gun axis, so aiming the axis at
+  // the zero puts the muzzle axis through it exactly.
+  Vector3 d = {s.x - a.x, s.y - a.y, s.z - a.z};
+  f32 len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+  if (len < 1e-6f) {
+    *origin = a;
+    *yaw_g = yaw_deg;
+    *pitch_g = pitch_deg;
+    return;
+  }
+  d.x /= len;
+  d.y /= len;
+  d.z /= len;
+  *origin = a;
+  *yaw_g = atan2f(d.x, d.z) * RAD2DEG;
+  *pitch_g = asinf(clamp_float(d.y, -1.0f, 1.0f)) * RAD2DEG;
+}
+
+// Ejection cut in recentered mesh space (mesh x -0.385 + centering 0.32),
+// rotated yaw-then-pitch exactly like the render transform.
+static Vector3 sight_gun_port_m(Vector3 origin, f32 yaw_g, f32 pitch_g) {
+  f32 x = GUN_CENTER_X_M - 0.385f, y = 0.045f, z = 0.18f;
+  f32 pt = -pitch_g * DEG2RAD;
+  f32 cp = cosf(pt), sp = sinf(pt);
+  f32 y1 = y * cp - z * sp, z1 = y * sp + z * cp;
+  f32 cy = cosf(yaw_g * DEG2RAD), sy = sinf(yaw_g * DEG2RAD);
+  return (Vector3){origin.x + x * cy + z1 * sy, origin.y + y1,
+                   origin.z - x * sy + z1 * cy};
+}
+
+// Smooth remote yaw/pitch: snapshot base plus the lag delta scaled by the
+// position alpha, so body and gun glide together instead of snapping.
+static f32 present_lerp_angle(i16 base, int delta, f32 a) {
+  return (f32)base - (f32)delta * (1.0f - a);
 }
 
 // ---- universal hitscan (single path for floor, cubes and players) ----
@@ -1652,6 +1677,38 @@ static bool seg_box_hit(Vector3 p0, Vector3 d, Vector3 bmin, Vector3 bmax,
   *t_out = tmin;
   *n_out = n;
   return true;
+}
+
+// True aim distance for the gun zero: nearest solid along the eye ray,
+// players included, shooter excluded. Both ends run this same helper — the
+// server on authoritative state for bullets, the client on snapshot state
+// for render — so tracers match the visible gun and aiming at a head zeroes
+// on the head at any range. Sky falls back to a near-parallel distance.
+#define SIGHT_SKY_DIST_M 12.0f
+#define SIGHT_MAX_DIST_M 60.0f
+
+static f32 sight_zero_m(const GameState *g, u32 skip, Vector3 eye, Vector3 f) {
+  Vector3 p0 = {eye.x * (f32)POS_SCALE, eye.y * (f32)POS_SCALE,
+                eye.z * (f32)POS_SCALE};
+  Vector3 d = {f.x * SIGHT_MAX_DIST_M * (f32)POS_SCALE,
+               f.y * SIGHT_MAX_DIST_M * (f32)POS_SCALE,
+               f.z * SIGHT_MAX_DIST_M * (f32)POS_SCALE};
+  f32 best = 1.0f;
+  u32 comps[] = {COMP_SOLID};
+  EcsQuery q = ecs_query(&g->ecs, comps, 1);
+  while (ecs_next(&q)) {
+    u32 o = q.entity;
+    if (o == skip)
+      continue;
+    Vector3 bmin, bmax, n;
+    f32 t;
+    solid_bounds(g, o, &bmin, &bmax);
+    if (seg_box_hit(p0, d, bmin, bmax, &t, &n) && t < best)
+      best = t;
+  }
+  if (best >= 1.0f)
+    return SIGHT_SKY_DIST_M;
+  return clamp_float(best * SIGHT_MAX_DIST_M, 0.5f, SIGHT_MAX_DIST_M);
 }
 
 #endif

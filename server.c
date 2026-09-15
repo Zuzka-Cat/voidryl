@@ -170,27 +170,32 @@ static void holding_system(GameState *g) {
 }
 
 static u32 spawn_bullet(GameState *g, u32 pe) {
-  Vector3 f, r, u, muzzle, target, dir;
   if (count_kind(g, KIND_BULLET) >= MAX_BULLETS)
     return ECS_INVALID_ENTITY;
   u32 e = take_entity(g);
   if (e == ECS_INVALID_ENTITY)
     return e;
   clear_entity_data(g, e);
-  gun_basis(g, pe, &f, &r, &u);
-  muzzle = gun_point(g, pe, f, r, u, GUN_MUZZLE_OFFSET);
-  target =
-      gun_point(g, pe, f, r, u, (Vector3){BULLET_ZERO_DISTANCE, 0.0f, 0.0f});
-  dir =
-      (Vector3){target.x - muzzle.x, target.y - muzzle.y, target.z - muzzle.z};
-  f32 len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-  if (len > 0.001f) {
-    dir.x /= len;
-    dir.y /= len;
-    dir.z /= len;
-  } else {
-    dir = f;
-  }
+  // Shots leave the converged hip-gun muzzle along the barrel (+spread only),
+  // from the exact pose the client renders, so tracers match the visible gun.
+  Vector3 feet = {(f32)g->px[pe] / POS_SCALE, (f32)g->py[pe] / POS_SCALE,
+                  (f32)g->pz[pe] / POS_SCALE};
+  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
+  Vector3 fv = sight_dir((f32)g->yaw[pe], (f32)g->pitch[pe]);
+  f32 zero = sight_zero_m(g, pe, eye, fv);
+  Vector3 gp;
+  f32 gyaw, gpitch;
+  sight_gun_pose_m(feet, (f32)g->yaw[pe], (f32)g->pitch[pe], zero, &gp, &gyaw,
+                   &gpitch);
+  Vector3 gd = sight_dir(gyaw, gpitch);
+  Vector3 muzzle = {gp.x + gd.x * GUN_MUZZLE_Z_M, gp.y + gd.y * GUN_MUZZLE_Z_M,
+                    gp.z + gd.z * GUN_MUZZLE_Z_M};
+  Vector3 dir = gd;
+  // Spread basis around the barrel: yaw-only right plus r x dir up.
+  f32 gcy = cosf(gyaw * DEG2RAD), gsy = sinf(gyaw * DEG2RAD);
+  Vector3 r = {-gcy, 0.0f, gsy};
+  Vector3 u = {r.y * gd.z - r.z * gd.y, r.z * gd.x - r.x * gd.z,
+               r.x * gd.y - r.y * gd.x};
   // Per-weapon imprecision: slight cone, tighter while aiming.
   {
     u8 owner = g->owner[pe];
@@ -219,28 +224,17 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
   g->px[e] = (i16)lroundf(muzzle.x * POS_SCALE);
   g->py[e] = (i16)lroundf(muzzle.y * POS_SCALE);
   g->pz[e] = (i16)lroundf(muzzle.z * POS_SCALE);
-  // Inherit shooter velocity so strafing/falling doesn't make tracers drift
-  // opposite in the shooter's own view. Same fixed-point units (units/tick),
-  // so directly addable: moving right adds slight rightward flight, moving
-  // left adds slight leftward flight, same for fwd/back/up/down. Without
-  // this a right strafe (3 u/tick vs 32 u/tick bullet) reads as the bullet
-  // flying left.
-  f32 bvx = dir.x * BULLET_SPEED + (f32)g->vx[pe];
-  f32 bvy = dir.y * BULLET_SPEED + (f32)g->vy[pe];
-  f32 bvz = dir.z * BULLET_SPEED + (f32)g->vz[pe];
+  // No shooter-velocity inheritance: at 3 u/tick strafe vs 64 u/tick shots it
+  // would angle tracers ~3 deg off the crosshair. Shots stay on the ray.
+  f32 bvx = dir.x * BULLET_SPEED;
+  f32 bvy = dir.y * BULLET_SPEED;
+  f32 bvz = dir.z * BULLET_SPEED;
   g->vx[e] = (i16)lroundf(bvx);
   g->vy[e] = (i16)lroundf(bvy);
   g->vz[e] = (i16)lroundf(bvz);
-  f32 blen = sqrtf(bvx * bvx + bvy * bvy + bvz * bvz);
-  if (blen > 0.001f) {
-    f32 s = clamp_float(bvy / blen, -1.0f, 1.0f);
-    g->yaw[e] = wrap_degrees((int)lroundf(atan2f(bvx, bvz) * RAD2DEG));
-    g->pitch[e] = (i16)clamp_int((int)lroundf(asinf(s) * RAD2DEG), -89, 89);
-  } else {
-    g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
-    g->pitch[e] =
-        (i16)clamp_int((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
-  }
+  g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
+  g->pitch[e] =
+      (i16)clamp_int((int)lroundf(asinf(clamp_float(dir.y, -1.0f, 1.0f)) * RAD2DEG), -89, 89);
   g->owner[e] = g->owner[pe];
   g->kind[e] = KIND_BULLET;
   g->lifetime[e] = BULLET_LIFETIME_TICKS;
@@ -259,7 +253,6 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
 #define CASING_INHERIT_Y 0.3f
 
 static void spawn_casing(GameState *g, u32 pe) {
-  Vector3 f, r, u, port;
   u32 h, e;
   if (count_kind(g, KIND_CASING) >= MAX_CASINGS)
     destroy_oldest(g, KIND_CASING);
@@ -271,13 +264,23 @@ static void spawn_casing(GameState *g, u32 pe) {
   if (wid >= WEAPON_COUNT)
     wid = WEAPON_P99;
   const ShellDef *sh = shell_def(wid);
-  gun_basis(g, pe, &f, &r, &u);
-  // Ejection port: top-right of the slide, above the trigger guard.
-  // gun_basis r points screen-right, so a positive port_side puts the port
-  // on the right where the P99 cut is, keeping the spawn visible instead of
-  // crossing through the gun.
-  port = gun_point(g, pe, f, r, u,
-                   (Vector3){sh->port_fwd, sh->port_side, sh->port_up});
+  // Brass leaves the converged gun's ejection cut, kicked along the gun's own
+  // right/up/back like the extractor/ejector throw it.
+  Vector3 feet = {(f32)g->px[pe] / POS_SCALE, (f32)g->py[pe] / POS_SCALE,
+                  (f32)g->pz[pe] / POS_SCALE};
+  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
+  Vector3 fv = sight_dir((f32)g->yaw[pe], (f32)g->pitch[pe]);
+  f32 zero = sight_zero_m(g, pe, eye, fv);
+  Vector3 gp;
+  f32 gyaw, gpitch;
+  sight_gun_pose_m(feet, (f32)g->yaw[pe], (f32)g->pitch[pe], zero, &gp, &gyaw,
+                   &gpitch);
+  Vector3 port = sight_gun_port_m(gp, gyaw, gpitch);
+  Vector3 f = sight_dir(gyaw, gpitch);
+  f32 gcy = cosf(gyaw * DEG2RAD), gsy = sinf(gyaw * DEG2RAD);
+  Vector3 r = {-gcy, 0.0f, gsy};
+  Vector3 u = {r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z,
+               r.x * f.y - r.y * f.x};
   h = mix32(g->tick * 33u + e * 17u + (u32)g->owner[pe] * 91u + (u32)g->px[pe]);
   // P99 ejection: outward right, up at ~30-45 deg elevation, slightly
   // rearward (extractor pivots the case around its right rim, fixed ejector
@@ -296,7 +299,7 @@ static void spawn_casing(GameState *g, u32 pe) {
   g->px[e] = (i16)lroundf(port.x * POS_SCALE);
   g->py[e] = (i16)lroundf(port.y * POS_SCALE);
   g->pz[e] = (i16)lroundf(port.z * POS_SCALE);
-  // gun_basis r already points screen-right, so eject right with +r.
+  // r is the gun's screen-right, so eject right with +r.
   // Plus full horizontal shooter velocity (same fixed-point units, so
   // directly addable): the case is flung from a moving gun, and matching the
   // observer's motion keeps the rightward snap reading correctly in view.
@@ -530,38 +533,11 @@ static void lifetime_system(GameState *g) {
   }
 }
 
-// Authoritative presentation smoothing per player, replicated so remotes
-// render the same ADS/bob/lean/reload/sprint flavor. Steps the shared
-// present_* helpers — the exact ones the client uses for local prediction.
-static void present_system(GameState *g) {
-  for (u32 p = 0; p < MAX_PLAYERS; ++p) {
-    u32 e = g->player_entity[p];
-    if (e == NET_PACKET_NONE || !ecs_alive(&g->ecs, e) ||
-        g->kind[e] != KIND_PLAYER)
-      continue;
-    u8 buttons = g->input[p].buttons;
-    bool reloading = g->weapon_reload[e] != 0;
-    present_blend_tick(&g->sv_aim[p],
-                       present_aim_want(buttons, reloading), 12.0f, SIM_DT);
-    present_walk_tick(&g->sv_phase[p], &g->sv_blend[p], g->input[p].move_x,
-                      g->input[p].move_z, SIM_DT);
-    present_lean_tick(&g->sv_leanx[p], &g->sv_velx[p],
-                      (f32)g->input[p].move_x, SIM_DT);
-    present_lean_tick(&g->sv_leanz[p], &g->sv_velz[p],
-                      (f32)g->input[p].move_z, SIM_DT);
-    present_blend_tick(&g->sv_sprint[p],
-                       present_sprint_want(buttons, g->input[p].move_x,
-                                           g->input[p].move_z),
-                       8.0f, SIM_DT);
-  }
-}
-
 static void server_tick(GameState *g) {
   aim_system(g);
   movement_system(g);
   holding_system(g);
   weapon_system(g);
-  present_system(g);
   casing_system(g);
   projectile_system(g);
   lifetime_system(g);
@@ -585,9 +561,8 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
   while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
     u32 e = q.entity;
     u8 weapon = WEAPON_P99, ammo = 0, reloading = 0;
-    u8 aim_q = 0, phase_q = 0, blend_q = 0, reload_q = 0, sprint_q = 0;
+    u8 reload_q = 0;
     u8 scale = 0;
-    i8 lean_x_q = 0, lean_z_q = 0;
     if (g->kind[e] == KIND_CUBE) {
       scale = scale_encode(scale_value(g, e));
     } else if (g->kind[e] == KIND_CASING) {
@@ -598,17 +573,8 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
       weapon = g->weapon_id[e];
       ammo = g->weapon_ammo[e];
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
-      if (g->owner[e] < MAX_PLAYERS) {
-        u8 p = g->owner[e];
-        aim_q = encode_01(g->sv_aim[p]);
-        phase_q = encode_01(g->sv_phase[p] / (2.0f * PI));
-        blend_q = encode_01(g->sv_blend[p]);
-        sprint_q = encode_01(g->sv_sprint[p]);
-        lean_x_q = encode_11(g->sv_leanx[p]);
-        lean_z_q = encode_11(g->sv_leanz[p]);
-        reload_q =
-            encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
-      }
+      reload_q =
+          encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
     }
     snap->entities[snap->count++] =
         (NetEntity){.entity = (u8)e,
@@ -619,14 +585,8 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
                     .weapon = weapon,
                     .ammo = ammo,
                     .reloading = reloading,
-                    .aim_q = aim_q,
-                    .walk_phase_q = phase_q,
-                    .walk_blend_q = blend_q,
                     .reload_q = reload_q,
-                    .sprint_q = sprint_q,
                     .scale = scale,
-                    .lean_x_q = lean_x_q,
-                    .lean_z_q = lean_z_q,
                     .x = g->px[e],
                     .y = g->py[e],
                     .z = g->pz[e],

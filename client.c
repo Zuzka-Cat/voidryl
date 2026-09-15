@@ -189,15 +189,8 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
         weapon_apply_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0,
                               w->reload_q, snap->acknowledged_sequence);
       }
-      // Replicated presentation for the remote renderer (local entity
-      // keeps its predicted floats instead).
-      g->r_aim[e] = w->aim_q;
-      g->r_phase[e] = w->walk_phase_q;
-      g->r_blend[e] = w->walk_blend_q;
+      // Reload progress for the remote reload whip.
       g->r_reload[e] = w->reload_q;
-      g->r_sprint[e] = w->sprint_q;
-      g->r_leanx[e] = w->lean_x_q;
-      g->r_leanz[e] = w->lean_z_q;
     }
     add_kind_components(g, e, w->kind);
   }
@@ -646,53 +639,41 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool hurt = g->flash[e] > PLAYER_FIRE_FLASH_TICKS;
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
-  f32 lag = 1.0f - a;
-  f32 yaw_lag = (f32)lag_decode(g->lag_yaw[e]) * lag;
-  f32 pitch_lag = (f32)lag_decode(g->lag_pitch[e]) * lag;
-  // Replicated presentation, decoded once and posed through the same shared
-  // helpers as the local viewmodel (server smooths, we just apply).
-  const WeaponDef *rdef = weapon_def(g->weapon_id[e]);
-  f32 ab = decode_01(g->r_aim[e]);
-  f32 rph = decode_01(g->r_phase[e]) * 2.0f * PI;
-  f32 rwb = decode_01(g->r_blend[e]);
-  f32 rlx = decode_11(g->r_leanx[e]);
-  f32 rlz = decode_11(g->r_leanz[e]);
-  f32 sb = decode_01(g->r_sprint[e]);
+  // Smooth look with the position alpha so body and gun glide together.
+  f32 yaw_r =
+      present_lerp_angle(g->yaw[e], lag_decode(g->lag_yaw[e]), a);
+  f32 pitch_r =
+      present_lerp_angle(g->pitch[e], lag_decode(g->lag_pitch[e]), a);
   f32 reload_t = g->r_reload[e] == 0
                      ? 0.0f
                      : (f32)(g->r_reload[e] - 1) / 254.0f;
-  f32 lox, loz;
-  present_lean_offsets(rlx, rlz, &lox, &loz);
-  f32 rbox, rboy, rboz, rboroll;
-  present_bob_offsets(rph, rwb, 1.0f - 0.5f * ab, &rbox, &rboy, &rboz,
-                      &rboroll);
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
-  rlRotatef((f32)g->yaw[e], 0.0f, 1.0f, 0.0f);
+  rlRotatef(yaw_r, 0.0f, 1.0f, 0.0f);
   draw_cube_lit((Vector3){0.0f, 0.72f, 0.0f}, (Vector3){0.50f, 1.36f, 0.30f},
                 body);
   draw_cube_lit((Vector3){0.0f, 1.44f, 0.06f}, (Vector3){0.26f, 0.26f, 0.26f},
                 hurt ? PAL_LIGHT : PAL_PURPLE);
+  rlPopMatrix();
+  // Hip carry on the shooter's right, converged onto the sight ray at the
+  // true eye-ray distance: clearly beside the torso, yet the muzzle axis
+  // meets the crosshair — aiming at a head reads as pointing at it at any
+  // range. Closed-form tracking of a smoothed distance, so nothing snaps.
+  Vector3 feet = {pos.x, pos.y, pos.z};
+  Vector3 eye = {pos.x, pos.y + EYE_HEIGHT_M, pos.z};
+  Vector3 f = sight_dir(yaw_r, pitch_r);
+  f32 zero = sight_zero_m(g, e, eye, f);
+  Vector3 gp;
+  f32 gyaw, gpitch;
+  sight_gun_pose_m(feet, yaw_r, pitch_r, zero, &gp, &gyaw, &gpitch);
   rlPushMatrix();
-  // Third-person read of the same pose: gun lifts toward the face and takes
-  // the per-gun cant/trim/tilt with aim and sprint, plus replicated lean
-  // and bob. Reload whips in place via the shared dispatcher (see draw_gun).
-  rlTranslatef(-0.22f - yaw_lag * 0.018f + ab * 0.10f + lox + rbox,
-               1.16f + pitch_lag * 0.009f + fire * 0.05f + ab * 0.10f + rboy,
-               0.30f - fire * 0.02f + loz + rboz);
-  // True recoil climb for remotes plus stronger turn bob with up/down
-  // cross-coupling from yaw motion.
-  rlRotatef((f32)-g->pitch[e] - pitch_lag * 0.80f - yaw_lag * 0.28f -
-                fire * 13.0f + rdef->ads_pitch_deg * ab +
-                rdef->sprint_tilt_deg * sb,
-            1.0f, 0.0f, 0.0f);
-  rlRotatef(-yaw_lag * 0.85f, 0.0f, 1.0f, 0.0f);
-  rlRotatef(-yaw_lag * 0.30f + rdef->ads_cant_deg * ab + rboroll, 0.0f, 0.0f,
-            1.0f);
+  rlTranslatef(gp.x, gp.y, gp.z);
+  rlRotatef(gyaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-gpitch, 1.0f, 0.0f, 0.0f);
+  rlTranslatef(GUN_CENTER_X_M, 0.0f, 0.0f);
   draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
                  reload_t);
-  rlPopMatrix();
   rlPopMatrix();
 }
 

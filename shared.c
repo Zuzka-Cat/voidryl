@@ -167,6 +167,46 @@ static const WeaponDef *weapon_def(u8 id) {
 #define BULLET_ZERO_DISTANCE 12.0f
 #define ARENA_POS (15 * POS_SCALE)
 
+// Perspective-hold tuning. While holding E the cube slides on the ground
+// around the holder: yaw steers it, pitch drives distance/scale (look down
+// brings it close/tiny, looking forward/far pushes it out/giant). Y stays
+// grounded at half height. Scale persists after release. The pitch curve is
+// deliberately gentle so small look adjustments only nudge the cube.
+#define HOLD_BASE_DIST 2.0f
+#define HOLD_PITCH_STEP 0.02f
+#define HOLD_MIN_DIST 1.0f
+#define HOLD_MAX_DIST 4.0f
+#define CUBE_SCALE_MIN 0.12f
+#define CUBE_SCALE_MAX 2.0f
+
+static f32 hold_dist_for_pitch(i16 pitch_deg) {
+  f32 d = HOLD_BASE_DIST + (f32)pitch_deg * HOLD_PITCH_STEP;
+  if (d < HOLD_MIN_DIST)
+    return HOLD_MIN_DIST;
+  if (d > HOLD_MAX_DIST)
+    return HOLD_MAX_DIST;
+  return d;
+}
+
+static u8 scale_encode(f32 s) {
+  if (s < CUBE_SCALE_MIN)
+    s = CUBE_SCALE_MIN;
+  if (s > CUBE_SCALE_MAX)
+    s = CUBE_SCALE_MAX;
+  int q = (int)lroundf(s * 64.0f);
+  if (q < 1)
+    q = 1;
+  if (q > 255)
+    q = 255;
+  return (u8)q;
+}
+
+static f32 scale_decode(u8 q) {
+  if (q == 0)
+    return 1.0f;
+  return (f32)q / 64.0f;
+}
+
 static const Vector3 GUN_MUZZLE_OFFSET = {1.46f, 0.42f, -0.18f};
 
 enum EntityKind {
@@ -185,7 +225,8 @@ enum {
   COMP_PROJECTILE,
   COMP_LIFETIME,
   COMP_RENDERABLE,
-  COMP_NETWORKED
+  COMP_NETWORKED,
+  COMP_SCALE
 } ComponentKind;
 
 typedef struct InputCommand {
@@ -215,6 +256,10 @@ typedef struct NetEntity {
   // ADS/bob/lean/reload/sprint flavor with no second animation codebase.
   u8 aim_q, walk_phase_q, walk_blend_q, reload_q, sprint_q;
   i8 lean_x_q, lean_z_q;
+  // World scale for scaled entities (cubes). Quantized like the other
+  // presentation fields; 0 means 1.0 for backwards-tolerant decode.
+  // Proper protocol field, not padding reuse.
+  u8 scale;
   i16 x, y, z, yaw, pitch;
 } NetEntity;
 
@@ -235,7 +280,7 @@ typedef struct NetSnapshot {
 } NetSnapshot;
 
 #define ECS_MAX_ENTITIES 32u
-#define ECS_MAX_COMPONENTS 8u
+#define ECS_MAX_COMPONENTS 9u
 #define ECS_INVALID_ENTITY UINT32_MAX
 
 typedef struct ECS {
@@ -377,6 +422,10 @@ typedef struct GameState {
   f32 move_sway_x, move_sway_z;
   f32 move_vel_x, move_vel_z;
   f32 sprint_blend;
+  // Per-entity world scale backing COMP_SCALE (cubes only for now,
+  // 1.0 == normal). Authoritative on the server, replicated via
+  // NetEntity.scale, applied by renderer/collision through scale_value().
+  f32 scale[ECS_MAX_ENTITIES];
   // Server-side per-player presentation smoothing (replicated to remotes).
   f32 sv_aim[MAX_PLAYERS], sv_phase[MAX_PLAYERS], sv_blend[MAX_PLAYERS];
   f32 sv_sprint[MAX_PLAYERS];
@@ -952,6 +1001,7 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
   g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
   g->flash[e] = g->held_by[e] = 0;
+  g->scale[e] = 1.0f;
   g->weapon_id[e] = WEAPON_P99;
   g->weapon_ammo[e] = 0;
   g->weapon_cooldown[e] = 0;
@@ -966,7 +1016,9 @@ static void add_kind_components(GameState *g, u32 e, u8 kind) {
   ecs_add(&g->ecs, e, COMP_POSITION);
   ecs_add(&g->ecs, e, COMP_RENDERABLE);
   ecs_add(&g->ecs, e, COMP_NETWORKED);
-  if (kind == KIND_PLAYER) {
+  if (kind == KIND_CUBE) {
+    ecs_add(&g->ecs, e, COMP_SCALE);
+  } else if (kind == KIND_PLAYER) {
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_AIM);
     ecs_add(&g->ecs, e, COMP_PLAYER);
@@ -1034,22 +1086,56 @@ static u32 create_cube(GameState *g, u32 index) {
 }
 
 static void game_init(GameState *g) {
+  // Server-only world init: authoritative cubes live here.
   game_zero(g);
   for (u32 i = 0; i < MAX_CUBES; ++i)
     (void)create_cube(g, i);
 }
 
+// Client world lifecycle (proper place for world resets, not a patch in
+// apply_snapshot). The client world is purely snapshot-driven: it starts
+// empty and is populated only by the server. game_init() is server-only.
+static void client_clear_world(GameState *g) {
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
+    if (ecs_alive(&g->ecs, e))
+      ecs_destroy(&g->ecs, e);
+    g->scale[e] = 1.0f;
+  }
+  memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
+  g->snapshot_seen = 0;
+}
+
+static void client_init(GameState *g) {
+  game_zero(g);
+  client_clear_world(g);
+}
+
 // spatial / gun helpers
+
+static f32 scale_value(const GameState *g, u32 e) {
+  if (e >= ECS_MAX_ENTITIES || !ecs_has(&g->ecs, e, COMP_SCALE))
+    return 1.0f;
+  f32 s = g->scale[e];
+  if (!(s > 0.01f))
+    return 1.0f;
+  if (s < CUBE_SCALE_MIN)
+    return CUBE_SCALE_MIN;
+  if (s > CUBE_SCALE_MAX)
+    return CUBE_SCALE_MAX;
+  return s;
+}
 
 static bool cube_overlap(const GameState *g, i16 x, i16 z, i16 radius) {
   u32 comps[] = {COMP_POSITION, COMP_RENDERABLE};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    if (g->kind[e] == KIND_CUBE && g->held_by[e] == 0 &&
-        abs((int)x - g->px[e]) < POS_SCALE / 2 + radius &&
-        abs((int)z - g->pz[e]) < POS_SCALE / 2 + radius)
-      return true;
+    if (g->kind[e] == KIND_CUBE && g->held_by[e] == 0) {
+      int half = (int)((f32)(POS_SCALE / 2) * scale_value(g, e));
+      if (abs((int)x - g->px[e]) < half + radius &&
+          abs((int)z - g->pz[e]) < half + radius)
+        return true;
+    }
   }
   return false;
 }

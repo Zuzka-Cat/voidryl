@@ -39,6 +39,11 @@ static void renew_client_session(GameState *g) {
   g->next_sequence = g->next_chat_sequence = 0;
   g->last_snapshot_tick = g->last_chat_sequence = 0;
   g->snapshot_silence_ticks = 0;
+  // Proper world reset: a new session invalidates every server entity id,
+  // so drop the whole snapshot-driven world here. The world starts empty
+  // (client_init) and is rebuilt only by snapshots, which is also what
+  // fixes the old ghost-cube duplication at the root.
+  client_clear_world(g);
   g->gun_kick = 0;
   g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   g->gun_rise = g->gun_rise_velocity = 0.0f;
@@ -141,6 +146,8 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
     g->pitch[e] = w->pitch;
     g->flash[e] = w->flags;
     g->held_by[e] = w->extra;
+    if (w->kind == KIND_CUBE)
+      g->scale[e] = scale_decode(w->scale);
     if (w->kind == KIND_PLAYER) {
       if (!had)
         weapon_set_from_snapshot(g, e, w->weapon, w->ammo,
@@ -253,6 +260,15 @@ static void client_send_chat(GameState *g, int fd) {
 
 static void update_input(GameState *g, int fd) {
   g->look_delta_x = g->look_delta_y = 0.0f;
+  g->help = IsKeyDown(KEY_F1) ? 1u : 0u;
+  if (g->help) {
+    g->input[0].move_x = g->input[0].move_z = 0;
+    g->input[0].buttons = 0;
+    (void)GetMouseDelta();
+    while (GetKeyPressed() != 0) {
+    }
+    return;
+  }
   if (!g->chatting && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_T))) {
     g->chatting = 1;
     g->chat_length = 0;
@@ -301,8 +317,6 @@ static void update_input(GameState *g, int fd) {
     g->input[0].buttons |= BTN_JUMP;
   if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
     g->input[0].buttons |= BTN_SPRINT;
-  if (IsKeyPressed(KEY_F1))
-    g->help ^= 1u;
   if (IsKeyPressed(KEY_ESCAPE)) {
     g->mouse_captured ^= 1u;
     if (g->mouse_captured)
@@ -553,10 +567,12 @@ static void draw_world(const GameState *g, f32 a) {
     u32 e = q.entity;
     Vector3 p = entity_pos(g, e, a);
     switch (g->kind[e]) {
-    case KIND_CUBE:
-      draw_cube_lit(p, (Vector3){0.9f, 1.0f, 0.9f},
+    case KIND_CUBE: {
+      f32 s = scale_value(g, e);
+      draw_cube_lit(p, (Vector3){0.9f * s, 1.0f * s, 0.9f * s},
                     g->held_by[e] ? PAL_LIGHT : PAL_MID);
       break;
+    }
     case KIND_PLAYER:
       if (g->owner[e] != g->local_player)
         draw_remote_player(g, e, p, a);
@@ -699,6 +715,14 @@ static void draw_hit_indicator(const GameState *g, u32 e) {
   }
 }
 
+static void draw_help_line(int y, String text, Color color) {
+  int w = small_text_width(text);
+  int x = (LOGICAL_W - w) / 2;
+  if (x < 1)
+    x = 1;
+  draw_small_text(x, y, text, color);
+}
+
 static void draw_hud(GameState *g) {
   u32 e = local_player_entity(g);
   unsigned fps = (unsigned)GetFPS();
@@ -739,18 +763,6 @@ static void draw_hud(GameState *g) {
     draw_number_padded(bx + 1, LOGICAL_H - 8, ammo, width,
                        ammo_color(ammo, mag, reloading));
   }
-  if (g->help) {
-    DrawRectangle(1, 17, 42, 16, PAL_DARK);
-    DrawRectangle(47, 17, 44, 16, PAL_DARK);
-    draw_small_text(2, 19, STR("WASD MOVE"), PAL_LIGHT);
-    draw_small_text(2, 26, STR("MOUSE LOOK"), PAL_LIGHT);
-    draw_small_text(48, 19, STR("SPACE JUMP"), PAL_LIGHT);
-    draw_small_text(48, 26, STR("E HOLD"), PAL_LIGHT);
-    DrawRectangle(1, 35, 42, 7, PAL_DARK);
-    draw_small_text(2, 36, STR("RMB AIM"), PAL_LIGHT);
-    DrawRectangle(47, 35, 44, 7, PAL_DARK);
-    draw_small_text(48, 36, STR("SHIFT RUN"), PAL_LIGHT);
-  }
   if (g->chatting) {
     String chat = game_chat_input(g);
     int w = 8 + small_text_width(chat);
@@ -761,6 +773,20 @@ static void draw_hud(GameState *g) {
     DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
     draw_small_text(2, 2, STR("T:"), PAL_MID);
     draw_small_text(10, 2, chat, PAL_LIGHT);
+  }
+  if (g->help) {
+    DrawRectangle(0, 0, LOGICAL_W, LOGICAL_H, PAL_DARK);
+    DrawRectangleLines(0, 0, LOGICAL_W, LOGICAL_H, PAL_MID);
+    draw_help_line(3, STR("HOLD F1 PAUSED HELP"), PAL_MID);
+    draw_help_line(9, STR("WASD MOVE"), PAL_LIGHT);
+    draw_help_line(15, STR("MOUSE LOOK"), PAL_LIGHT);
+    draw_help_line(21, STR("LMB FIRE"), PAL_LIGHT);
+    draw_help_line(27, STR("RMB AIM"), PAL_LIGHT);
+    draw_help_line(33, STR("SPACE JUMP"), PAL_LIGHT);
+    draw_help_line(39, STR("SHIFT+W SPRINT"), PAL_LIGHT);
+    draw_help_line(45, STR("E HOLD CUBE"), PAL_LIGHT);
+    draw_help_line(51, STR("ENTER/T CHAT"), PAL_LIGHT);
+    draw_help_line(57, STR("ESC MOUSE"), PAL_LIGHT);
   }
 }
 
@@ -956,7 +982,7 @@ static int client_run(String host, u16 port, String name) {
     fprintf(stderr, "host must be an IPv4 address or localhost\n");
     return 1;
   }
-  game_init(&game);
+  client_init(&game);
   renew_client_session(&game);
   game.view_yaw = 180;
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
@@ -979,8 +1005,15 @@ static int client_run(String host, u16 port, String name) {
     if (dt > 0.25)
       dt = 0.25;
     current = now;
-    acc += dt;
     update_input(&game, fd);
+    if (game.help) {
+      f32 frozen_alpha = (f32)game.interpolation_ticks / (f32)SNAPSHOT_INTERVAL;
+      if (frozen_alpha > 1.0f)
+        frozen_alpha = 1.0f;
+      render_frame(&game, view, ui, frozen_alpha);
+      continue;
+    }
+    acc += dt;
     client_receive(&game, fd);
     while (acc >= SIM_DT) {
       if (++game.command_ticks >= COMMAND_INTERVAL) {

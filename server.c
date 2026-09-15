@@ -84,8 +84,8 @@ static void aim_system(GameState *g) {
 }
 
 static u32 held_cube_for(const GameState *g, u8 player) {
-  u32 comps[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED};
-  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  u32 comps[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED, COMP_SCALE};
+  EcsQuery q = ecs_query(&g->ecs, comps, 4);
   while (ecs_next(&q))
     if (g->kind[q.entity] == KIND_CUBE && g->held_by[q.entity] == player + 1u)
       return q.entity;
@@ -98,6 +98,8 @@ static void holding_system(GameState *g) {
   while (ecs_next(&pq)) {
     u32 pe = pq.entity;
     u8 player = g->owner[pe];
+    if (player >= MAX_PLAYERS)
+      continue;
     u32 held = held_cube_for(g, player);
     bool want = (g->input[player].buttons & BTN_GRAB) != 0;
     if (!want && held != ECS_INVALID_ENTITY) {
@@ -106,8 +108,9 @@ static void holding_system(GameState *g) {
     }
     if (want && held == ECS_INVALID_ENTITY) {
       Vector3 dir;
-      u32 cubes[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED};
-      EcsQuery cq = ecs_query(&g->ecs, cubes, 3);
+      u32 cubes[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED,
+                     COMP_SCALE};
+      EcsQuery cq = ecs_query(&g->ecs, cubes, 4);
       f32 best_d = 1000.0f;
       u32 best = ECS_INVALID_ENTITY;
       aim_dir(g->yaw[pe], g->pitch[pe], &dir);
@@ -116,7 +119,7 @@ static void holding_system(GameState *g) {
         if (g->kind[c] != KIND_CUBE || g->held_by[c] != 0)
           continue;
         Vector3 off = {(f32)(g->px[c] - g->px[pe]) / POS_SCALE,
-                       (f32)(g->py[c] - 96) / POS_SCALE,
+                       (f32)(g->py[c] - (g->py[pe] + 96)) / POS_SCALE,
                        (f32)(g->pz[c] - g->pz[pe]) / POS_SCALE};
         f32 d = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
         f32 dot = d > 0.01f
@@ -133,15 +136,45 @@ static void holding_system(GameState *g) {
       }
     }
     if (held != ECS_INVALID_ENTITY) {
+      // Grounded perspective play: the cube slides on the floor around the
+      // holder. Yaw steers it, pitch drives distance/scale (look down ->
+      // close/tiny, look forward/far -> distant/giant). Y is always
+      // grounded at half height so it never floats. Scale persists after
+      // release.
       Vector3 dir;
       aim_dir(g->yaw[pe], g->pitch[pe], &dir);
-      g->px[held] =
-          clamp_i16((int)g->px[pe] + (int)lroundf(dir.x * 2.0f * POS_SCALE),
-                    -ARENA_POS, ARENA_POS);
-      g->py[held] = POS_SCALE + 32;
-      g->pz[held] =
-          clamp_i16((int)g->pz[pe] + (int)lroundf(dir.z * 2.0f * POS_SCALE),
-                    -ARENA_POS, ARENA_POS);
+      (void)dir;
+      f32 dist = hold_dist_for_pitch(g->pitch[pe]);
+      f32 scale = dist / HOLD_BASE_DIST;
+      if (scale < CUBE_SCALE_MIN)
+        scale = CUBE_SCALE_MIN;
+      if (scale > CUBE_SCALE_MAX)
+        scale = CUBE_SCALE_MAX;
+      g->scale[held] = scale;
+      f32 yaw_rad = (f32)g->yaw[pe] * DEG2RAD;
+      f32 hx = sinf(yaw_rad);
+      f32 hz = cosf(yaw_rad);
+      f32 half_h = 32.0f * scale;
+      f32 half_xz = 28.8f * scale;
+      f32 limit_x = (f32)ARENA_POS - half_xz;
+      f32 limit_z = (f32)ARENA_POS - half_xz;
+      if (limit_x < 0.0f)
+        limit_x = 0.0f;
+      if (limit_z < 0.0f)
+        limit_z = 0.0f;
+      f32 tx = (f32)g->px[pe] + hx * dist * (f32)POS_SCALE;
+      f32 tz = (f32)g->pz[pe] + hz * dist * (f32)POS_SCALE;
+      if (tx < -limit_x)
+        tx = -limit_x;
+      if (tx > limit_x)
+        tx = limit_x;
+      if (tz < -limit_z)
+        tz = -limit_z;
+      if (tz > limit_z)
+        tz = limit_z;
+      g->px[held] = (i16)lroundf(tx);
+      g->py[held] = (i16)lroundf(half_h);
+      g->pz[held] = (i16)lroundf(tz);
     }
   }
 }
@@ -352,12 +385,20 @@ static void projectile_system(GameState *g) {
     EcsQuery sq = ecs_query(&g->ecs, solids, 2);
     while (!hit && ecs_next(&sq)) {
       u32 c = sq.entity;
-      if (g->kind[c] == KIND_CUBE && g->held_by[c] == 0 &&
-          abs((int)g->px[e] - g->px[c]) < 42 &&
-          abs((int)g->py[e] - g->py[c]) < 48 &&
-          abs((int)g->pz[e] - g->pz[c]) < 42) {
-        hit = true;
-        leave = true;
+      if (g->kind[c] == KIND_CUBE && g->held_by[c] == 0) {
+        f32 s = scale_value(g, c);
+        int rxz = (int)(42.0f * s);
+        int ry = (int)(48.0f * s);
+        if (rxz < 8)
+          rxz = 8;
+        if (ry < 8)
+          ry = 8;
+        if (abs((int)g->px[e] - g->px[c]) < rxz &&
+            abs((int)g->py[e] - g->py[c]) < ry &&
+            abs((int)g->pz[e] - g->pz[c]) < rxz) {
+          hit = true;
+          leave = true;
+        }
       }
     }
     u32 players[] = {COMP_POSITION, COMP_PLAYER};
@@ -456,8 +497,11 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
     u32 e = q.entity;
     u8 weapon = WEAPON_P99, ammo = 0, reloading = 0;
     u8 aim_q = 0, phase_q = 0, blend_q = 0, reload_q = 0, sprint_q = 0;
+    u8 scale = 0;
     i8 lean_x_q = 0, lean_z_q = 0;
-    if (g->kind[e] == KIND_PLAYER) {
+    if (g->kind[e] == KIND_CUBE) {
+      scale = scale_encode(scale_value(g, e));
+    } else if (g->kind[e] == KIND_PLAYER) {
       weapon = g->weapon_id[e];
       ammo = g->weapon_ammo[e];
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
@@ -487,6 +531,7 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
                     .walk_blend_q = blend_q,
                     .reload_q = reload_q,
                     .sprint_q = sprint_q,
+                    .scale = scale,
                     .lean_x_q = lean_x_q,
                     .lean_z_q = lean_z_q,
                     .x = g->px[e],

@@ -36,10 +36,10 @@ The final client argument is the player's name and must contain exactly four let
 - `Shift` + `W`: sprint (faster, gun tilts up, ADS blocked while held)
 - left mouse: fire
 - right mouse: aim down sights (zoom, slower move/look, tighter spread)
-- `E`: hold the cube in the center view; release to drop it
+- `E`: hold the cube under the crosshair; it slides on the ground where you look (yaw steers, pitch drives distance/scale: look down = close/tiny, look forward/far = distant/giant); release to drop it (scale persists)
 - `Enter` or `T`: open chat; `Enter` sends and `Esc` cancels
 - `Esc`: release/capture the mouse when chat is closed
-- `F1`: show/hide the small help overlay
+- `F1` (hold): fullscreen help overlay, pauses the game while held
 
 ## Rendering and palette
 
@@ -64,8 +64,9 @@ The low-resolution target is point-filtered and MSAA is not enabled. A palette-s
 - `COMP_LIFETIME`: bullet, casing, and impact-mark expiry
 - `COMP_RENDERABLE`: render query membership
 - `COMP_NETWORKED`: snapshot query membership
+- `COMP_SCALE`: world-scale membership (cubes); backing `scale[]` in `GameState`
 
-The input, aim, movement, holding, weapon, projectile, lifetime, render, and network paths use ECS queries. Entity creation, reuse, component add/remove, queries, and safe destruction all go through `ecs_create`, `ecs_add`, `ecs_remove`, `ecs_has`/the ECS query masks, `ecs_query`, `ecs_next`, and `ecs_destroy`. Eight deterministic cubes are ECS entities and are networked just like players, bullets, and shell casings; the server moves a held cube in front of its player and replicates that position. Casings are spawned and simulated authoritatively with ejection velocity, gravity, floor bounce, yaw, pitch, and quantized roll, so every client sees the same falling brass.
+The input, aim, movement, holding, weapon, projectile, lifetime, render, and network paths use ECS queries. Entity creation, reuse, component add/remove, queries, and safe destruction all go through `ecs_create`, `ecs_add`, `ecs_remove`, `ecs_has`/the ECS query masks, `ecs_query`, `ecs_next`, and `ecs_destroy`. Eight deterministic cubes are server-authoritative ECS entities with `COMP_SCALE` and are networked just like players, bullets, and shell casings; while held with `E` the server slides a cube on the floor around the holder (yaw steers, pitch-driven distance `dist = 2.0 + pitch * 0.02`, clamped 1.0–4.0m) and sets `scale = dist / 2.0`, so looking down shrinks it and looking far grows it, always grounded at half height. Player collision and bullets use the scaled extents, and the scale persists after release. The client world is purely snapshot-driven (`client_init` starts empty, `renew_client_session` clears via `client_clear_world`); `game_init` is server-only, which removes the old ghost-cube duplication at the root. Casings are spawned and simulated authoritatively with ejection velocity, gravity, floor bounce, yaw, pitch, and quantized roll, so every client sees the same falling brass.
 
 ## State budget
 
@@ -77,4 +78,4 @@ _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
 
 The build-time assertion keeps the complete mutable game state within 4 KiB. This includes the ECS arrays, interpolation state, fixed player names and notification text, input/peer records, and two fixed packet buffers.
 
-`NetInputPacket` is 24 bytes, `NetChatPacket` is 36 bytes, `NetEntity` is 26 bytes (including quantized ADS/bob/lean/reload/sprint presentation per player), and a full fixed `NetSnapshot` is 884 bytes. There is no `malloc`, `calloc`, `realloc`, `free`, `strdup`, VLA, runtime-loaded asset, or application-owned growable container. Raylib's render targets are GPU/render handles and are outside the requested CPU gameplay-state budget.
+`NetInputPacket` is 24 bytes, `NetChatPacket` is 36 bytes, `NetEntity` is 26 bytes (including quantized ADS/bob/lean/reload/sprint presentation per player plus the explicit `scale` field for scaled cubes), and a full fixed `NetSnapshot` is 884 bytes. There is no `malloc`, `calloc`, `realloc`, `free`, `strdup`, VLA, runtime-loaded asset, or application-owned growable container. Raylib's render targets are GPU/render handles and are outside the requested CPU gameplay-state budget.

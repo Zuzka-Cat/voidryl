@@ -1,8 +1,8 @@
 #ifndef CLIENT_C
 #define CLIENT_C
 
-#include "rlgl.h"
 #include "shared.c"
+#include "rlgl.h"
 
 #define PAL_DARK ((Color){16, 8, 24, 255})
 #define PAL_PURPLE ((Color){60, 30, 102, 255})
@@ -28,6 +28,19 @@
 #define STAT_UPDATE_DT 0.1
 
 static u32 local_player_entity(const GameState *g);
+
+typedef struct RemoteGun {
+  f32 walk_phase, walk_blend, aim_blend, sprint_blend;
+  Vector2 move_sway, move_vel, gun_sway;
+  u8 loco;
+} RemoteGun;
+
+static RemoteGun remote_gun[ECS_MAX_ENTITIES];
+
+static void remote_gun_reset(u32 e) {
+  if (e < ECS_MAX_ENTITIES)
+    remote_gun[e] = (RemoteGun){0};
+}
 
 static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -74,6 +87,8 @@ static void renew_client_session(GameState *g) {
   memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
   g->ping.rtt_ms = 0.0;
   g->ping.have = 0;
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
+    remote_gun_reset(e);
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
@@ -92,6 +107,7 @@ static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
   for (u32 c = 0; c < ECS_MAX_COMPONENTS; ++c)
     ecs_remove(&g->ecs, e, c);
   clear_entity_data(g, e);
+  remote_gun_reset(e);
   return e;
 }
 
@@ -136,7 +152,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
       continue;
     if (w->owner >= MAX_PLAYERS)
       continue;
-    g->snapshot_seen |= UINT32_C(1) << w->entity;
+    g->snapshot_seen |= UINT64_C(1) << w->entity;
     u8 mapped = g->network_entity[w->entity];
     bool had = mapped != NET_PACKET_NONE && ecs_alive(&g->ecs, mapped) &&
                g->kind[mapped] == w->kind;
@@ -179,6 +195,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
                               w->reload_q, snap->acknowledged_sequence);
       }
       g->r_reload[e] = w->reload_q;
+      remote_gun[e].loco = w->scale;
     }
     add_kind_components(g, e, w->kind);
   }
@@ -186,7 +203,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   for (u32 s = 0; s < ECS_MAX_ENTITIES; ++s) {
     u8 local = g->network_entity[s];
     if (local != NET_PACKET_NONE &&
-        (g->snapshot_seen & (UINT32_C(1) << s)) == 0) {
+        (g->snapshot_seen & (UINT64_C(1) << s)) == 0) {
       if (ecs_alive(&g->ecs, local))
         ecs_destroy(&g->ecs, local);
       g->network_entity[s] = NET_PACKET_NONE;
@@ -492,20 +509,8 @@ static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
   Vector3 grs = {0.10f, 0.28f, 0.13f};
   DrawCubeV(gr, grs, PAL_PURPLE);
   draw_box_wires(gr, grs, PAL_DARK);
-  Vector3 gb = {-0.32f, -0.125f, 0.30f - frame_off};
-  DrawCubeV(gb, (Vector3){0.02f, 0.015f, 0.22f}, PAL_DARK);
-  Vector3 gf = {-0.32f, -0.095f, 0.40f - frame_off};
-  DrawCubeV(gf, (Vector3){0.02f, 0.06f, 0.02f}, PAL_DARK);
-  Vector3 grr = {-0.32f, -0.095f, 0.20f - frame_off};
-  DrawCubeV(grr, (Vector3){0.02f, 0.06f, 0.02f}, PAL_DARK);
-  DrawCubeV((Vector3){-0.32f, -0.085f, 0.28f - frame_off},
-            (Vector3){0.018f, 0.05f, 0.018f}, PAL_DARK);
   DrawCubeV((Vector3){-0.385f, 0.045f, 0.18f - slide_off},
             (Vector3){0.012f, 0.025f, 0.14f}, PAL_DARK);
-  DrawCubeV((Vector3){-0.32f, 0.02f, 0.10f - slide_off},
-            (Vector3){0.145f, 0.06f, 0.015f}, PAL_DARK);
-  DrawCubeV((Vector3){-0.32f, 0.02f, 0.135f - slide_off},
-            (Vector3){0.145f, 0.06f, 0.015f}, PAL_DARK);
   f32 sz = -slide_off;
   Vector3 rss = {0.022f, 0.028f, 0.04f};
   Vector3 rl = {-0.375f, 0.080f, 0.09f + sz};
@@ -575,10 +580,36 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
                 hurt ? PAL_LIGHT : PAL_PURPLE);
   rlPopMatrix();
   GunPose gp = player_gun_pose(g, e, pos, yaw_r, pitch_r, a);
+  const WeaponDef *wdef = weapon_def(g->weapon_id[e]);
+  RemoteGun *rp = &remote_gun[e];
+  f32 b = clamp_float(rp->aim_blend, 0.0f, 1.0f);
+  f32 sway_scale = 1.0f - b * 0.75f;
+  Vector3 fwd, right, up;
+  look_basis(gp.yaw, gp.pitch, &fwd, &right, &up);
+  PresentBob bob =
+      present_bob_offsets(rp->walk_phase, rp->walk_blend, 1.0f - 0.5f * b);
+  Vector2 lean = present_lean_offsets(rp->move_sway);
+  f32 swing_yaw = rp->move_vel.x * 1.2f * sway_scale;
+  f32 swing_pitch = -rp->move_vel.y * 0.5f * sway_scale;
+  f32 swing_roll = -rp->move_vel.x * 0.6f * sway_scale;
+  Vector3 origin = gp.origin;
+  origin = vec3_add(origin, vec3_mul(right, rp->gun_sway.x * 1.02f * sway_scale +
+                                                lean.x + bob.pos.x));
+  origin = vec3_add(origin, vec3_mul(up, rp->gun_sway.y * 1.28f * sway_scale +
+                                             bob.pos.y));
+  origin = vec3_add(origin, vec3_mul(fwd, lean.y + bob.pos.z));
+  f32 extra_yaw = rp->gun_sway.x * -52.0f * sway_scale + swing_yaw;
+  f32 extra_pitch = (rp->gun_sway.y * -46.0f + rp->gun_sway.x * -11.0f) *
+                        sway_scale +
+                    swing_pitch + wdef->ads_pitch_deg * b +
+                    wdef->sprint_tilt_deg * rp->sprint_blend;
+  f32 extra_roll = rp->gun_sway.x * -29.0f * sway_scale + wdef->ads_cant_deg * b +
+                   bob.roll + swing_roll;
   rlPushMatrix();
-  rlTranslatef(gp.origin.x, gp.origin.y, gp.origin.z);
-  rlRotatef(gp.yaw, 0.0f, 1.0f, 0.0f);
-  rlRotatef(-gp.pitch, 1.0f, 0.0f, 0.0f);
+  rlTranslatef(origin.x, origin.y, origin.z);
+  rlRotatef(gp.yaw + extra_yaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-gp.pitch + extra_pitch, 1.0f, 0.0f, 0.0f);
+  rlRotatef(extra_roll, 0.0f, 0.0f, 1.0f);
   rlTranslatef(GUN_CENTER_X_M, 0.0f, 0.0f);
   draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
                  reload_t);
@@ -635,7 +666,8 @@ static void mark_basis(Vector3 n, Vector3 *u, Vector3 *v) {
   }
 }
 
-static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size) {
+static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size,
+                           Color fill) {
   f32 h = size * 0.5f;
   Vector3 a = {c.x + (u.x + v.x) * h, c.y + (u.y + v.y) * h,
                c.z + (u.z + v.z) * h};
@@ -645,10 +677,10 @@ static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size) {
                 c.z - (u.z + v.z) * h};
   Vector3 d = {c.x - (u.x - v.x) * h, c.y - (u.y - v.y) * h,
                c.z - (u.z - v.z) * h};
-  DrawTriangle3D(a, b, cc, PAL_DARK);
-  DrawTriangle3D(a, cc, d, PAL_DARK);
-  DrawTriangle3D(a, cc, b, PAL_DARK);
-  DrawTriangle3D(a, d, cc, PAL_DARK);
+  DrawTriangle3D(a, b, cc, fill);
+  DrawTriangle3D(a, cc, d, fill);
+  DrawTriangle3D(a, cc, b, fill);
+  DrawTriangle3D(a, d, cc, fill);
 }
 
 static void reflect_basis(Vector3 r, Vector3 *u, Vector3 *v) {
@@ -656,6 +688,18 @@ static void reflect_basis(Vector3 r, Vector3 *u, Vector3 *v) {
                                   : (Vector3){1.0f, 0.0f, 0.0f};
   *u = vec3_norm(vec3_cross(r, ref));
   *v = vec3_cross(r, *u);
+}
+
+static Color color_lerp(Color a, Color b, f32 t) {
+  t = clamp_float(t, 0.0f, 1.0f);
+  return (Color){(u8)clamp_int((int)lroundf((f32)a.r + ((f32)b.r - (f32)a.r) * t),
+                               0, 255),
+                 (u8)clamp_int((int)lroundf((f32)a.g + ((f32)b.g - (f32)a.g) * t),
+                               0, 255),
+                 (u8)clamp_int((int)lroundf((f32)a.b + ((f32)b.b - (f32)a.b) * t),
+                               0, 255),
+                 (u8)clamp_int((int)lroundf((f32)a.a + ((f32)b.a - (f32)a.a) * t),
+                               0, 255)};
 }
 
 static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
@@ -673,18 +717,29 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
   f32 ca = cosf(ang), sa = sinf(ang);
   Vector3 ru = {u.x * ca + v.x * sa, u.y * ca + v.y * sa, u.z * ca + v.z * sa};
   Vector3 rv = {v.x * ca - u.x * sa, v.y * ca - u.y * sa, v.z * ca - u.z * sa};
-  draw_mark_quad(c, ru, rv, MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str);
+  f32 life = decode_unorm8(g->flash[e]);
+  f32 fade_t = 1.0f - life;
+  fade_t = fade_t * fade_t * (3.0f - 2.0f * fade_t);
+  Color hole = color_lerp(PAL_DARK, mat, fade_t);
+  f32 size = (MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str) *
+             (1.0f - 0.28f * fade_t);
+  draw_mark_quad(c, ru, rv, size, hole);
+  if (fade_t < 0.55f) {
+    Color core = color_lerp(PAL_DARK, hole, 0.35f);
+    draw_mark_quad(c, ru, rv, size * (0.55f - 0.25f * fade_t), core);
+  }
   Vector3 d;
   aim_dir(g->aim[e].yaw, g->aim[e].pitch, &d);
   float dn = vec3_dot(d, n);
   Vector3 r = vec3_sub(d, vec3_mul(n, 2.0f * dn));
   Vector3 cu, cv;
   reflect_basis(r, &cu, &cv);
-  int age = (IMPACT_MARK_LIFETIME_TICKS - (int)g->lifetime[e]) * 2;
-  int life = MARK_SPATTER_LIFE + MARK_SPATTER_LIFE_STEP * (int)str;
-  if (age >= 0 && age < life) {
+  int age = (int)lroundf((1.0f - life) * (f32)IMPACT_MARK_LIFETIME_TICKS *
+                         (f32)IMPACT_MARK_AGE_PERIOD);
+  int sp_life = MARK_SPATTER_LIFE + MARK_SPATTER_LIFE_STEP * (int)str;
+  if (age >= 0 && age < sp_life) {
     f32 t = (f32)age * SIM_DT;
-    f32 fade = 1.0f - (f32)age / (f32)life;
+    f32 fade = 1.0f - (f32)age / (f32)sp_life;
     int count = MARK_SPATTER_BASE + (int)str;
     for (int i = 0; i < count; ++i) {
       u32 hh = mix32(seed + (u32)i * 2246822519u);
@@ -696,7 +751,7 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
       Vector3 dp = {c.x + dir.x * sp * t, c.y + dir.y * sp * t - 4.9f * t * t,
                     c.z + dir.z * sp * t};
       f32 s = (0.030f + 0.010f * (f32)((hh >> 21) & 3u)) * fade + 0.008f;
-      DrawCubeV(dp, (Vector3){s, s, s}, mat);
+      DrawCubeV(dp, (Vector3){s, s, s}, color_lerp(mat, hole, 1.0f - fade));
     }
   }
 }
@@ -1001,6 +1056,44 @@ static void update_viewmodel(GameState *g, f32 dt) {
     g->gun_rise = g->gun_rise_velocity = 0.0f;
 }
 
+static void update_remote_viewmodels(GameState *g, f32 dt) {
+  if (dt > 0.05f)
+    dt = 0.05f;
+  f32 snap_t = (f32)SNAPSHOT_INTERVAL * SIM_DT;
+  if (snap_t < 1e-4f)
+    snap_t = 0.05f;
+  u32 comps[] = {COMP_PLAYER, COMP_POSITION};
+  EcsQuery q = ecs_query(&g->ecs, comps, 2);
+  while (ecs_next(&q)) {
+    u32 e = q.entity;
+    if (g->owner[e] == g->local_player)
+      continue;
+    RemoteGun *rp = &remote_gun[e];
+    i8 mx, mz;
+    bool aiming, sprinting;
+    unpack_player_locomotion(rp->loco, &mx, &mz, &aiming, &sprinting);
+    bool reloading = weapon_is_reloading(g, e);
+    present_blend_tick(&rp->aim_blend,
+                       present_aim_want(aiming ? BTN_AIM : 0u, reloading),
+                       12.0f, dt);
+    present_walk_tick(&rp->walk_phase, &rp->walk_blend, mx, mz, dt);
+    present_lean_tick(&rp->move_sway.x, &rp->move_vel.x, (f32)mx, dt);
+    present_lean_tick(&rp->move_sway.y, &rp->move_vel.y, (f32)mz, dt);
+    present_blend_tick(&rp->sprint_blend, sprinting, 8.0f, dt);
+    f32 k = dt / snap_t;
+    f32 look_x = -(f32)lag_decode(g->lag[e].yaw) * k;
+    f32 look_y = -(f32)lag_decode(g->lag[e].pitch) * k;
+    f32 steady = 1.0f - rp->aim_blend * 0.55f;
+    f32 tx = look_x * 0.048f * steady;
+    f32 ty = -look_y * 0.045f * steady;
+    tx = clamp_float(tx, -0.50f, 0.50f);
+    ty = clamp_float(ty, -0.45f, 0.45f);
+    f32 sk = 1.0f - expf(-5.2f * dt);
+    rp->gun_sway.x += (tx - rp->gun_sway.x) * sk;
+    rp->gun_sway.y += (ty - rp->gun_sway.y) * sk;
+  }
+}
+
 static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
                          f32 a) {
   Camera3D cam = make_camera(g, a);
@@ -1176,6 +1269,7 @@ static int client_run(String host, u16 port, String name) {
     }
     client_receive(&game, fd);
     update_viewmodel(&game, (f32)dt);
+    update_remote_viewmodels(&game, (f32)dt);
     f32 alpha = ((f32)game.interpolation_ticks + (f32)(acc / SIM_DT)) /
                 (f32)SNAPSHOT_INTERVAL;
     if (alpha > 1.0f)

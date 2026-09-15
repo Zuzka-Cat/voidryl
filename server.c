@@ -295,7 +295,7 @@ static void make_impact_mark(GameState *g, u32 e, i16 x, i16 y, i16 z,
   g->held_by[e] = extra;
   g->kind[e] = KIND_IMPACT_MARK;
   g->lifetime[e] = IMPACT_MARK_LIFETIME_TICKS;
-  g->flash[e] = 3;
+  g->flash[e] = 255;
   g->vel[e] = (IVec3){0, 0, 0};
   ecs_remove(&g->ecs, e, COMP_PROJECTILE);
   ecs_remove(&g->ecs, e, COMP_VELOCITY);
@@ -401,11 +401,16 @@ static void lifetime_system(GameState *g) {
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    bool age = g->kind[e] != KIND_IMPACT_MARK || g->tick % 2u == 0;
+    bool age =
+        g->kind[e] != KIND_IMPACT_MARK || g->tick % IMPACT_MARK_AGE_PERIOD == 0;
     if (age && g->lifetime[e] > 0)
       --g->lifetime[e];
-    if (g->kind[e] == KIND_IMPACT_MARK)
-      g->flash[e] = (u8)(g->lifetime[e] > 84 ? 3 : g->lifetime[e] > 42 ? 2 : 1);
+    if (g->kind[e] == KIND_IMPACT_MARK) {
+      g->flash[e] = encode_unorm8((f32)g->lifetime[e] /
+                                 (f32)IMPACT_MARK_LIFETIME_TICKS);
+      if (g->flash[e] == 0 && g->lifetime[e] > 0)
+        g->flash[e] = 1;
+    }
     if (g->lifetime[e] == 0)
       ecs_destroy(&g->ecs, e);
   }
@@ -450,6 +455,8 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
       ammo = g->weapon_ammo[e];
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
       reload_q = encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
+      if (g->owner[e] < MAX_PLAYERS)
+        scale = pack_player_locomotion(&g->input[g->owner[e]]);
     }
     snap->entities[snap->count++] = (NetEntity){.entity = (u8)e,
                                                 .kind = g->kind[e],

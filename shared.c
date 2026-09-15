@@ -63,9 +63,9 @@ typedef struct {
 #define MAX_CUBES 8
 #define MAX_BULLETS 8
 #define MAX_CASINGS 8
-#define MAX_IMPACT_MARKS 8
+#define MAX_IMPACT_MARKS 24
 
-#define NET_ENTITY_LIMIT 32
+#define NET_ENTITY_LIMIT 64
 #define NET_MAGIC 0xB7u
 enum NetPacketKind {
   NET_PACKET_INPUT = 1,
@@ -183,7 +183,8 @@ static const ShellDef *shell_def(u8 id) {
 #define PLAYER_HIT_FLASH_TICKS 24
 #define BULLET_LIFETIME_TICKS 128
 #define CASING_LIFETIME_TICKS 128
-#define IMPACT_MARK_LIFETIME_TICKS 128
+#define IMPACT_MARK_LIFETIME_TICKS 250
+#define IMPACT_MARK_AGE_PERIOD 8
 
 #define ARENA 32
 #define BULLET_SPEED 64.0f
@@ -400,13 +401,13 @@ static i32 net_snapshot_wire_size(u8 count) {
                NET_SNAPSHOT_NAMES_SIZE);
 }
 
-#define ECS_MAX_ENTITIES 32u
+#define ECS_MAX_ENTITIES 64u
 #define ECS_MAX_COMPONENTS 10u
 #define ECS_INVALID_ENTITY UINT32_MAX
 
 typedef struct ECS {
   uint64_t mask[ECS_MAX_COMPONENTS];
-  uint32_t dead;
+  uint64_t dead;
   uint8_t count;
 } ECS;
 
@@ -418,16 +419,16 @@ typedef struct EcsQuery {
 } EcsQuery;
 
 static bool ecs_alive(const ECS *e, uint32_t ent) {
-  return ent < e->count && !(e->dead & (UINT32_C(1) << ent));
+  return ent < e->count && !(e->dead & (UINT64_C(1) << ent));
 }
 
 static uint32_t ecs_create(ECS *e) {
-  uint32_t live_range =
-      e->count == 32u ? UINT32_MAX : (UINT32_C(1) << e->count) - 1u;
-  uint32_t free_bits = e->dead & live_range;
+  uint64_t live_range =
+      e->count >= 64u ? UINT64_MAX : (UINT64_C(1) << e->count) - 1u;
+  uint64_t free_bits = e->dead & live_range;
   if (free_bits) {
-    uint32_t ent = (uint32_t)__builtin_ctz(free_bits);
-    e->dead &= ~(UINT32_C(1) << ent);
+    uint32_t ent = (uint32_t)__builtin_ctzll(free_bits);
+    e->dead &= ~(UINT64_C(1) << ent);
     return ent;
   }
   if (e->count >= ECS_MAX_ENTITIES)
@@ -456,9 +457,9 @@ static void ecs_destroy(ECS *e, uint32_t ent) {
     return;
   for (uint32_t c = 0; c < ECS_MAX_COMPONENTS; ++c)
     e->mask[c] &= ~(UINT64_C(1) << ent);
-  e->dead |= UINT32_C(1) << ent;
-  while (e->count && (e->dead & (UINT32_C(1) << (e->count - 1u)))) {
-    e->dead &= ~(UINT32_C(1) << (e->count - 1u));
+  e->dead |= UINT64_C(1) << ent;
+  while (e->count && (e->dead & (UINT64_C(1) << (e->count - 1u)))) {
+    e->dead &= ~(UINT64_C(1) << (e->count - 1u));
     --e->count;
   }
 }
@@ -530,7 +531,8 @@ typedef struct GameState {
   Peer peers[MAX_PLAYERS];
   u8 player_entity[MAX_PLAYERS];
   u8 network_entity[ECS_MAX_ENTITIES];
-  u32 snapshot_seen, session;
+  uint64_t snapshot_seen;
+  u32 session;
   u16 tick, next_sequence, next_chat_sequence;
   u16 last_snapshot_tick, last_chat_sequence, notice_ticks;
   u16 snapshot_silence_ticks;
@@ -554,8 +556,8 @@ typedef struct GameState {
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
-_Static_assert(ECS_MAX_ENTITIES <= 32u,
-               "current ecs can only handle 32 entities");
+_Static_assert(ECS_MAX_ENTITIES <= 64u,
+               "current ecs can only handle 64 entities");
 _Static_assert(MAX_PLAYERS <= 8, "visible_players is an 8-bit mask");
 
 static i32 cstr_len(const char *s) {
@@ -797,6 +799,25 @@ static PresentBob present_bob_offsets(f32 phase, f32 blend, f32 ads_damp) {
 
 static Vector2 present_lean_offsets(Vector2 sway) {
   return (Vector2){-sway.x * 0.045f, sway.y * 0.05f};
+}
+
+static u8 pack_player_locomotion(const InputCommand *in) {
+  u8 mx = (u8)clamp_int((int)in->move_x + 1, 0, 2);
+  u8 mz = (u8)clamp_int((int)in->move_z + 1, 0, 2);
+  u8 aim = (in->buttons & BTN_AIM) ? 1u : 0u;
+  u8 sprint =
+      present_sprint_want(in->buttons, in->move_x, in->move_z) ? 1u : 0u;
+  return (u8)(mx | (mz << 2) | (aim << 4) | (sprint << 5));
+}
+
+static void unpack_player_locomotion(u8 packed, i8 *mx, i8 *mz, bool *aiming,
+                                     bool *sprinting) {
+  int x = (int)(packed & 3u) - 1;
+  int z = (int)((packed >> 2) & 3u) - 1;
+  *mx = (i8)clamp_int(x, -1, 1);
+  *mz = (i8)clamp_int(z, -1, 1);
+  *aiming = (packed & (1u << 4)) != 0;
+  *sprinting = (packed & (1u << 5)) != 0;
 }
 
 static u8 encode_reload_q(bool reloading, f32 t) {
@@ -1367,21 +1388,11 @@ typedef struct {
 
 static GunPose gun_pose_at(Vector3 feet, f32 look_yaw, f32 look_pitch,
                            f32 zero_m) {
+  (void)zero_m;
   GunPose p;
   p.origin = hip_origin_m(feet, look_yaw);
-  Vector3 target =
-      vec3_add(player_eye_m(feet),
-               vec3_mul(sight_dir(look_yaw, look_pitch), fmaxf(zero_m, 0.35f)));
-  Vector3 d = vec3_sub(target, p.origin);
-  f32 len = vec3_len(d);
-  if (len < 1e-5f) {
-    p.yaw = look_yaw;
-    p.pitch = look_pitch;
-  } else {
-    d = vec3_mul(d, 1.0f / len);
-    p.yaw = atan2f(d.x, d.z) * RAD2DEG;
-    p.pitch = asinf(clamp_float(d.y, -1.0f, 1.0f)) * RAD2DEG;
-  }
+  p.yaw = look_yaw;
+  p.pitch = look_pitch;
   look_basis(p.yaw, p.pitch, &p.fwd, &p.right, &p.up);
   return p;
 }
@@ -1590,9 +1601,10 @@ static f32 sight_zero_m(const GameState *g, u32 skip, Vector3 eye, Vector3 f,
 
 static GunPose player_gun_pose(const GameState *g, u32 e, Vector3 feet, f32 yaw,
                                f32 pitch, f32 a) {
-  Vector3 eye = player_eye_m(feet);
-  Vector3 look = sight_dir(yaw, pitch);
-  return gun_pose_at(feet, yaw, pitch, sight_zero_m(g, e, eye, look, a));
+  (void)g;
+  (void)e;
+  (void)a;
+  return gun_pose_at(feet, yaw, pitch, 0.0f);
 }
 
 #endif

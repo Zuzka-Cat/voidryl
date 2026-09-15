@@ -104,14 +104,11 @@ typedef struct WeaponDef {
   f32 aim_fov;
   f32 aim_sens_scale;
   f32 aim_move_scale;
-  // Viewmodel ADS pose: hip base + ADS base (sight-near, intentionally
-  // slightly off-center) + ADS cant in degrees, per gun, so each future
-  // weapon ships its own zoom view with no per-weapon branching in the
-  // renderer.
+  // Viewmodel hip base + ADS cant in degrees, per gun. Full-zoom ADS
+  // translation is solved per weapon from its sight tip (see gun_ads_target
+  // in client.c), not stored, so sight alignment can't drift from the data.
   f32 hip_off_x;
   f32 hip_off_y;
-  f32 ads_off_x;
-  f32 ads_off_y;
   f32 ads_cant_deg;
   // Static ADS pitch trim in degrees, blended in with aim. Positive tips
   // the muzzle down, negative raises it. Purely cosmetic (bullets follow
@@ -133,10 +130,14 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .reload_ticks = 120,
             .slide_tap = 0.09f,
             .slide_hold = 0.126f,
-            .recoil_vel_tap = 0.9f,
-            .recoil_vel_hold = 1.71f,
-            .rise_vel_tap = 0.945f,
-            .rise_vel_hold = 1.89f,
+            // Viewmodel impulses (velocity kicks into the client springs in
+            // update_viewmodel): sharp straight-back punch + lagging muzzle
+            // flip. Peaks ride the spring clamps; the spring rates shape the
+            // punch/recover timing, so tune feel there, magnitude here.
+            .recoil_vel_tap = 1.05f,
+            .recoil_vel_hold = 1.9f,
+            .rise_vel_tap = 1.0f,
+            .rise_vel_hold = 2.0f,
             .spread_hip_deg = 2.6f,
             .spread_aim_deg = 0.45f,
             .hip_fov = 72.0f,
@@ -145,8 +146,6 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .aim_move_scale = 0.5f,
             .hip_off_x = 0.06f,
             .hip_off_y = -0.18f,
-            .ads_off_x = 0.398f,
-            .ads_off_y = -0.128f,
             .ads_cant_deg = -12.0f,
             .ads_pitch_deg = -3.0f,
             .sprint_tilt_deg = -32.0f,
@@ -156,6 +155,53 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
 static const WeaponDef *weapon_def(u8 id) {
   return &WEAPON_DEFS[id < WEAPON_COUNT ? id : WEAPON_P99];
 }
+
+// Shell catalog: one entry per WeaponId, parallel to WEAPON_DEFS.
+// To add different shells per gun, add one more line here, e.g.
+//   [WEAPON_P90] = { .len = 0.06f, ... },
+// The server spawns (spawn_casing) and the client renders (draw_casing)
+// both read through shell_def(), so no per-shell branching is needed
+// elsewhere. Units are meters and m/s; port offsets are in gun_basis
+// space (forward, side with +right along gun_basis r, up).
+// body_pal/rim_pal select the palette for the brass: 0 dark, 1 purple,
+// 2 mid, 3 light. The dark outline is always drawn for readability.
+typedef struct ShellDef {
+  f32 len;
+  f32 radius;
+  f32 rim_radius;
+  f32 port_fwd;
+  f32 port_side;
+  f32 port_up;
+  f32 eject_right;
+  f32 eject_up;
+  f32 eject_back;
+  f32 jitter;
+  u8 body_pal;
+  u8 rim_pal;
+} ShellDef;
+
+static const ShellDef SHELL_DEFS[WEAPON_COUNT] = {
+    [WEAPON_P99] =
+        {
+            .len = 0.07f,
+            .radius = 0.014f,
+            .rim_radius = 0.017f,
+            .port_fwd = 0.55f,
+            .port_side = 0.14f,
+            .port_up = -0.06f,
+            .eject_right = 2.4f,
+            .eject_up = 1.9f,
+            .eject_back = 0.55f,
+            .jitter = 0.35f,
+            .body_pal = 3,
+            .rim_pal = 2,
+        },
+};
+
+static const ShellDef *shell_def(u8 id) {
+  return &SHELL_DEFS[id < WEAPON_COUNT ? id : WEAPON_P99];
+}
+
 #define PLAYER_FIRE_FLASH_TICKS 6
 #define PLAYER_HIT_FLASH_TICKS 24
 #define BULLET_LIFETIME_TICKS 128
@@ -398,6 +444,15 @@ typedef struct GameState {
   u8 weapon_cooldown[ECS_MAX_ENTITIES];
   u8 weapon_prev[ECS_MAX_ENTITIES];
   u16 weapon_reload[ECS_MAX_ENTITIES];
+  // Client-side prediction metadata for stale-snapshot guards (never
+  // simulated, never snapshotted). weapon_dirty_seq[e] is the input sequence
+  // that caused the last local weapon change on e; compared against the
+  // snapshot's acknowledged_sequence to prove the server had seen our change
+  // before we let it regress predicted state. Zero means synced (see
+  // predicted_is_stale). last_snapshot_ack is the ack from the last applied
+  // snapshot, for debugging/future predicted fields.
+  u16 weapon_dirty_seq[ECS_MAX_ENTITIES];
+  u16 last_snapshot_ack;
   InputCommand input[MAX_PLAYERS];
   Peer peers[MAX_PLAYERS];
   u8 player_entity[MAX_PLAYERS];
@@ -714,12 +769,6 @@ static bool present_aim_want(u8 buttons, bool reloading) {
   return (buttons & BTN_AIM) != 0 && !reloading;
 }
 
-// Hip->ADS viewmodel base from the WeaponDef.
-static void present_ads_pos(const WeaponDef *def, f32 blend, f32 *x, f32 *y) {
-  *x = def->hip_off_x * (1.0f - blend) + def->ads_off_x * blend;
-  *y = def->hip_off_y * (1.0f - blend) + def->ads_off_y * blend;
-}
-
 // Walk bob offsets; ads_damp is (1 - 0.5*aim) on both render paths.
 static void present_bob_offsets(f32 phase, f32 blend, f32 ads_damp, f32 *x,
                                 f32 *y, f32 *z, f32 *roll) {
@@ -767,12 +816,53 @@ static f32 present_unq01(u8 q) { return (f32)q / 255.0f; }
 
 static f32 present_unq11(i8 q) { return (f32)q / 127.0f; }
 
+// ---- generic stale-snapshot guards (source fix) ----
+// Reconciliation policy, single source of truth for ALL predicted state.
+// - Authoritative state (remotes, cubes, casings, presentation, names):
+//   overwrite from the snapshot. Global tick ordering in
+//   net_validate_snapshot_fields guarantees snapshots apply in order.
+// - Predicted state (local weapon ammo/reload/id today; local position or
+//   any future client-predicted field): NEVER overwrite directly from a
+//   snapshot. A snapshot is stale by RTT: the server hadn't seen our latest
+//   inputs when it was taken (see acknowledged_sequence, which the old code
+//   discarded). Blind overwrite regresses fresh prediction (the mag-dump
+//   15->14->0 wipe). Route every predicted field through the helpers below:
+//   (a) monotonic-down counters (ammo, health, ...): adopt only if server is
+//       lower (server fired extra shots we haven't, e.g. delayed release).
+//       Ignore higher (server hasn't seen our shots yet).
+//   (b) ack proof: predicted_is_stale(dirty_seq, snap_ack) is true while the
+//       server hasn't acked our last change -> must not regress to it.
+//   (c) forward-only progress (reload remaining): adopt the minimum
+//       remaining, never extend.
+// Adding a new predicted field means adding a dirty_seq for it and using
+// these helpers, not a new ad-hoc guard.
+static bool predicted_is_stale(u16 dirty_seq, u16 snap_ack) {
+  return sequence_newer(dirty_seq, snap_ack);
+}
+
+static bool reconcile_should_adopt_lower_u8(u8 local_value, u8 server_value) {
+  return server_value < local_value;
+}
+
+// Decode the wire reload_q (0 = not reloading, else 1..255) to a remaining
+// tick count so both-reloading sides can take the minimum (forward only).
+// Unknown/zero progress while reloading means "just started": return the
+// full duration so we never fast-forward on bad data.
+static u16 reload_remaining_from_q(u8 reload_q, u16 reload_ticks) {
+  if (reload_q == 0)
+    return 0;
+  if (reload_ticks == 0)
+    return 0;
+  return (u16)(((u32)reload_ticks * (u32)(255u - reload_q) + 127u) / 254u);
+}
+
 // Reconcile a snapshot weapon state onto a client entity. Remote entities
 // are fully authoritative. The local entity keeps its prediction and only
-// moves towards the server: starting a reload it missed, finishing one the
-// server confirmed, or adopting a lower ammo count.
+// moves towards the server via the generic guards above: monotonic ammo,
+// ack-proof reload start, forward-only reload progress, ack-gated weapon id.
 static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
-                                  u8 srv_ammo, bool srv_reloading) {
+                                  u8 srv_ammo, bool srv_reloading,
+                                  u8 srv_reload_q, u16 snap_ack) {
   if (!weapon_entity_valid(e))
     return;
   if (srv_weapon >= WEAPON_COUNT)
@@ -785,28 +875,76 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
     weapon_set_from_snapshot(g, e, srv_weapon, srv_ammo, srv_reloading);
     return;
   }
-  g->weapon_id[e] = srv_weapon;
+  // Predicted path: gate the weapon id itself. While our switch hasn't been
+  // acked, keep predicting with the local id; once acked, adopt the server
+  // id (today always identical; future pickups need this to avoid snap-back).
+  u16 dirty = g->weapon_dirty_seq[e];
+  bool stale = predicted_is_stale(dirty, snap_ack);
+  if (!stale && g->weapon_id[e] != srv_weapon) {
+    g->weapon_id[e] = srv_weapon;
+    g->weapon_dirty_seq[e] = snap_ack;
+    dirty = snap_ack;
+    stale = false;
+  }
   const WeaponDef *def = weapon_def(g->weapon_id[e]);
   if (srv_ammo > def->mag_size)
     srv_ammo = def->mag_size;
-  if (g->weapon_ammo[e] > def->mag_size)
+  if (g->weapon_ammo[e] > def->mag_size) {
     g->weapon_ammo[e] = srv_ammo;
+    g->weapon_dirty_seq[e] = snap_ack;
+    dirty = snap_ack;
+    stale = predicted_is_stale(dirty, snap_ack);
+  }
   if (srv_reloading) {
-    if (g->weapon_reload[e] == 0 && g->weapon_ammo[e] == def->mag_size) {
-      // Predicted reload finished earlier than the server; ignore the stale
-      // snapshot instead of flickering back to reloading.
-    } else {
+    if (g->weapon_reload[e] != 0) {
+      // Both reloading: forward-only via remaining minimum so a stale
+      // snapshot can never extend the reload. Ammo stays empty.
       g->weapon_ammo[e] = 0;
-      if (g->weapon_reload[e] == 0)
-        g->weapon_reload[e] = def->reload_ticks;
+      u16 local_remaining = g->weapon_reload[e];
+      u16 srv_remaining =
+          reload_remaining_from_q(srv_reload_q, def->reload_ticks);
+      if (srv_reload_q != 0 && srv_remaining < local_remaining)
+        g->weapon_reload[e] = srv_remaining;
+    } else if (g->weapon_ammo[e] == 0) {
+      // Local emptied but hasn't started its reload yet (the one-tick gap
+      // before weapon_tick auto-starts it): adopt the server reload.
+      g->weapon_ammo[e] = 0;
+      g->weapon_reload[e] = def->reload_ticks;
+      g->weapon_dirty_seq[e] = snap_ack;
+    } else if (stale) {
+      // Local has ammo and isn't reloading, and the server hasn't acked our
+      // last weapon change (refill + predicted shots): this reloading
+      // snapshot predates our refill and is stale. Ignore it instead of
+      // wiping the fresh mag back to 0. This subsumes the old
+      // `ammo == mag_size` guard, which only covered the exact refill tick.
+    } else {
+      // Fresh (server saw our refill yet still says reloading): genuine new
+      // cycle the local missed. Adopt it to converge.
+      g->weapon_ammo[e] = 0;
+      g->weapon_reload[e] = def->reload_ticks;
+      g->weapon_dirty_seq[e] = snap_ack;
     }
   } else if (g->weapon_reload[e] != 0) {
-    if (srv_ammo == def->mag_size) {
-      g->weapon_ammo[e] = def->mag_size;
+    // Server done while local still reloading: fast-forward ONLY if fresh
+    // (server has acked our reload start, so it truly finished ahead and we
+    // started late). If stale, the server simply hasn't emptied yet (it is
+    // behind: e.g. local 0/118 reloading while server still shows 1/0 live):
+    // keep reloading, else we snap back out of reload (0->1) and wipe again
+    // on the next snapshot. Ammo stays empty while reloading either way.
+    if (!stale) {
+      // Fresh: client started late, jump to the server state (done + its
+      // ammo, which may already include post-refill shots). Forward only.
+      g->weapon_ammo[e] = srv_ammo;
       g->weapon_reload[e] = 0;
+      g->weapon_dirty_seq[e] = snap_ack;
+    } else {
+      g->weapon_ammo[e] = 0;
     }
-  } else if (srv_ammo < g->weapon_ammo[e]) {
+  } else if (reconcile_should_adopt_lower_u8(g->weapon_ammo[e], srv_ammo)) {
+    // Both live: server fired extra shots we haven't (delayed release).
+    // Adopt the lower count; ignore higher (server hasn't seen our shots).
     g->weapon_ammo[e] = srv_ammo;
+    g->weapon_dirty_seq[e] = snap_ack;
   }
 }
 
@@ -1007,6 +1145,7 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->weapon_cooldown[e] = 0;
   g->weapon_prev[e] = 0;
   g->weapon_reload[e] = 0;
+  g->weapon_dirty_seq[e] = 0;
   g->r_aim[e] = g->r_phase[e] = g->r_blend[e] = 0;
   g->r_reload[e] = g->r_sprint[e] = 0;
   g->r_leanx[e] = g->r_leanz[e] = 0;

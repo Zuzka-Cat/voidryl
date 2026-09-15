@@ -229,17 +229,47 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
   g->px[e] = (i16)lroundf(muzzle.x * POS_SCALE);
   g->py[e] = (i16)lroundf(muzzle.y * POS_SCALE);
   g->pz[e] = (i16)lroundf(muzzle.z * POS_SCALE);
-  g->vx[e] = (i16)lroundf(dir.x * BULLET_SPEED);
-  g->vy[e] = (i16)lroundf(dir.y * BULLET_SPEED);
-  g->vz[e] = (i16)lroundf(dir.z * BULLET_SPEED);
-  g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
-  g->pitch[e] = clamp_i16((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
+  // Inherit shooter velocity so strafing/falling doesn't make tracers drift
+  // opposite in the shooter's own view. Same fixed-point units (units/tick),
+  // so directly addable: moving right adds slight rightward flight, moving
+  // left adds slight leftward flight, same for fwd/back/up/down. Without
+  // this a right strafe (3 u/tick vs 32 u/tick bullet) reads as the bullet
+  // flying left.
+  f32 bvx = dir.x * BULLET_SPEED + (f32)g->vx[pe];
+  f32 bvy = dir.y * BULLET_SPEED + (f32)g->vy[pe];
+  f32 bvz = dir.z * BULLET_SPEED + (f32)g->vz[pe];
+  g->vx[e] = (i16)lroundf(bvx);
+  g->vy[e] = (i16)lroundf(bvy);
+  g->vz[e] = (i16)lroundf(bvz);
+  f32 blen = sqrtf(bvx * bvx + bvy * bvy + bvz * bvz);
+  if (blen > 0.001f) {
+    f32 s = bvy / blen;
+    if (s > 1.0f)
+      s = 1.0f;
+    if (s < -1.0f)
+      s = -1.0f;
+    g->yaw[e] = wrap_degrees((int)lroundf(atan2f(bvx, bvz) * RAD2DEG));
+    g->pitch[e] = clamp_i16((int)lroundf(asinf(s) * RAD2DEG), -89, 89);
+  } else {
+    g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
+    g->pitch[e] = clamp_i16((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
+  }
   g->owner[e] = g->owner[pe];
   g->kind[e] = KIND_BULLET;
   g->lifetime[e] = BULLET_LIFETIME_TICKS;
   add_kind_components(g, e, KIND_BULLET);
   return e;
 }
+
+// Shooter velocity inherited by ejected brass. Horizontal is full (1.0):
+// brass leaves with the gun's velocity plus the ejector kick, so in the
+// shooter's own view the walk cancels out and ejection always reads
+// rightward at ejector speed. Anything less lets a strafe (3 u/tick)
+// outrun the brass drift (~1.5 u/tick), which reads as shells flying
+// backwards. Vertical is damped (0.3): the game jump is superhuman and full
+// inheritance would fountain brass meters high.
+#define CASING_INHERIT_XZ 1.0f
+#define CASING_INHERIT_Y 0.3f
 
 static void spawn_casing(GameState *g, u32 pe) {
   Vector3 f, r, u, port;
@@ -250,29 +280,53 @@ static void spawn_casing(GameState *g, u32 pe) {
   if (e == ECS_INVALID_ENTITY)
     return;
   clear_entity_data(g, e);
+  u8 wid = g->weapon_id[pe];
+  if (wid >= WEAPON_COUNT)
+    wid = WEAPON_P99;
+  const ShellDef *sh = shell_def(wid);
   gun_basis(g, pe, &f, &r, &u);
-  port =
-      gun_point(g, pe, f, r, u, (Vector3){0.72f, GUN_MUZZLE_OFFSET.y, 0.03f});
+  // Ejection port: top-right of the slide, above the trigger guard.
+  // gun_basis r points screen-right, so a positive port_side puts the port
+  // on the right where the P99 cut is, keeping the spawn visible instead of
+  // crossing through the gun.
+  port = gun_point(g, pe, f, r, u,
+                   (Vector3){sh->port_fwd, sh->port_side, sh->port_up});
   h = mix32(g->tick * 33u + e * 17u + (u32)g->owner[pe] * 91u + (u32)g->px[pe]);
-  // Small jitter only: natural ejection pops slightly right/up/back and falls
-  // nearby instead of flying far sideways.
-  f32 jx = ((int)(h & 255u) - 128) / 320.0f;
-  f32 jy = ((int)((h >> 8) & 255u) - 128) / 300.0f;
-  f32 jz = ((int)((h >> 16) & 255u) - 128) / 320.0f;
-  f32 side = 1.15f + jx;
-  f32 up = 2.10f + jy;
-  f32 back = 0.70f + jz * 0.25f;
+  // P99 ejection: outward right, up at ~30-45 deg elevation, slightly
+  // rearward (extractor pivots the case around its right rim, fixed ejector
+  // kicks the left base). Jitter is +/- shell jitter in m/s.
+  f32 jx = ((f32)((int)(h & 255u) - 128) / 128.0f) * sh->jitter;
+  f32 jy = ((f32)((int)((h >> 8) & 255u) - 128) / 128.0f) * sh->jitter;
+  f32 jz = ((f32)((int)((h >> 16) & 255u) - 128) / 128.0f) * sh->jitter;
+  f32 right_ms = sh->eject_right + jx;
+  f32 up_ms = sh->eject_up + jy;
+  f32 back_ms = sh->eject_back + jz * 0.5f;
+  // Fixed-point velocity is units/tick: m/s * POS_SCALE * SIM_DT (0.64x).
+  f32 k = (f32)POS_SCALE * SIM_DT;
+  f32 side = right_ms * k;
+  f32 up = up_ms * k;
+  f32 back = back_ms * k;
   g->px[e] = (i16)lroundf(port.x * POS_SCALE);
   g->py[e] = (i16)lroundf(port.y * POS_SCALE);
   g->pz[e] = (i16)lroundf(port.z * POS_SCALE);
-  // Note: gun_basis r points left, so eject right with -r for visibility.
-  g->vx[e] = (i16)lroundf(-r.x * side + u.x * up - f.x * back);
-  g->vy[e] = (i16)lroundf(-r.y * side + u.y * up - f.y * back);
-  g->vz[e] = (i16)lroundf(-r.z * side + u.z * up - f.z * back);
+  // gun_basis r already points screen-right, so eject right with +r.
+  // Plus full horizontal shooter velocity (same fixed-point units, so
+  // directly addable): the case is flung from a moving gun, and matching the
+  // observer's motion keeps the rightward snap reading correctly in view.
+  g->vx[e] =
+      (i16)(lroundf(r.x * side + u.x * up - f.x * back) +
+            lroundf((f32)g->vx[pe] * CASING_INHERIT_XZ));
+  g->vy[e] =
+      (i16)(lroundf(r.y * side + u.y * up - f.y * back) +
+            lroundf((f32)g->vy[pe] * CASING_INHERIT_Y));
+  g->vz[e] =
+      (i16)(lroundf(r.z * side + u.z * up - f.z * back) +
+            lroundf((f32)g->vz[pe] * CASING_INHERIT_XZ));
   g->yaw[e] = wrap_degrees(g->yaw[pe] + 50 + (int)(h % 41u));
   g->pitch[e] = (i16)(18 + (int)((h >> 5) % 29u));
   g->held_by[e] = (u8)h;
   g->owner[e] = g->owner[pe];
+  g->weapon_id[e] = wid;
   g->kind[e] = KIND_CASING;
   g->lifetime[e] = CASING_LIFETIME_TICKS;
   add_kind_components(g, e, KIND_CASING);
@@ -340,22 +394,43 @@ static void casing_system(GameState *g) {
     g->px[e] = (i16)(g->px[e] + g->vx[e]);
     g->py[e] = (i16)(g->py[e] + g->vy[e]);
     g->pz[e] = (i16)(g->pz[e] + g->vz[e]);
-    if (g->tick % 6u == 0 && g->vy[e] > -8)
+    // Real gravity (~9.8m/s^2): 1 unit per 16 ticks == 0.0625 units/tick.
+    // Rises ~0.15-0.25s, then drops 1-2m right/rearward like real 9mm brass.
+    if (g->tick % 16u == 0 && g->vy[e] > -8)
       --g->vy[e];
-    if (g->py[e] <= 4) {
-      g->py[e] = 4;
-      g->vy[e] = 0;
-      g->vx[e] = (i16)(g->vx[e] * 2 / 3);
-      g->vz[e] = (i16)(g->vz[e] * 2 / 3);
-      if (abs(g->vx[e]) < 1)
-        g->vx[e] = 0;
-      if (abs(g->vz[e]) < 1)
-        g->vz[e] = 0;
+    if (g->py[e] <= 2) {
+      g->py[e] = 2;
+      if (g->vy[e] <= -2) {
+        // Brass bounce: restitution ~0.35, horizontal loses ~25%.
+        g->vy[e] = (i16)(-g->vy[e] * 3 / 8);
+        g->vx[e] = (i16)(g->vx[e] * 3 / 4);
+        g->vz[e] = (i16)(g->vz[e] * 3 / 4);
+      } else {
+        // Resting/rolling: light friction so cases roll instead of halting.
+        g->vy[e] = 0;
+        g->vx[e] = (i16)(g->vx[e] * 15 / 16);
+        g->vz[e] = (i16)(g->vz[e] * 15 / 16);
+        if (abs(g->vx[e]) < 1)
+          g->vx[e] = 0;
+        if (abs(g->vz[e]) < 1)
+          g->vz[e] = 0;
+      }
     }
     if (g->vx[e] || g->vy[e] || g->vz[e]) {
-      g->yaw[e] = wrap_degrees(g->yaw[e] + 9 + (g->held_by[e] & 7));
-      g->pitch[e] = wrap_degrees(g->pitch[e] + 11 + ((g->held_by[e] >> 3) & 7));
-      g->held_by[e] = (u8)(g->held_by[e] + 13u);
+      bool airborne = g->py[e] > 2 || g->vy[e] != 0;
+      if (airborne) {
+        // Rapid end-over-end tumble in flight.
+        g->yaw[e] = wrap_degrees(g->yaw[e] + 9 + (g->held_by[e] & 7));
+        g->pitch[e] =
+            wrap_degrees(g->pitch[e] + 11 + ((g->held_by[e] >> 3) & 7));
+        g->held_by[e] = (u8)(g->held_by[e] + 13u);
+      } else {
+        // Slow roll on the ground.
+        g->yaw[e] = wrap_degrees(g->yaw[e] + 2 + (g->held_by[e] & 3));
+        g->pitch[e] =
+            wrap_degrees(g->pitch[e] + 2 + ((g->held_by[e] >> 2) & 3));
+        g->held_by[e] = (u8)(g->held_by[e] + 5u);
+      }
     }
   }
 }
@@ -501,6 +576,10 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
     i8 lean_x_q = 0, lean_z_q = 0;
     if (g->kind[e] == KIND_CUBE) {
       scale = scale_encode(scale_value(g, e));
+    } else if (g->kind[e] == KIND_CASING) {
+      // Shell type rides the weapon field so every client renders the
+      // per-gun casing size. No protocol change: 0 decodes to P99.
+      weapon = g->weapon_id[e] < WEAPON_COUNT ? g->weapon_id[e] : WEAPON_P99;
     } else if (g->kind[e] == KIND_PLAYER) {
       weapon = g->weapon_id[e];
       ammo = g->weapon_ammo[e];

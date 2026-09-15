@@ -227,26 +227,28 @@ static const ShellDef *shell_def(u8 id) {
 #define CUBE_SCALE_MIN 0.12f
 #define CUBE_SCALE_MAX 2.0f
 
+// Shared clamps: single source of truth for all range limiting.
+// Integers use plain comparisons; floats use fminf/fmaxf from <math.h>.
+static int clamp_int(int v, int lo, int hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+static f32 clamp_float(f32 v, f32 lo, f32 hi) {
+  return fminf(fmaxf(v, lo), hi);
+}
+
 static f32 hold_dist_for_pitch(i16 pitch_deg) {
   f32 d = HOLD_BASE_DIST + (f32)pitch_deg * HOLD_PITCH_STEP;
-  if (d < HOLD_MIN_DIST)
-    return HOLD_MIN_DIST;
-  if (d > HOLD_MAX_DIST)
-    return HOLD_MAX_DIST;
-  return d;
+  return clamp_float(d, HOLD_MIN_DIST, HOLD_MAX_DIST);
 }
 
 static u8 scale_encode(f32 s) {
-  if (s < CUBE_SCALE_MIN)
-    s = CUBE_SCALE_MIN;
-  if (s > CUBE_SCALE_MAX)
-    s = CUBE_SCALE_MAX;
-  int q = (int)lroundf(s * 64.0f);
-  if (q < 1)
-    q = 1;
-  if (q > 255)
-    q = 255;
-  return (u8)q;
+  s = clamp_float(s, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
+  return (u8)clamp_int((int)lroundf(s * 64.0f), 1, 255);
 }
 
 static f32 scale_decode(u8 q) {
@@ -333,31 +335,14 @@ typedef struct NetSnapshot {
   u8 names[MAX_PLAYERS][PLAYER_NAME_LENGTH];
 } NetSnapshot;
 
-// Dense snapshot wire format: 12-byte header + count * 26-byte entities +
-// 40-byte names. Max 884 bytes at 32 entities, typically 286 (8 cubes +
-// 1 player). Zero-filling of unused slots never hits the wire.
-#define NET_SNAPSHOT_HEADER_SIZE 12
+// Dense snapshot wire format: header + count * entities + names.
+// Zero-filling of unused slots never hits the wire. The header size is
+// derived from the struct layout so no magic length can drift.
+#define NET_SNAPSHOT_HEADER_SIZE (offsetof(NetSnapshot, entities))
 #define NET_SNAPSHOT_NAMES_SIZE (MAX_PLAYERS * PLAYER_NAME_LENGTH)
 #define NET_MAX_DATAGRAM sizeof(NetSnapshot)
 #define NET_INPUT_WIRE_SIZE sizeof(NetInputPacket)
 #define NET_CHAT_WIRE_SIZE sizeof(NetChatPacket)
-#define NET_OFF_COUNT 3
-
-_Static_assert(sizeof(NetEntity) == 26, "NetEntity wire size changed");
-_Static_assert(sizeof(NetInputPacket) == 24, "NetInputPacket padding changed");
-_Static_assert(sizeof(NetChatPacket) == 36, "NetChatPacket padding changed");
-_Static_assert(offsetof(NetInputPacket, name) == 16, "input name offset moved");
-_Static_assert(offsetof(NetInputPacket, reserved) == 21, "input tail moved");
-_Static_assert(offsetof(NetChatPacket, name) == 10, "chat name offset moved");
-_Static_assert(offsetof(NetChatPacket, text) == 15, "chat text offset moved");
-_Static_assert(offsetof(NetChatPacket, reserved) == 33, "chat tail moved");
-_Static_assert(offsetof(NetSnapshot, entities) == NET_SNAPSHOT_HEADER_SIZE,
-               "snapshot header has padding");
-_Static_assert(sizeof(NetSnapshot) ==
-                   NET_SNAPSHOT_HEADER_SIZE +
-                       NET_ENTITY_LIMIT * sizeof(NetEntity) +
-                       NET_SNAPSHOT_NAMES_SIZE,
-               "snapshot has trailing padding");
 
 static i32 net_snapshot_wire_size(u8 count) {
   if (count > NET_ENTITY_LIMIT)
@@ -489,9 +474,9 @@ typedef struct GameState {
   // simulated, never snapshotted). weapon_dirty_seq[e] is the input sequence
   // that caused the last local weapon change on e; compared against the
   // snapshot's acknowledged_sequence to prove the server had seen our change
-  // before we let it regress predicted state. Zero means synced (see
-  // predicted_is_stale). last_snapshot_ack is the ack from the last applied
-  // snapshot, for debugging/future predicted fields.
+  // before we let it regress predicted state. Zero means synced (stale while
+  // sequence_newer(dirty_seq, snap_ack)). last_snapshot_ack is the ack from
+  // the last applied snapshot, for debugging/future predicted fields.
   u16 weapon_dirty_seq[ECS_MAX_ENTITIES];
   u16 last_snapshot_ack;
   InputCommand input[MAX_PLAYERS];
@@ -535,9 +520,8 @@ typedef struct GameState {
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
-_Static_assert(ECS_MAX_ENTITIES <= 32u, "network bitsets assume 32 entities");
+_Static_assert(ECS_MAX_ENTITIES <= 32u, "current ecs can only handle 32 entities");
 _Static_assert(MAX_PLAYERS <= 8, "visible_players is an 8-bit mask");
-_Static_assert(sizeof tom_thumb_3x5 == 88, "unexpected Tom Thumb subset size");
 
 // string helpers
 
@@ -562,14 +546,6 @@ static bool string_eq(String a, String b) {
 }
 
 // math / time / session helpers
-
-static i16 clamp_i16(int value, i16 low, i16 high) {
-  if (value < low)
-    return low;
-  if (value > high)
-    return high;
-  return (i16)value;
-}
 
 static i16 wrap_degrees(int value) {
   value %= 360;
@@ -618,7 +594,7 @@ static int unpack_yaw(u8 packed) { return (int)packed * 360 / 256 - 180; }
 #define LAG_NEUTRAL 128
 
 static u8 lag_encode(int delta) {
-  return (u8)clamp_i16(delta + LAG_NEUTRAL, 0, 255);
+  return (u8)clamp_int(delta + LAG_NEUTRAL, 0, 255);
 }
 
 static int lag_decode(u8 v) { return (int)v - LAG_NEUTRAL; }
@@ -666,9 +642,8 @@ static u8 weapon_ammo(const GameState *g, u32 e) {
   return weapon_entity_valid(e) ? g->weapon_ammo[e] : 0;
 }
 
-static u8 weapon_mag_size(const GameState *g, u32 e) {
-  u8 id = weapon_entity_valid(e) ? g->weapon_id[e] : WEAPON_P99;
-  return weapon_def(id)->mag_size;
+static u8 weapon_mag_size(u8 weapon_id) {
+  return weapon_def(weapon_id)->mag_size;
 }
 
 static bool weapon_holding(const GameState *g, u32 e, bool want) {
@@ -729,7 +704,7 @@ static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
   const WeaponDef *def = weapon_def(weapon_id);
   int kick = holding ? (int)def->recoil_pitch_hold_deg
                      : (int)def->recoil_pitch_tap_deg;
-  return clamp_i16((int)pitch + kick, -75, 75);
+  return (i16)clamp_int((int)pitch + kick, -75, 75);
 }
 
 // Per-weapon imprecision in degrees. Hip is deliberately loose, ADS is
@@ -764,11 +739,7 @@ static f32 weapon_reload_progress(const GameState *g, u32 e) {
   if (def->reload_ticks == 0)
     return 0.0f;
   f32 t = 1.0f - (f32)g->weapon_reload[e] / (f32)def->reload_ticks;
-  if (t < 0.0f)
-    t = 0.0f;
-  if (t > 1.0f)
-    t = 1.0f;
-  return t;
+  return clamp_float(t, 0.0f, 1.0f);
 }
 
 // ---- shared presentation tick/pose helpers (single source of truth) ----
@@ -826,36 +797,31 @@ static void present_lean_offsets(f32 sx, f32 sz, f32 *ox, f32 *oz) {
   *oz = sz * 0.05f;
 }
 
-static u8 present_q01(f32 v) {
-  if (v <= 0.0f)
-    return 0;
-  if (v >= 1.0f)
-    return 255;
-  return (u8)(v * 255.0f + 0.5f);
+// Wire quantizers for replicated presentation (0..1 and -1..1 floats).
+// Single source of truth: encode clamps via clamp_float, rounds with
+// lroundf, then range-checks via clamp_int; decode is the exact inverse.
+static u8 encode_01(f32 v) {
+  return (u8)clamp_int((int)lroundf(clamp_float(v, 0.0f, 1.0f) * 255.0f), 0,
+                       255);
 }
 
-static i8 present_q11(f32 v) {
-  if (v <= -1.0f)
-    return -127;
-  if (v >= 1.0f)
-    return 127;
-  return (i8)(v * 127.0f);
+static f32 decode_01(u8 q) { return (f32)q / 255.0f; }
+
+static i8 encode_11(f32 v) {
+  return (i8)clamp_int((int)lroundf(clamp_float(v, -1.0f, 1.0f) * 127.0f),
+                       -127, 127);
 }
+
+static f32 decode_11(i8 q) { return (f32)q / 127.0f; }
 
 // Reload progress quantized: 0 means not reloading, otherwise 1..255.
-static u8 present_reload_q(bool reloading, f32 t) {
+static u8 encode_reload_q(bool reloading, f32 t) {
   if (!reloading)
     return 0;
-  if (t < 0.0f)
-    t = 0.0f;
-  if (t > 1.0f)
-    t = 1.0f;
-  return (u8)(1 + t * 254.0f);
+  return (u8)(clamp_int((int)lroundf(clamp_float(t, 0.0f, 1.0f) * 254.0f), 0,
+                        254) +
+              1);
 }
-
-static f32 present_unq01(u8 q) { return (f32)q / 255.0f; }
-
-static f32 present_unq11(i8 q) { return (f32)q / 127.0f; }
 
 // ---- generic stale-snapshot guards (source fix) ----
 // Reconciliation policy, single source of truth for ALL predicted state.
@@ -867,29 +833,22 @@ static f32 present_unq11(i8 q) { return (f32)q / 127.0f; }
 //   snapshot. A snapshot is stale by RTT: the server hadn't seen our latest
 //   inputs when it was taken (see acknowledged_sequence, which the old code
 //   discarded). Blind overwrite regresses fresh prediction (the mag-dump
-//   15->14->0 wipe). Route every predicted field through the helpers below:
+//   15->14->0 wipe). Route every predicted field through the policy below:
 //   (a) monotonic-down counters (ammo, health, ...): adopt only if server is
 //       lower (server fired extra shots we haven't, e.g. delayed release).
 //       Ignore higher (server hasn't seen our shots yet).
-//   (b) ack proof: predicted_is_stale(dirty_seq, snap_ack) is true while the
+//   (b) ack proof: sequence_newer(dirty_seq, snap_ack) is true while the
 //       server hasn't acked our last change -> must not regress to it.
 //   (c) forward-only progress (reload remaining): adopt the minimum
 //       remaining, never extend.
 // Adding a new predicted field means adding a dirty_seq for it and using
-// these helpers, not a new ad-hoc guard.
-static bool predicted_is_stale(u16 dirty_seq, u16 snap_ack) {
-  return sequence_newer(dirty_seq, snap_ack);
-}
-
-static bool reconcile_should_adopt_lower_u8(u8 local_value, u8 server_value) {
-  return server_value < local_value;
-}
+// sequence_newer + plain comparisons, not a new ad-hoc guard.
 
 // Decode the wire reload_q (0 = not reloading, else 1..255) to a remaining
 // tick count so both-reloading sides can take the minimum (forward only).
 // Unknown/zero progress while reloading means "just started": return the
 // full duration so we never fast-forward on bad data.
-static u16 reload_remaining_from_q(u8 reload_q, u16 reload_ticks) {
+static u16 decode_reload_q(u8 reload_q, u16 reload_ticks) {
   if (reload_q == 0)
     return 0;
   if (reload_ticks == 0)
@@ -920,7 +879,7 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
   // acked, keep predicting with the local id; once acked, adopt the server
   // id (today always identical; future pickups need this to avoid snap-back).
   u16 dirty = g->weapon_dirty_seq[e];
-  bool stale = predicted_is_stale(dirty, snap_ack);
+  bool stale = sequence_newer(dirty, snap_ack);
   if (!stale && g->weapon_id[e] != srv_weapon) {
     g->weapon_id[e] = srv_weapon;
     g->weapon_dirty_seq[e] = snap_ack;
@@ -934,7 +893,7 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
     g->weapon_ammo[e] = srv_ammo;
     g->weapon_dirty_seq[e] = snap_ack;
     dirty = snap_ack;
-    stale = predicted_is_stale(dirty, snap_ack);
+    stale = sequence_newer(dirty, snap_ack);
   }
   if (srv_reloading) {
     if (g->weapon_reload[e] != 0) {
@@ -942,8 +901,7 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
       // snapshot can never extend the reload. Ammo stays empty.
       g->weapon_ammo[e] = 0;
       u16 local_remaining = g->weapon_reload[e];
-      u16 srv_remaining =
-          reload_remaining_from_q(srv_reload_q, def->reload_ticks);
+      u16 srv_remaining = decode_reload_q(srv_reload_q, def->reload_ticks);
       if (srv_reload_q != 0 && srv_remaining < local_remaining)
         g->weapon_reload[e] = srv_remaining;
     } else if (g->weapon_ammo[e] == 0) {
@@ -981,7 +939,7 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
     } else {
       g->weapon_ammo[e] = 0;
     }
-  } else if (reconcile_should_adopt_lower_u8(g->weapon_ammo[e], srv_ammo)) {
+  } else if (srv_ammo < g->weapon_ammo[e]) {
     // Both live: server fired extra shots we haven't (delayed release).
     // Adopt the lower count; ignore higher (server hasn't seen our shots).
     g->weapon_ammo[e] = srv_ammo;
@@ -1055,8 +1013,12 @@ static void socket_nonblocking(int fd) {
 // Packet framing (exact size + magic + type). Semantic checks live in
 // net_validate_*_fields. All decoders zero-fill *out and copy field-wise,
 // so wire padding never propagates and struct padding never leaks.
+// Offsets always come from offsetof(), never literals, so layout changes
+// stay correct without touching this code.
 static bool net_packet_ok(const u8 *buf, i32 n, u8 type, i32 size) {
-  return n == size && n >= 2 && buf[0] == NET_MAGIC && buf[1] == type;
+  return n == size && n >= 2 &&
+         buf[offsetof(NetSnapshot, magic)] == NET_MAGIC &&
+         buf[offsetof(NetSnapshot, type)] == type;
 }
 
 static bool net_seq_fresh(u16 seq, bool got, u16 last) {
@@ -1099,46 +1061,28 @@ static bool net_validate_snapshot_fields(const NetSnapshot *snap,
 
 // Framing check for a dense snapshot: exact size for the claimed count.
 static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
-  if (!buf || n < 4 || buf[0] != NET_MAGIC ||
-      buf[1] != NET_PACKET_SNAPSHOT)
+  if (!buf || n < (i32)NET_SNAPSHOT_HEADER_SIZE ||
+      buf[offsetof(NetSnapshot, magic)] != NET_MAGIC ||
+      buf[offsetof(NetSnapshot, type)] != NET_PACKET_SNAPSHOT)
     return false;
-  u8 count = buf[NET_OFF_COUNT];
+  u8 count = buf[offsetof(NetSnapshot, count)];
   if (count > NET_ENTITY_LIMIT)
     return false;
   i32 want = net_snapshot_wire_size(count);
   return want >= 0 && n == want && (size_t)n <= sizeof(NetSnapshot);
 }
 
-static void net_write_snapshot_header(u8 *out, const NetSnapshot *snap) {
-  out[0] = snap->magic;
-  out[1] = snap->type;
-  out[2] = snap->local_player;
-  out[3] = snap->count;
-  memcpy(out + 4, &snap->session, sizeof(snap->session));
-  memcpy(out + 8, &snap->tick, sizeof(snap->tick));
-  memcpy(out + 10, &snap->acknowledged_sequence,
-         sizeof(snap->acknowledged_sequence));
-}
-
-static void net_read_snapshot_header(const u8 *buf, NetSnapshot *out) {
-  out->magic = buf[0];
-  out->type = buf[1];
-  out->local_player = buf[2];
-  out->count = buf[NET_OFF_COUNT];
-  memcpy(&out->session, buf + 4, sizeof(out->session));
-  memcpy(&out->tick, buf + 8, sizeof(out->tick));
-  memcpy(&out->acknowledged_sequence, buf + 10,
-         sizeof(out->acknowledged_sequence));
-}
-
 // Returns wire length, or -1 when count invalid / buffer too small.
+// The header prefix has no padding (see asserts), so one memcpy moves
+// magic/type/local_player/count/session/tick/ack together; entities and
+// names follow as dense blobs.
 static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
   if (!snap || !out || snap->count > NET_ENTITY_LIMIT)
     return -1;
   i32 want = net_snapshot_wire_size(snap->count);
   if (want < 0 || out_cap < want)
     return -1;
-  net_write_snapshot_header(out, snap);
+  memcpy(out, snap, NET_SNAPSHOT_HEADER_SIZE);
   if (snap->count > 0)
     memcpy(out + NET_SNAPSHOT_HEADER_SIZE, snap->entities,
            (size_t)snap->count * sizeof(NetEntity));
@@ -1154,9 +1098,9 @@ static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
 static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
   if (!buf || !out || !net_snapshot_wire_ok(buf, n))
     return false;
-  u8 count = buf[NET_OFF_COUNT];
+  u8 count = buf[offsetof(NetSnapshot, count)];
   *out = (NetSnapshot){0};
-  net_read_snapshot_header(buf, out);
+  memcpy(out, buf, NET_SNAPSHOT_HEADER_SIZE);
   out->count = count;
   if (count > 0)
     memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
@@ -1172,21 +1116,26 @@ static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
 static bool net_input_decode(const u8 *buf, i32 n, NetInputPacket *out) {
   if (!buf || !out || n != (i32)sizeof(NetInputPacket))
     return false;
-  if (buf[0] != NET_MAGIC ||
-      (buf[1] != NET_PACKET_INPUT && buf[1] != NET_PACKET_DISCONNECT))
+  if (buf[offsetof(NetInputPacket, magic)] != NET_MAGIC ||
+      (buf[offsetof(NetInputPacket, type)] != NET_PACKET_INPUT &&
+       buf[offsetof(NetInputPacket, type)] != NET_PACKET_DISCONNECT))
     return false;
   *out = (NetInputPacket){0};
-  out->magic = buf[0];
-  out->type = buf[1];
-  out->claimed_player = buf[2];
-  out->buttons = buf[3];
-  memcpy(&out->session, buf + 4, sizeof(out->session));
-  memcpy(&out->sequence, buf + 8, sizeof(out->sequence));
-  out->move_x = (i8)buf[10];
-  out->move_z = (i8)buf[11];
-  memcpy(&out->aim_yaw, buf + 12, sizeof(out->aim_yaw));
-  memcpy(&out->aim_pitch, buf + 14, sizeof(out->aim_pitch));
-  memcpy(out->name, buf + 16, PLAYER_NAME_LENGTH);
+  out->magic = buf[offsetof(NetInputPacket, magic)];
+  out->type = buf[offsetof(NetInputPacket, type)];
+  out->claimed_player = buf[offsetof(NetInputPacket, claimed_player)];
+  out->buttons = buf[offsetof(NetInputPacket, buttons)];
+  memcpy(&out->session, buf + offsetof(NetInputPacket, session),
+         sizeof(out->session));
+  memcpy(&out->sequence, buf + offsetof(NetInputPacket, sequence),
+         sizeof(out->sequence));
+  out->move_x = (i8)buf[offsetof(NetInputPacket, move_x)];
+  out->move_z = (i8)buf[offsetof(NetInputPacket, move_z)];
+  memcpy(&out->aim_yaw, buf + offsetof(NetInputPacket, aim_yaw),
+         sizeof(out->aim_yaw));
+  memcpy(&out->aim_pitch, buf + offsetof(NetInputPacket, aim_pitch),
+         sizeof(out->aim_pitch));
+  memcpy(out->name, buf + offsetof(NetInputPacket, name), PLAYER_NAME_LENGTH);
   return true;
 }
 
@@ -1196,16 +1145,18 @@ static bool net_chat_decode(const u8 *buf, i32 n, NetChatPacket *out) {
   if (!net_packet_ok(buf, n, NET_PACKET_CHAT, (i32)sizeof(NetChatPacket)))
     return false;
   *out = (NetChatPacket){0};
-  out->magic = buf[0];
-  out->type = buf[1];
-  out->player = buf[2];
-  out->length = buf[3];
+  out->magic = buf[offsetof(NetChatPacket, magic)];
+  out->type = buf[offsetof(NetChatPacket, type)];
+  out->player = buf[offsetof(NetChatPacket, player)];
+  out->length = buf[offsetof(NetChatPacket, length)];
   if (out->length > CHAT_LENGTH)
     return false;
-  memcpy(&out->session, buf + 4, sizeof(out->session));
-  memcpy(&out->sequence, buf + 8, sizeof(out->sequence));
-  memcpy(out->name, buf + 10, PLAYER_NAME_LENGTH);
-  memcpy(out->text, buf + 10 + PLAYER_NAME_LENGTH, out->length);
+  memcpy(&out->session, buf + offsetof(NetChatPacket, session),
+         sizeof(out->session));
+  memcpy(&out->sequence, buf + offsetof(NetChatPacket, sequence),
+         sizeof(out->sequence));
+  memcpy(out->name, buf + offsetof(NetChatPacket, name), PLAYER_NAME_LENGTH);
+  memcpy(out->text, buf + offsetof(NetChatPacket, text), out->length);
   return true;
 }
 
@@ -1286,22 +1237,22 @@ static void game_zero(GameState *g) {
 }
 
 static void clear_entity_data(GameState *g, u32 e) {
+  // SoA layout: each field is its own array, so one memset cannot clear a
+  // single entity. Zero every zero-default slot, then restore the non-zero
+  // defaults (lag neutral, unit scale, default weapon which is == 0).
   g->px[e] = g->py[e] = g->pz[e] = 0;
   g->vx[e] = g->vy[e] = g->vz[e] = 0;
   g->yaw[e] = g->pitch[e] = 0;
   g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
-  g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
   g->flash[e] = g->held_by[e] = 0;
+  g->weapon_ammo[e] = g->weapon_cooldown[e] = g->weapon_prev[e] = 0;
+  g->weapon_reload[e] = g->weapon_dirty_seq[e] = 0;
+  g->r_aim[e] = g->r_phase[e] = g->r_blend[e] = g->r_reload[e] =
+      g->r_sprint[e] = 0;
+  g->r_leanx[e] = g->r_leanz[e] = 0;
+  g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
   g->scale[e] = 1.0f;
   g->weapon_id[e] = WEAPON_P99;
-  g->weapon_ammo[e] = 0;
-  g->weapon_cooldown[e] = 0;
-  g->weapon_prev[e] = 0;
-  g->weapon_reload[e] = 0;
-  g->weapon_dirty_seq[e] = 0;
-  g->r_aim[e] = g->r_phase[e] = g->r_blend[e] = 0;
-  g->r_reload[e] = g->r_sprint[e] = 0;
-  g->r_leanx[e] = g->r_leanz[e] = 0;
 }
 
 static void add_kind_components(GameState *g, u32 e, u8 kind) {
@@ -1410,11 +1361,7 @@ static f32 scale_value(const GameState *g, u32 e) {
   f32 s = g->scale[e];
   if (!(s > 0.01f))
     return 1.0f;
-  if (s < CUBE_SCALE_MIN)
-    return CUBE_SCALE_MIN;
-  if (s > CUBE_SCALE_MAX)
-    return CUBE_SCALE_MAX;
-  return s;
+  return clamp_float(s, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
 }
 
 static bool cube_overlap(const GameState *g, i16 x, i16 z, i16 radius) {

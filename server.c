@@ -66,8 +66,8 @@ static void movement_system(GameState *g) {
         g->vy[e] = 0;
       }
     }
-    i16 nx = clamp_i16((int)g->px[e] + step_x, -ARENA_POS, ARENA_POS);
-    i16 nz = clamp_i16((int)g->pz[e] + step_z, -ARENA_POS, ARENA_POS);
+    i16 nx = (i16)clamp_int((int)g->px[e] + step_x, -ARENA_POS, ARENA_POS);
+    i16 nz = (i16)clamp_int((int)g->pz[e] + step_z, -ARENA_POS, ARENA_POS);
     if (!cube_overlap(g, nx, g->pz[e], POS_SCALE / 4))
       g->px[e] = nx;
     if (!cube_overlap(g, g->px[e], nz, POS_SCALE / 4))
@@ -83,7 +83,7 @@ static void aim_system(GameState *g) {
     if (p >= MAX_PLAYERS)
       continue;
     g->yaw[q.entity] = wrap_degrees(g->input[p].aim_yaw);
-    g->pitch[q.entity] = clamp_i16(g->input[p].aim_pitch, -75, 75);
+    g->pitch[q.entity] = (i16)clamp_int(g->input[p].aim_pitch, -75, 75);
   }
 }
 
@@ -149,33 +149,19 @@ static void holding_system(GameState *g) {
       aim_dir(g->yaw[pe], g->pitch[pe], &dir);
       (void)dir;
       f32 dist = hold_dist_for_pitch(g->pitch[pe]);
-      f32 scale = dist / HOLD_BASE_DIST;
-      if (scale < CUBE_SCALE_MIN)
-        scale = CUBE_SCALE_MIN;
-      if (scale > CUBE_SCALE_MAX)
-        scale = CUBE_SCALE_MAX;
+      f32 scale = clamp_float(dist / HOLD_BASE_DIST, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
       g->scale[held] = scale;
       f32 yaw_rad = (f32)g->yaw[pe] * DEG2RAD;
       f32 hx = sinf(yaw_rad);
       f32 hz = cosf(yaw_rad);
       f32 half_h = 32.0f * scale;
       f32 half_xz = 28.8f * scale;
-      f32 limit_x = (f32)ARENA_POS - half_xz;
-      f32 limit_z = (f32)ARENA_POS - half_xz;
-      if (limit_x < 0.0f)
-        limit_x = 0.0f;
-      if (limit_z < 0.0f)
-        limit_z = 0.0f;
+      f32 limit_x = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
+      f32 limit_z = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
       f32 tx = (f32)g->px[pe] + hx * dist * (f32)POS_SCALE;
       f32 tz = (f32)g->pz[pe] + hz * dist * (f32)POS_SCALE;
-      if (tx < -limit_x)
-        tx = -limit_x;
-      if (tx > limit_x)
-        tx = limit_x;
-      if (tz < -limit_z)
-        tz = -limit_z;
-      if (tz > limit_z)
-        tz = limit_z;
+      tx = clamp_float(tx, -limit_x, limit_x);
+      tz = clamp_float(tz, -limit_z, limit_z);
       g->px[held] = (i16)lroundf(tx);
       g->py[held] = (i16)lroundf(half_h);
       g->pz[held] = (i16)lroundf(tz);
@@ -247,16 +233,13 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
   g->vz[e] = (i16)lroundf(bvz);
   f32 blen = sqrtf(bvx * bvx + bvy * bvy + bvz * bvz);
   if (blen > 0.001f) {
-    f32 s = bvy / blen;
-    if (s > 1.0f)
-      s = 1.0f;
-    if (s < -1.0f)
-      s = -1.0f;
+    f32 s = clamp_float(bvy / blen, -1.0f, 1.0f);
     g->yaw[e] = wrap_degrees((int)lroundf(atan2f(bvx, bvz) * RAD2DEG));
-    g->pitch[e] = clamp_i16((int)lroundf(asinf(s) * RAD2DEG), -89, 89);
+    g->pitch[e] = (i16)clamp_int((int)lroundf(asinf(s) * RAD2DEG), -89, 89);
   } else {
     g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
-    g->pitch[e] = clamp_i16((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
+    g->pitch[e] =
+        (i16)clamp_int((int)lroundf(asinf(dir.y) * RAD2DEG), -89, 89);
   }
   g->owner[e] = g->owner[pe];
   g->kind[e] = KIND_BULLET;
@@ -590,14 +573,14 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
       if (g->owner[e] < MAX_PLAYERS) {
         u8 p = g->owner[e];
-        aim_q = present_q01(g->sv_aim[p]);
-        phase_q = present_q01(g->sv_phase[p] / (2.0f * PI));
-        blend_q = present_q01(g->sv_blend[p]);
-        sprint_q = present_q01(g->sv_sprint[p]);
-        lean_x_q = present_q11(g->sv_leanx[p]);
-        lean_z_q = present_q11(g->sv_leanz[p]);
+        aim_q = encode_01(g->sv_aim[p]);
+        phase_q = encode_01(g->sv_phase[p] / (2.0f * PI));
+        blend_q = encode_01(g->sv_blend[p]);
+        sprint_q = encode_01(g->sv_sprint[p]);
+        lean_x_q = encode_11(g->sv_leanx[p]);
+        lean_z_q = encode_11(g->sv_leanz[p]);
         reload_q =
-            present_reload_q(reloading != 0, weapon_reload_progress(g, e));
+            encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
       }
     }
     snap->entities[snap->count++] =
@@ -829,10 +812,11 @@ static void server_handle_input(GameState *g, int fd,
   peer->last_seen = g->tick;
   peer->address = from->sin_addr.s_addr;
   peer->port = from->sin_port;
-  g->input[peer->player].move_x = clamp_i16(packet->move_x, -1, 1);
-  g->input[peer->player].move_z = clamp_i16(packet->move_z, -1, 1);
+  g->input[peer->player].move_x = (i8)clamp_int(packet->move_x, -1, 1);
+  g->input[peer->player].move_z = (i8)clamp_int(packet->move_z, -1, 1);
   g->input[peer->player].aim_yaw = wrap_degrees(packet->aim_yaw);
-  g->input[peer->player].aim_pitch = clamp_i16(packet->aim_pitch, -75, 75);
+  g->input[peer->player].aim_pitch =
+      (i16)clamp_int(packet->aim_pitch, -75, 75);
   g->input[peer->player].buttons = packet->buttons & BTN_ALL;
 }
 

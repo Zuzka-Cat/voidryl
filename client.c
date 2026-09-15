@@ -117,7 +117,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   g->last_snapshot_tick = snap->tick;
   // Source-level stale guard: the ack proves what the server had seen when
   // this snapshot was taken. Predicted state below uses it (via
-  // weapon_dirty_seq + predicted_is_stale) instead of trusting the snapshot
+  // weapon_dirty_seq + sequence_newer) instead of trusting the snapshot
   // as current. Discarding it here is what caused the old mag-dump wipe.
   g->last_snapshot_ack = snap->acknowledged_sequence;
   g->connected = 1;
@@ -367,7 +367,8 @@ static void update_input(GameState *g, int fd) {
   g->look_delta_x = sdx;
   g->look_delta_y = sdy;
   g->view_yaw = wrap_degrees((int)g->view_yaw - (int)lroundf(sdx));
-  g->view_pitch = clamp_i16((int)g->view_pitch - (int)lroundf(sdy), -75, 75);
+  g->view_pitch =
+      (i16)clamp_int((int)g->view_pitch - (int)lroundf(sdy), -75, 75);
 }
 
 static u32 local_player_entity(const GameState *g) {
@@ -620,12 +621,12 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   // Replicated presentation, decoded once and posed through the same shared
   // helpers as the local viewmodel (server smooths, we just apply).
   const WeaponDef *rdef = weapon_def(g->weapon_id[e]);
-  f32 ab = present_unq01(g->r_aim[e]);
-  f32 rph = present_unq01(g->r_phase[e]) * 2.0f * PI;
-  f32 rwb = present_unq01(g->r_blend[e]);
-  f32 rlx = present_unq11(g->r_leanx[e]);
-  f32 rlz = present_unq11(g->r_leanz[e]);
-  f32 sb = present_unq01(g->r_sprint[e]);
+  f32 ab = decode_01(g->r_aim[e]);
+  f32 rph = decode_01(g->r_phase[e]) * 2.0f * PI;
+  f32 rwb = decode_01(g->r_blend[e]);
+  f32 rlx = decode_11(g->r_leanx[e]);
+  f32 rlz = decode_11(g->r_leanz[e]);
+  f32 sb = decode_01(g->r_sprint[e]);
   f32 reload_t = g->r_reload[e] == 0
                      ? 0.0f
                      : (f32)(g->r_reload[e] - 1) / 254.0f;
@@ -841,21 +842,21 @@ static void draw_hit_indicator(const GameState *g, u32 e) {
   int cx = LOGICAL_W / 2, cy = LOGICAL_H / 2;
   int len = g->flash[e] > 12 ? 14 : 10;
   if (s < -0.20f) {
-    int y = clamp_i16(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
+    int y = clamp_int(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
     DrawRectangle(0, y, 3, len, c);
     DrawRectangle(3, y + len / 2 - 2, 2, 4, c);
   }
   if (s > 0.20f) {
-    int y = clamp_i16(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
+    int y = clamp_int(cy - (int)(f * 18.0f) - len / 2, 2, LOGICAL_H - len - 2);
     DrawRectangle(LOGICAL_W - 3, y, 3, len, c);
     DrawRectangle(LOGICAL_W - 5, y + len / 2 - 2, 2, 4, c);
   }
   if (f > 0.50f) {
-    int x = clamp_i16(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
+    int x = clamp_int(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
     DrawRectangle(x, 0, len, 3, c);
   }
   if (f < -0.50f) {
-    int x = clamp_i16(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
+    int x = clamp_int(cx + (int)(s * 22.0f) - len / 2, 2, LOGICAL_W - len - 2);
     DrawRectangle(x, LOGICAL_H - 3, len, 3, c);
   }
 }
@@ -898,7 +899,7 @@ static void draw_hud(GameState *g) {
   if (e != ECS_INVALID_ENTITY && g->connected) {
     bool reloading = weapon_is_reloading(g, e);
     unsigned ammo = weapon_ammo(g, e);
-    unsigned mag = weapon_mag_size(g, e);
+    unsigned mag = weapon_mag_size(g->weapon_id[e]);
     if (ammo > mag)
       ammo = mag;
     int width = ammo_field_width(mag);
@@ -965,8 +966,8 @@ static void update_viewmodel(GameState *g, f32 dt) {
   f32 steady = 1.0f - g->aim_blend * 0.55f;
   f32 tx = g->look_delta_x * 0.048f * steady;
   f32 ty = -g->look_delta_y * 0.045f * steady;
-  tx = fmaxf(-0.50f, fminf(0.50f, tx));
-  ty = fmaxf(-0.45f, fminf(0.45f, ty));
+  tx = clamp_float(tx, -0.50f, 0.50f);
+  ty = clamp_float(ty, -0.45f, 0.45f);
   f32 k = 1.0f - expf(-5.2f * dt);
   g->gun_sway_x += (tx - g->gun_sway_x) * k;
   g->gun_sway_y += (ty - g->gun_sway_y) * k;
@@ -979,20 +980,14 @@ static void update_viewmodel(GameState *g, f32 dt) {
   g->gun_recoil_velocity +=
       (-140.0f * g->gun_recoil - 13.0f * g->gun_recoil_velocity) * dt;
   g->gun_recoil += g->gun_recoil_velocity * dt;
-  if (g->gun_recoil < -0.02f)
-    g->gun_recoil = -0.02f;
-  if (g->gun_recoil > 0.09f)
-    g->gun_recoil = 0.09f;
+  g->gun_recoil = clamp_float(g->gun_recoil, -0.02f, 0.09f);
   if (fabsf(g->gun_recoil) < 0.0005f && fabsf(g->gun_recoil_velocity) < 0.005f)
     g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   // Muzzle flip lags the punch and recovers slower, like a wrist.
   g->gun_rise_velocity +=
       (-70.0f * g->gun_rise - 9.0f * g->gun_rise_velocity) * dt;
   g->gun_rise += g->gun_rise_velocity * dt;
-  if (g->gun_rise < -0.018f)
-    g->gun_rise = -0.018f;
-  if (g->gun_rise > 0.085f)
-    g->gun_rise = 0.085f;
+  g->gun_rise = clamp_float(g->gun_rise, -0.018f, 0.085f);
   if (fabsf(g->gun_rise) < 0.0005f && fabsf(g->gun_rise_velocity) < 0.005f)
     g->gun_rise = g->gun_rise_velocity = 0.0f;
 }
@@ -1020,11 +1015,7 @@ static void render_frame(GameState *g, RenderTexture2D view,
   BeginMode3D(wcam);
   rlPushMatrix();
   f32 rise = g->gun_rise;
-  f32 b = g->aim_blend;
-  if (b < 0.0f)
-    b = 0.0f;
-  if (b > 1.0f)
-    b = 1.0f;
+  f32 b = clamp_float(g->aim_blend, 0.0f, 1.0f);
   f32 sway_scale = 1.0f - b * 0.75f;
   f32 reload_t =
       local_e != ECS_INVALID_ENTITY ? weapon_reload_progress(g, local_e) : 0.0f;
@@ -1114,7 +1105,7 @@ static void client_predict_weapon(GameState *g) {
   // Discrete weapon changes (fire / reload start / refill) advance prediction
   // ahead of the server by RTT. Record the input sequence that caused them so
   // snapshots can prove staleness via acknowledged_sequence instead of
-  // regressing (see predicted_is_stale). Cooldown/prev/timer countdowns are
+  // regressing (see sequence_newer). Cooldown/prev/timer countdowns are
   // deterministic or unsnapshotted and must NOT dirty (else every snapshot
   // would look stale).
   u8 before_ammo = g->weapon_ammo[e];

@@ -11,6 +11,7 @@
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +79,7 @@ enum NetPacketKind {
 #define BTN_JUMP 4u
 #define BTN_AIM 8u
 #define BTN_SPRINT 16u
+#define BTN_ALL (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM | BTN_SPRINT)
 
 // Weapon catalog: single source of truth for fire rate, mag size, reload and
 // recoil. To add a weapon, append a WeaponId and a WeaponDef entry; the
@@ -294,6 +296,10 @@ typedef struct NetInputPacket {
   i8 move_x, move_z;
   i16 aim_yaw, aim_pitch;
   u8 name[PLAYER_NAME_LENGTH];
+  // Explicit tail: struct would pad 21 -> 24 anyway. Named so
+  // initializers zero it deterministically (padding bytes would stay
+  // unspecified per C11 6.2.6.1p6). Always send zero, ignore on receive.
+  u8 reserved[3];
 } NetInputPacket;
 
 typedef struct NetEntity {
@@ -315,6 +321,8 @@ typedef struct NetChatPacket {
   u16 sequence;
   u8 name[PLAYER_NAME_LENGTH];
   u8 text[CHAT_LENGTH];
+  // Explicit tail: 33 -> 36. See NetInputPacket.reserved.
+  u8 reserved[3];
 } NetChatPacket;
 
 typedef struct NetSnapshot {
@@ -324,6 +332,39 @@ typedef struct NetSnapshot {
   NetEntity entities[NET_ENTITY_LIMIT];
   u8 names[MAX_PLAYERS][PLAYER_NAME_LENGTH];
 } NetSnapshot;
+
+// Dense snapshot wire format: 12-byte header + count * 26-byte entities +
+// 40-byte names. Max 884 bytes at 32 entities, typically 286 (8 cubes +
+// 1 player). Zero-filling of unused slots never hits the wire.
+#define NET_SNAPSHOT_HEADER_SIZE 12
+#define NET_SNAPSHOT_NAMES_SIZE (MAX_PLAYERS * PLAYER_NAME_LENGTH)
+#define NET_MAX_DATAGRAM sizeof(NetSnapshot)
+#define NET_INPUT_WIRE_SIZE sizeof(NetInputPacket)
+#define NET_CHAT_WIRE_SIZE sizeof(NetChatPacket)
+#define NET_OFF_COUNT 3
+
+_Static_assert(sizeof(NetEntity) == 26, "NetEntity wire size changed");
+_Static_assert(sizeof(NetInputPacket) == 24, "NetInputPacket padding changed");
+_Static_assert(sizeof(NetChatPacket) == 36, "NetChatPacket padding changed");
+_Static_assert(offsetof(NetInputPacket, name) == 16, "input name offset moved");
+_Static_assert(offsetof(NetInputPacket, reserved) == 21, "input tail moved");
+_Static_assert(offsetof(NetChatPacket, name) == 10, "chat name offset moved");
+_Static_assert(offsetof(NetChatPacket, text) == 15, "chat text offset moved");
+_Static_assert(offsetof(NetChatPacket, reserved) == 33, "chat tail moved");
+_Static_assert(offsetof(NetSnapshot, entities) == NET_SNAPSHOT_HEADER_SIZE,
+               "snapshot header has padding");
+_Static_assert(sizeof(NetSnapshot) ==
+                   NET_SNAPSHOT_HEADER_SIZE +
+                       NET_ENTITY_LIMIT * sizeof(NetEntity) +
+                       NET_SNAPSHOT_NAMES_SIZE,
+               "snapshot has trailing padding");
+
+static i32 net_snapshot_wire_size(u8 count) {
+  if (count > NET_ENTITY_LIMIT)
+    return -1;
+  return (i32)(NET_SNAPSHOT_HEADER_SIZE +
+               (i32)count * (i32)sizeof(NetEntity) + NET_SNAPSHOT_NAMES_SIZE);
+}
 
 #define ECS_MAX_ENTITIES 32u
 #define ECS_MAX_COMPONENTS 9u
@@ -1011,12 +1052,9 @@ static void socket_nonblocking(int fd) {
     (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// packet validation
-
-static bool net_magic_ok(const u8 *buf, i32 n) {
-  return n >= 2 && buf[0] == NET_MAGIC;
-}
-
+// Packet framing (exact size + magic + type). Semantic checks live in
+// net_validate_*_fields. All decoders zero-fill *out and copy field-wise,
+// so wire padding never propagates and struct padding never leaks.
 static bool net_packet_ok(const u8 *buf, i32 n, u8 type, i32 size) {
   return n == size && n >= 2 && buf[0] == NET_MAGIC && buf[1] == type;
 }
@@ -1049,10 +1087,125 @@ static bool net_validate_snapshot_fields(const NetSnapshot *snap,
                                          u16 last_tick) {
   if (snap->count > NET_ENTITY_LIMIT)
     return false;
+  if (snap->local_player != NET_PACKET_NONE &&
+      snap->local_player >= MAX_PLAYERS)
+    return false;
   if (snap->session != expected_session)
     return false;
   if (!net_seq_fresh(snap->tick, got, last_tick))
     return false;
+  return true;
+}
+
+// Framing check for a dense snapshot: exact size for the claimed count.
+static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
+  if (!buf || n < 4 || buf[0] != NET_MAGIC ||
+      buf[1] != NET_PACKET_SNAPSHOT)
+    return false;
+  u8 count = buf[NET_OFF_COUNT];
+  if (count > NET_ENTITY_LIMIT)
+    return false;
+  i32 want = net_snapshot_wire_size(count);
+  return want >= 0 && n == want && (size_t)n <= sizeof(NetSnapshot);
+}
+
+static void net_write_snapshot_header(u8 *out, const NetSnapshot *snap) {
+  out[0] = snap->magic;
+  out[1] = snap->type;
+  out[2] = snap->local_player;
+  out[3] = snap->count;
+  memcpy(out + 4, &snap->session, sizeof(snap->session));
+  memcpy(out + 8, &snap->tick, sizeof(snap->tick));
+  memcpy(out + 10, &snap->acknowledged_sequence,
+         sizeof(snap->acknowledged_sequence));
+}
+
+static void net_read_snapshot_header(const u8 *buf, NetSnapshot *out) {
+  out->magic = buf[0];
+  out->type = buf[1];
+  out->local_player = buf[2];
+  out->count = buf[NET_OFF_COUNT];
+  memcpy(&out->session, buf + 4, sizeof(out->session));
+  memcpy(&out->tick, buf + 8, sizeof(out->tick));
+  memcpy(&out->acknowledged_sequence, buf + 10,
+         sizeof(out->acknowledged_sequence));
+}
+
+// Returns wire length, or -1 when count invalid / buffer too small.
+static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
+  if (!snap || !out || snap->count > NET_ENTITY_LIMIT)
+    return -1;
+  i32 want = net_snapshot_wire_size(snap->count);
+  if (want < 0 || out_cap < want)
+    return -1;
+  net_write_snapshot_header(out, snap);
+  if (snap->count > 0)
+    memcpy(out + NET_SNAPSHOT_HEADER_SIZE, snap->entities,
+           (size_t)snap->count * sizeof(NetEntity));
+  memcpy(out + NET_SNAPSHOT_HEADER_SIZE +
+             (size_t)snap->count * sizeof(NetEntity),
+         snap->names, NET_SNAPSHOT_NAMES_SIZE);
+  return want;
+}
+
+// Validates framing, then expands into a zero-filled struct.
+// Never partially fills *out. Semantic checks still need
+// net_validate_snapshot_fields.
+static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
+  if (!buf || !out || !net_snapshot_wire_ok(buf, n))
+    return false;
+  u8 count = buf[NET_OFF_COUNT];
+  *out = (NetSnapshot){0};
+  net_read_snapshot_header(buf, out);
+  out->count = count;
+  if (count > 0)
+    memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
+           (size_t)count * sizeof(NetEntity));
+  memcpy(out->names, buf + NET_SNAPSHOT_HEADER_SIZE +
+                         (size_t)count * sizeof(NetEntity),
+         NET_SNAPSHOT_NAMES_SIZE);
+  return true;
+}
+
+// Fixed-size decoders: exact-size framing + zero-fill + field copy.
+// Wire pad bytes are ignored, struct pad bytes stay zero.
+static bool net_input_decode(const u8 *buf, i32 n, NetInputPacket *out) {
+  if (!buf || !out || n != (i32)sizeof(NetInputPacket))
+    return false;
+  if (buf[0] != NET_MAGIC ||
+      (buf[1] != NET_PACKET_INPUT && buf[1] != NET_PACKET_DISCONNECT))
+    return false;
+  *out = (NetInputPacket){0};
+  out->magic = buf[0];
+  out->type = buf[1];
+  out->claimed_player = buf[2];
+  out->buttons = buf[3];
+  memcpy(&out->session, buf + 4, sizeof(out->session));
+  memcpy(&out->sequence, buf + 8, sizeof(out->sequence));
+  out->move_x = (i8)buf[10];
+  out->move_z = (i8)buf[11];
+  memcpy(&out->aim_yaw, buf + 12, sizeof(out->aim_yaw));
+  memcpy(&out->aim_pitch, buf + 14, sizeof(out->aim_pitch));
+  memcpy(out->name, buf + 16, PLAYER_NAME_LENGTH);
+  return true;
+}
+
+static bool net_chat_decode(const u8 *buf, i32 n, NetChatPacket *out) {
+  if (!buf || !out)
+    return false;
+  if (!net_packet_ok(buf, n, NET_PACKET_CHAT, (i32)sizeof(NetChatPacket)))
+    return false;
+  *out = (NetChatPacket){0};
+  out->magic = buf[0];
+  out->type = buf[1];
+  out->player = buf[2];
+  out->length = buf[3];
+  if (out->length > CHAT_LENGTH)
+    return false;
+  memcpy(&out->session, buf + 4, sizeof(out->session));
+  memcpy(&out->sequence, buf + 8, sizeof(out->sequence));
+  memcpy(out->name, buf + 10, PLAYER_NAME_LENGTH);
+  memcpy(out->text, buf + 10 + PLAYER_NAME_LENGTH, out->length);
   return true;
 }
 

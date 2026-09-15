@@ -32,6 +32,8 @@ static void movement_system(GameState *g) {
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q)) {
     u32 e = q.entity;
+    if (g->owner[e] >= MAX_PLAYERS)
+      continue;
     InputCommand *in = &g->input[g->owner[e]];
     f32 yaw = (f32)g->yaw[e] * DEG2RAD;
     f32 dx = (f32)in->move_z * sinf(yaw) - (f32)in->move_x * cosf(yaw);
@@ -78,6 +80,8 @@ static void aim_system(GameState *g) {
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
     u8 p = g->owner[q.entity];
+    if (p >= MAX_PLAYERS)
+      continue;
     g->yaw[q.entity] = wrap_degrees(g->input[p].aim_yaw);
     g->pitch[q.entity] = clamp_i16(g->input[p].aim_pitch, -75, 75);
   }
@@ -623,11 +627,15 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
 
 static void send_peer_snapshot(int fd, const Peer *peer,
                                const NetSnapshot *snap) {
+  u8 wire[NET_MAX_DATAGRAM];
+  i32 wire_len = net_snapshot_encode(snap, wire, (i32)sizeof(wire));
+  if (wire_len < 0)
+    return;
   struct sockaddr_in address = {.sin_family = AF_INET,
                                 .sin_addr.s_addr = peer->address,
                                 .sin_port = peer->port};
-  (void)sendto(fd, snap, sizeof(*snap), 0, (const struct sockaddr *)&address,
-               sizeof(address));
+  (void)sendto(fd, wire, (size_t)wire_len, 0,
+               (const struct sockaddr *)&address, sizeof(address));
 }
 
 static int find_peer_session(const GameState *g, u32 session) {
@@ -707,8 +715,12 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
 }
 
 static void remove_peer(GameState *g, int peer_index) {
+  if (peer_index < 0 || peer_index >= MAX_PLAYERS)
+    return;
   Peer *peer = &g->peers[peer_index];
   u8 player = peer->player;
+  if (player >= MAX_PLAYERS)
+    return;
   u32 e = g->player_entity[player];
   if (e != NET_PACKET_NONE && ecs_alive(&g->ecs, e))
     ecs_destroy(&g->ecs, e);
@@ -721,106 +733,132 @@ static void remove_peer(GameState *g, int peer_index) {
 }
 
 static void server_relay_chat(GameState *g, int fd, int sender,
-                              NetChatPacket *packet) {
-  packet->player = g->peers[sender].player;
-  packet->sequence = g->next_chat_sequence++;
-  String src = game_player_name(g, packet->player);
-  memcpy(packet->name, src.items, PLAYER_NAME_LENGTH);
+                              const NetChatPacket *received) {
+  if (sender < 0 || sender >= MAX_PLAYERS || !g->peers[sender].active ||
+      g->peers[sender].player >= MAX_PLAYERS)
+    return;
+  // Rebuild: never reflect sender-controlled player/sequence.
+  if (received->length > CHAT_LENGTH)
+    return;
+  NetChatPacket out = {
+      .magic = NET_MAGIC,
+      .type = NET_PACKET_CHAT,
+      .player = g->peers[sender].player,
+      .length = received->length,
+      .sequence = g->next_chat_sequence++,
+  };
+  String src = game_player_name(g, out.player);
+  memcpy(out.name, src.items, PLAYER_NAME_LENGTH);
+  memcpy(out.text, received->text, out.length);
   for (int i = 0; i < MAX_PLAYERS; ++i) {
     if (!g->peers[i].active)
       continue;
     struct sockaddr_in address = {.sin_family = AF_INET,
                                   .sin_addr.s_addr = g->peers[i].address,
                                   .sin_port = g->peers[i].port};
-    packet->session = g->peers[i].session;
-    (void)sendto(fd, packet, sizeof(*packet), 0,
+    out.session = g->peers[i].session;
+    (void)sendto(fd, &out, sizeof(out), 0,
                  (const struct sockaddr *)&address, sizeof(address));
   }
 }
 
+static void server_handle_chat(GameState *g, int fd,
+                                 const struct sockaddr_in *from,
+                                 NetChatPacket *packet) {
+  int pi = find_peer_session(g, packet->session);
+  if (pi < 0 || pi >= MAX_PLAYERS)
+    return;
+  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH,
+                  PLAYER_NAME_LENGTH};
+  Peer *peer = &g->peers[pi];
+  if (peer->player >= MAX_PLAYERS)
+    return;
+  if (!net_validate_chat_fields(wname, packet->length, packet->sequence,
+                                peer->got_chat_sequence != 0,
+                                peer->last_chat_sequence))
+    return;
+  peer->got_chat_sequence = 1;
+  peer->last_chat_sequence = packet->sequence;
+  peer->last_seen = g->tick;
+  peer->address = from->sin_addr.s_addr;
+  peer->port = from->sin_port;
+  String text = {packet->text, packet->length, CHAT_LENGTH};
+  net_sanitize_chat_text(text);
+  server_relay_chat(g, fd, pi, packet);
+}
+
+static void server_handle_input(GameState *g, int fd,
+                                const struct sockaddr_in *from,
+                                const NetInputPacket *packet) {
+  (void)fd;
+  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH,
+                  PLAYER_NAME_LENGTH};
+  if (!net_validate_input_fields(packet->session, wname))
+    return;
+  int pi = find_peer_session(g, packet->session);
+  if (packet->type == NET_PACKET_DISCONNECT) {
+    if (pi >= 0 && pi < MAX_PLAYERS) {
+      String have = game_player_name(g, (u32)pi);
+      if (string_eq(have, wname))
+        remove_peer(g, pi);
+    }
+    return;
+  }
+  if (pi < 0) {
+    if (packet->claimed_player != NET_PACKET_NONE ||
+        session_was_retired(g, packet->session))
+      return;
+    pi = add_peer(g, from, packet->session, wname);
+    if (pi < 0)
+      return;
+  }
+  if (pi < 0 || pi >= MAX_PLAYERS)
+    return;
+  Peer *peer = &g->peers[pi];
+  if (peer->player >= MAX_PLAYERS)
+    return;
+  String have = game_player_name(g, peer->player);
+  if (!string_eq(have, wname) || (packet->claimed_player != NET_PACKET_NONE &&
+                                  packet->claimed_player != peer->player))
+    return;
+  if (!net_seq_fresh(packet->sequence, peer->got_sequence != 0,
+                     peer->last_sequence))
+    return;
+  peer->got_sequence = 1;
+  peer->last_sequence = packet->sequence;
+  peer->last_seen = g->tick;
+  peer->address = from->sin_addr.s_addr;
+  peer->port = from->sin_port;
+  g->input[peer->player].move_x = clamp_i16(packet->move_x, -1, 1);
+  g->input[peer->player].move_z = clamp_i16(packet->move_z, -1, 1);
+  g->input[peer->player].aim_yaw = wrap_degrees(packet->aim_yaw);
+  g->input[peer->player].aim_pitch = clamp_i16(packet->aim_pitch, -75, 75);
+  g->input[peer->player].buttons = packet->buttons & BTN_ALL;
+}
+
 static void server_receive(GameState *g, int fd) {
-  u8 buf[sizeof(NetSnapshot)];
+  u8 buf[NET_MAX_DATAGRAM];
   for (;;) {
     struct sockaddr_in from;
     socklen_t from_size = sizeof(from);
-    ssize_t n =
+    ssize_t raw =
         recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_size);
-    if (n < 0)
+    if (raw < 0)
       return;
-    if (!net_magic_ok(buf, (i32)n))
+    if (raw == 0 || raw > (ssize_t)sizeof(buf))
       continue;
-    if (net_packet_ok(buf, (i32)n, NET_PACKET_CHAT,
-                      (i32)sizeof(NetChatPacket))) {
-      NetChatPacket packet;
-      memcpy(&packet, buf, sizeof(packet));
-      int pi = find_peer_session(g, packet.session);
-      if (pi < 0)
-        continue;
-      String wname = {(u8 *)packet.name, PLAYER_NAME_LENGTH,
-                      PLAYER_NAME_LENGTH};
-      Peer *peer = &g->peers[pi];
-      if (!net_validate_chat_fields(wname, packet.length, packet.sequence,
-                                    peer->got_chat_sequence != 0,
-                                    peer->last_chat_sequence))
-        continue;
-      peer->got_chat_sequence = 1;
-      peer->last_chat_sequence = packet.sequence;
-      peer->last_seen = g->tick;
-      peer->address = from.sin_addr.s_addr;
-      peer->port = from.sin_port;
-      String text = {packet.text, packet.length, CHAT_LENGTH};
-      net_sanitize_chat_text(text);
-      server_relay_chat(g, fd, pi, &packet);
+    i32 n = (i32)raw;
+    NetChatPacket chat;
+    if (net_chat_decode(buf, n, &chat)) {
+      server_handle_chat(g, fd, &from, &chat);
       continue;
     }
-    if (!net_packet_ok(buf, (i32)n, NET_PACKET_INPUT,
-                       (i32)sizeof(NetInputPacket)) &&
-        !net_packet_ok(buf, (i32)n, NET_PACKET_DISCONNECT,
-                       (i32)sizeof(NetInputPacket)))
-      continue;
-    NetInputPacket packet;
-    memcpy(&packet, buf, sizeof(packet));
-    u32 session = packet.session;
-    String wname = {(u8 *)packet.name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
-    if (!net_validate_input_fields(session, wname))
-      continue;
-    int pi = find_peer_session(g, session);
-    if (buf[1] == NET_PACKET_DISCONNECT) {
-      if (pi >= 0) {
-        String have = game_player_name(g, (u32)pi);
-        if (string_eq(have, wname))
-          remove_peer(g, pi);
-      }
+    NetInputPacket input;
+    if (net_input_decode(buf, n, &input)) {
+      server_handle_input(g, fd, &from, &input);
       continue;
     }
-    if (pi < 0) {
-      if (packet.claimed_player != NET_PACKET_NONE ||
-          session_was_retired(g, session))
-        continue;
-      pi = add_peer(g, &from, session, wname);
-      if (pi < 0)
-        continue;
-    }
-    Peer *peer = &g->peers[pi];
-    String have = game_player_name(g, peer->player);
-    if (!string_eq(have, wname) || (packet.claimed_player != NET_PACKET_NONE &&
-                                    packet.claimed_player != peer->player))
-      continue;
-    u16 seq = packet.sequence;
-    if (!net_seq_fresh(seq, peer->got_sequence != 0, peer->last_sequence))
-      continue;
-    peer->got_sequence = 1;
-    peer->last_sequence = seq;
-    peer->last_seen = g->tick;
-    peer->address = from.sin_addr.s_addr;
-    peer->port = from.sin_port;
-    g->input[peer->player].move_x = clamp_i16(packet.move_x, -1, 1);
-    g->input[peer->player].move_z = clamp_i16(packet.move_z, -1, 1);
-    g->input[peer->player].aim_yaw = wrap_degrees(packet.aim_yaw);
-    g->input[peer->player].aim_pitch = clamp_i16(packet.aim_pitch, -75, 75);
-    g->input[peer->player].buttons =
-        packet.buttons &
-        (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM | BTN_SPRINT);
+    // Drop malformed datagrams.
   }
 }
 
@@ -834,7 +872,7 @@ static void server_expire_peers(GameState *g) {
 static void server_send_all(GameState *g, int fd) {
   NetSnapshot snap;
   for (int i = 0; i < MAX_PLAYERS; ++i) {
-    if (!g->peers[i].active)
+    if (!g->peers[i].active || g->peers[i].player >= MAX_PLAYERS)
       continue;
     u16 ack = g->peers[i].got_sequence ? g->peers[i].last_sequence : 0;
     write_snapshot(g, &snap, g->peers[i].player, ack, g->peers[i].session);

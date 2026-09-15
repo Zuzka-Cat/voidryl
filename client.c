@@ -65,6 +65,8 @@ static void renew_client_session(GameState *g) {
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
+  if (server_entity >= ECS_MAX_ENTITIES)
+    return ECS_INVALID_ENTITY;
   u8 local = g->network_entity[server_entity];
   if (local != NET_PACKET_NONE && ecs_alive(&g->ecs, local) &&
       ecs_has(&g->ecs, local, COMP_NETWORKED) && g->kind[local] == kind)
@@ -72,8 +74,8 @@ static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
   if (local != NET_PACKET_NONE && ecs_alive(&g->ecs, local))
     ecs_destroy(&g->ecs, local);
   u32 e = ecs_create(&g->ecs);
-  if (e == ECS_INVALID_ENTITY)
-    return e;
+  if (e == ECS_INVALID_ENTITY || e >= ECS_MAX_ENTITIES)
+    return ECS_INVALID_ENTITY;
   g->network_entity[server_entity] = (u8)e;
   for (u32 c = 0; c < ECS_MAX_COMPONENTS; ++c)
     ecs_remove(&g->ecs, e, c);
@@ -123,6 +125,8 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   for (u8 i = 0; i < snap->count; ++i) {
     const NetEntity *w = &snap->entities[i];
     if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_CASING)
+      continue;
+    if (w->owner >= MAX_PLAYERS)
       continue;
     g->snapshot_seen |= UINT32_C(1) << w->entity;
     u8 mapped = g->network_entity[w->entity];
@@ -205,10 +209,10 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
 }
 
 static void client_receive(GameState *g, int fd) {
-  u8 buf[sizeof(NetSnapshot)];
+  u8 buf[NET_MAX_DATAGRAM];
   for (;;) {
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n < 0) {
+    ssize_t raw = recv(fd, buf, sizeof(buf), 0);
+    if (raw < 0) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         if (g->connected)
           notice_set(g, STR("DROPPED"));
@@ -216,31 +220,28 @@ static void client_receive(GameState *g, int fd) {
       }
       return;
     }
-    if (!net_magic_ok(buf, (i32)n) || (size_t)n > sizeof(NetSnapshot))
+    if (raw == 0 || raw > (ssize_t)sizeof(buf))
       continue;
-    if (net_packet_ok(buf, (i32)n, NET_PACKET_CHAT,
-                      (i32)sizeof(NetChatPacket))) {
-      NetChatPacket packet;
-      memcpy(&packet, buf, sizeof(packet));
-      String wname = {(u8 *)packet.name, PLAYER_NAME_LENGTH,
+    i32 n = (i32)raw;
+    NetChatPacket chat;
+    if (net_chat_decode(buf, n, &chat)) {
+      String wname = {(u8 *)chat.name, PLAYER_NAME_LENGTH,
                       PLAYER_NAME_LENGTH};
-      if (packet.session != g->session)
+      if (chat.session != g->session)
         continue;
-      if (!net_validate_chat_fields(wname, packet.length, packet.sequence,
+      if (!net_validate_chat_fields(wname, chat.length, chat.sequence,
                                     g->got_chat_sequence != 0,
                                     g->last_chat_sequence))
         continue;
       g->got_chat_sequence = 1;
-      g->last_chat_sequence = packet.sequence;
-      String text = {packet.text, packet.length, CHAT_LENGTH};
+      g->last_chat_sequence = chat.sequence;
+      String text = {chat.text, chat.length, CHAT_LENGTH};
       notice_chat_msg(g, wname, text);
       continue;
     }
-    if (!net_packet_ok(buf, (i32)n, NET_PACKET_SNAPSHOT,
-                       (i32)sizeof(NetSnapshot)))
-      continue;
     NetSnapshot snap;
-    memcpy(&snap, buf, sizeof(snap));
+    if (!net_snapshot_decode(buf, n, &snap))
+      continue;
     if (!net_validate_snapshot_fields(&snap, g->session, g->got_snapshot != 0,
                                       g->last_snapshot_tick))
       continue;
@@ -250,15 +251,16 @@ static void client_receive(GameState *g, int fd) {
 }
 
 static void client_send_input(GameState *g, int fd, u8 type) {
-  NetInputPacket packet = {.magic = NET_MAGIC,
-                           .type = type,
-                           .claimed_player = g->local_player,
-                           .session = g->session};
+  NetInputPacket packet = {
+      .magic = NET_MAGIC,
+      .type = type,
+      .claimed_player = g->local_player,
+      .session = g->session,
+  };
   String req = game_requested_name(g);
   memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
   if (type == NET_PACKET_INPUT) {
-    packet.buttons = g->input[0].buttons & (BTN_FIRE | BTN_GRAB | BTN_JUMP |
-                                            BTN_AIM | BTN_SPRINT);
+    packet.buttons = g->input[0].buttons & BTN_ALL;
     packet.sequence = g->next_sequence++;
     packet.move_x = g->input[0].move_x;
     packet.move_z = g->input[0].move_z;
@@ -269,12 +271,16 @@ static void client_send_input(GameState *g, int fd, u8 type) {
 }
 
 static void client_send_chat(GameState *g, int fd) {
-  NetChatPacket packet = {.magic = NET_MAGIC,
-                          .type = NET_PACKET_CHAT,
-                          .player = g->local_player,
-                          .length = g->chat_length,
-                          .session = g->session,
-                          .sequence = g->next_chat_sequence++};
+  if (g->chat_length > CHAT_LENGTH)
+    return;
+  NetChatPacket packet = {
+      .magic = NET_MAGIC,
+      .type = NET_PACKET_CHAT,
+      .player = g->local_player,
+      .length = g->chat_length,
+      .session = g->session,
+      .sequence = g->next_chat_sequence++,
+  };
   String req = game_requested_name(g);
   String chat = game_chat_input(g);
   memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);

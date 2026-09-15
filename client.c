@@ -4,10 +4,28 @@
 #include "rlgl.h"
 #include "shared.c"
 
-static const Color PAL_DARK = {16, 8, 24, 255};
-static const Color PAL_PURPLE = {60, 30, 102, 255};
-static const Color PAL_MID = {155, 123, 208, 255};
-static const Color PAL_LIGHT = {246, 213, 232, 255};
+#define PAL_DARK ((Color){16, 8, 24, 255})
+#define PAL_PURPLE ((Color){60, 30, 102, 255})
+#define PAL_MID ((Color){155, 123, 208, 255})
+#define PAL_LIGHT ((Color){246, 213, 232, 255})
+
+#define VIEWMODEL_SCALE 1.35f
+#define P99_SIGHT_TIP ((Vector3){-0.32f, 0.098f, 0.48f})
+#define OUTLINE_WIRE_EXPAND 1.04f
+#define MARK_SPLAT_BASE 0.08f
+#define MARK_SPLAT_STEP 0.04f
+#define MARK_SPATTER_BASE 2
+#define MARK_SPATTER_LIFE 12
+#define MARK_SPATTER_LIFE_STEP 4
+#define MARK_DRAW_NUDGE 0.008f
+#define HELP_COL0_X 2
+#define HELP_COL1_X (LOGICAL_W / 2 + 1)
+#define HELP_TITLE_Y 3
+#define HELP_ROWS_Y 11
+#define HELP_ROW_DY 6
+#define HELP_KEY_ADV 24
+#define STAT_NUM_ADV 20
+#define STAT_UPDATE_DT 0.1
 
 static u32 local_player_entity(const GameState *g);
 
@@ -19,9 +37,8 @@ static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
       close(fd);
     return -1;
   }
-  *server = (struct sockaddr_in){.sin_family = AF_INET,
-                                 .sin_addr = address,
-                                 .sin_port = htons(port)};
+  *server = (struct sockaddr_in){
+      .sin_family = AF_INET, .sin_addr = address, .sin_port = htons(port)};
   if (connect(fd, (const struct sockaddr *)server, sizeof(*server)) < 0) {
     close(fd);
     return -1;
@@ -40,12 +57,6 @@ static void renew_client_session(GameState *g) {
   g->last_snapshot_tick = g->last_chat_sequence = 0;
   g->last_snapshot_ack = 0;
   g->snapshot_silence_ticks = 0;
-  // Proper world reset: a new session invalidates every server entity id,
-  // so drop the whole snapshot-driven world here. The world starts empty
-  // (client_init) and is rebuilt only by snapshots, which is also what
-  // fixes the old ghost-cube duplication at the root.
-  // Prediction metadata must reset too: old dirty seqs are in the previous
-  // session's ack domain and would falsely mark fresh snapshots stale.
   for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
     g->weapon_dirty_seq[e] = 0;
   client_clear_world(g);
@@ -57,13 +68,9 @@ static void renew_client_session(GameState *g) {
   g->screen_shake = 0.0f;
   g->walk_phase = 0.0f;
   g->walk_blend = 0.0f;
-  g->move_sway_x = 0.0f;
-  g->move_sway_z = 0.0f;
-  g->move_vel_x = 0.0f;
-  g->move_vel_z = 0.0f;
+  g->move_sway = (Vector2){0, 0};
+  g->move_vel = (Vector2){0, 0};
   g->sprint_blend = 0.0f;
-  // New session invalidates all outstanding sequence send times: acks from
-  // the next session live in a different sequence domain.
   memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
   g->ping.rtt_ms = 0.0;
   g->ping.have = 0;
@@ -120,10 +127,6 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   g->snapshot_seen = 0;
   g->local_player = snap->local_player;
   g->last_snapshot_tick = snap->tick;
-  // Source-level stale guard: the ack proves what the server had seen when
-  // this snapshot was taken. Predicted state below uses it (via
-  // weapon_dirty_seq + sequence_newer) instead of trusting the snapshot
-  // as current. Discarding it here is what caused the old mag-dump wipe.
   g->last_snapshot_ack = snap->acknowledged_sequence;
   g->connected = 1;
   g->snapshot_silence_ticks = 0;
@@ -141,28 +144,24 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
     if (e == ECS_INVALID_ENTITY)
       continue;
     i16 nx = w->x, ny = w->y, nz = w->z;
-    i16 dx = (i16)(nx - g->px[e]);
-    i16 dy = (i16)(ny - g->py[e]);
-    i16 dz = (i16)(nz - g->pz[e]);
+    i16 dx = (i16)(nx - g->pos[e].x);
+    i16 dy = (i16)(ny - g->pos[e].y);
+    i16 dz = (i16)(nz - g->pos[e].z);
     bool snap_pos =
         !had || abs(dx) > 240 || abs(dz) > 240 || dy > 48 || dy < -240;
-    g->vx[e] = snap_pos ? 0 : dx;
-    g->vy[e] = snap_pos ? 0 : dy;
-    g->vz[e] = snap_pos ? 0 : dz;
+    g->vel[e].x = snap_pos ? 0 : dx;
+    g->vel[e].y = snap_pos ? 0 : dy;
+    g->vel[e].z = snap_pos ? 0 : dz;
     if (had && w->kind == KIND_PLAYER) {
-      g->lag_yaw[e] = lag_encode(wrap_degrees(w->yaw - g->yaw[e]));
-      g->lag_pitch[e] = lag_encode((int)w->pitch - (int)g->pitch[e]);
+      g->lag[e].yaw = lag_encode(wrap_degrees(w->yaw - g->aim[e].yaw));
+      g->lag[e].pitch = lag_encode((int)w->pitch - (int)g->aim[e].pitch);
     } else if (w->kind == KIND_PLAYER) {
-      g->lag_yaw[e] = LAG_NEUTRAL;
-      g->lag_pitch[e] = LAG_NEUTRAL;
+      g->lag[e] = (LagAim){LAG_NEUTRAL, LAG_NEUTRAL};
     }
     g->kind[e] = w->kind;
     g->owner[e] = w->owner;
-    g->px[e] = nx;
-    g->py[e] = ny;
-    g->pz[e] = nz;
-    g->yaw[e] = w->yaw;
-    g->pitch[e] = w->pitch;
+    g->pos[e] = (IVec3){nx, ny, nz};
+    g->aim[e] = (Aim){w->yaw, w->pitch};
     g->flash[e] = w->flags;
     g->held_by[e] = w->extra;
     if (w->kind == KIND_CUBE)
@@ -172,24 +171,13 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
       g->weapon_id[e] = sid;
     }
     if (w->kind == KIND_PLAYER) {
-      // Predicted vs authoritative split (source fix): the local player's
-      // weapon is predicted (client_predict_weapon runs ahead by RTT), so it
-      // must reconcile via weapon_apply_snapshot (ack + monotonic + progress
-      // guards). Everything else on the local entity today is
-      // server-authoritative (no movement prediction: position/aim are
-      // snapshot-driven and interpolated), so direct overwrite is safe. If
-      // movement prediction is ever added, it must NOT overwrite here but
-      // reconcile like the weapon. Remotes are always authoritative.
       if (!had) {
-        weapon_set_from_snapshot(g, e, w->weapon, w->ammo,
-                                 w->reloading != 0);
-        // Fresh mapping: no unsynced local changes yet.
+        weapon_set_from_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0);
         g->weapon_dirty_seq[e] = snap->acknowledged_sequence;
       } else {
         weapon_apply_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0,
                               w->reload_q, snap->acknowledged_sequence);
       }
-      // Reload progress for the remote reload whip.
       g->r_reload[e] = w->reload_q;
     }
     add_kind_components(g, e, w->kind);
@@ -223,8 +211,7 @@ static void client_receive(GameState *g, int fd) {
     i32 n = (i32)raw;
     NetChatPacket chat;
     if (net_chat_decode(buf, n, &chat)) {
-      String wname = {(u8 *)chat.name, PLAYER_NAME_LENGTH,
-                      PLAYER_NAME_LENGTH};
+      String wname = {(u8 *)chat.name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
       if (chat.session != g->session)
         continue;
       if (!net_validate_chat_fields(wname, chat.length, chat.sequence,
@@ -243,8 +230,6 @@ static void client_receive(GameState *g, int fd) {
     if (!net_validate_snapshot_fields(&snap, g->session, g->got_snapshot != 0,
                                       g->last_snapshot_tick))
       continue;
-    // RTT sample: the ack proves the server had seen this input sequence.
-    // Look up when we sent it; smooth to keep the TAB readout readable.
     {
       u16 ack = snap.acknowledged_sequence;
       u32 slot = (u32)ack & PING_WINDOW_MASK;
@@ -283,9 +268,8 @@ static void client_send_input(GameState *g, int fd, u8 type) {
     packet.sequence = g->next_sequence++;
     packet.move_x = g->input[0].move_x;
     packet.move_z = g->input[0].move_z;
-    packet.aim_yaw = g->view_yaw;
-    packet.aim_pitch = g->view_pitch;
-    // Timestamp for TAB ping: slot by low bits, validated by full sequence.
+    packet.aim_yaw = g->view.yaw;
+    packet.aim_pitch = g->view.pitch;
     u32 slot = (u32)packet.sequence & PING_WINDOW_MASK;
     g->ping.send_time[slot] = hires_time_in_seconds();
     g->ping.send_seq[slot] = packet.sequence;
@@ -314,7 +298,7 @@ static void client_send_chat(GameState *g, int fd) {
 }
 
 static void update_input(GameState *g, int fd) {
-  g->look_delta_x = g->look_delta_y = 0.0f;
+  g->look_delta = (Vector2){0, 0};
   g->help = IsKeyDown(KEY_F1) ? 1u : 0u;
   if (g->help) {
     g->input[0].move_x = g->input[0].move_z = 0;
@@ -382,17 +366,15 @@ static void update_input(GameState *g, int fd) {
   if (!g->mouse_captured)
     return;
   Vector2 mouse = GetMouseDelta();
-  // ADS precision from the weapon config: slower, finer look while zoomed.
   u32 sens_e = local_player_entity(g);
-  u8 sens_wid = sens_e != ECS_INVALID_ENTITY ? g->weapon_id[sens_e] : WEAPON_P99;
+  u8 sens_wid =
+      sens_e != ECS_INVALID_ENTITY ? g->weapon_id[sens_e] : WEAPON_P99;
   f32 sens = aiming ? weapon_aim_sens_scale(sens_wid) : 1.0f;
-  f32 sdx = mouse.x * sens;
-  f32 sdy = mouse.y * sens;
-  g->look_delta_x = sdx;
-  g->look_delta_y = sdy;
-  g->view_yaw = wrap_degrees((int)g->view_yaw - (int)lroundf(sdx));
-  g->view_pitch =
-      (i16)clamp_int((int)g->view_pitch - (int)lroundf(sdy), -75, 75);
+  g->look_delta.x = mouse.x * sens;
+  g->look_delta.y = mouse.y * sens;
+  g->view.yaw = wrap_degrees((int)g->view.yaw - (int)lroundf(g->look_delta.x));
+  g->view.pitch = (i16)clamp_int(
+      (int)g->view.pitch - (int)lroundf(g->look_delta.y), -75, 75);
 }
 
 static u32 local_player_entity(const GameState *g) {
@@ -404,43 +386,26 @@ static u32 local_player_entity(const GameState *g) {
   return ECS_INVALID_ENTITY;
 }
 
-static f32 xf(u32 e, f32 a, const i16 *p, const i16 *d) {
-  return ((f32)p[e] - (f32)d[e] * (1.0f - a)) / (f32)POS_SCALE;
-}
-
-static Vector3 entity_pos(const GameState *g, u32 e, f32 a) {
-  return (Vector3){xf(e, a, g->px, g->vx), xf(e, a, g->py, g->vy),
-                   xf(e, a, g->pz, g->vz)};
-}
-
 static Camera3D make_camera(const GameState *g, f32 a) {
   u32 e = local_player_entity(g);
   Vector3 dir = {0.0f, 0.0f, 1.0f};
   u8 wid = e != ECS_INVALID_ENTITY ? g->weapon_id[e] : WEAPON_P99;
   f32 hip_fov = weapon_hip_fov(wid);
   f32 aim_fov = weapon_aim_fov(wid);
-  Camera3D cam = {.position = (Vector3){0.0f, 1.5f, 0.0f},
-                   .up = (Vector3){0.0f, 1.0f, 0.0f},
-                   .fovy = hip_fov,
-                   .projection = CAMERA_PERSPECTIVE};
+  Camera3D cam = {.position = (Vector3){0.0f, EYE_HEIGHT_M, 0.0f},
+                  .up = (Vector3){0.0f, 1.0f, 0.0f},
+                  .fovy = hip_fov,
+                  .projection = CAMERA_PERSPECTIVE};
   if (e != ECS_INVALID_ENTITY) {
-    Vector3 p = entity_pos(g, e, a);
-    cam.position = (Vector3){p.x, 1.5f + p.y, p.z};
-    aim_dir(g->view_yaw, g->view_pitch, &dir);
+    Vector3 p = entity_pos_m(g, e, a);
+    cam.position = player_eye_m(p);
+    dir = sight_dir((f32)g->view.yaw, (f32)g->view.pitch);
   }
   cam.fovy = hip_fov * (1.0f - g->aim_blend) + aim_fov * g->aim_blend;
-  cam.target = (Vector3){cam.position.x + dir.x, cam.position.y + dir.y,
-                          cam.position.z + dir.z};
+  cam.target = vec3_add(cam.position, dir);
   return cam;
 }
 
-// P99-only reload presentation. One configurable timer drives it: the anim
-// reads weapon_reload_progress (== reload_ticks), so count and motion can
-// never drift apart. Choreography over t in 0..1: smooth down (0-0.38),
-// brief hold/mag-out wait (to 0.58), quick forward thud/mag-slam (to 0.72),
-// then a snappy whip back with a whisper of overshoot past ready.
-// Never call this for another weapon id; each future gun gets its own
-// gun_reload_pose_<name>.
 static f32 reload_ss01(f32 x) {
   if (x <= 0.0f)
     return 0.0f;
@@ -474,18 +439,6 @@ static void gun_reload_pose_p99(f32 reload_t) {
   rlTranslatef(0.32f, 0.05f, -0.25f);
 }
 
-// Viewmodel scale shared by the draw call and the ADS solver below: one
-// source of truth, since the solver output is only exact for this scale.
-// P99 front-post tip in draw_gun_p99 local space. Must stay in sync with the
-// FS block below (center y 0.082 + half-height 0.016, x -0.32, z 0.48).
-static const f32 VIEWMODEL_SCALE = 1.35f;
-static const Vector3 P99_SIGHT_TIP = {-0.32f, 0.098f, 0.48f};
-
-// Solve the full-ADS translation T so the sight tip maps exactly to the
-// screen center. Rest pose is M = T * Rx(pitch) * Rz(roll) * S, so the tip
-// lands at T + Rx*Rz*S*tip; requiring x=y=0 gives T.xy = -(Rx*Rz*S*tip).xy.
-// This matches rlgl matrix order (verified against rlMatrixMultiply semantics
-// in rlgl.h) and the right-hand rule (positive pitch tips the muzzle down).
 static void ads_target_for_tip(const WeaponDef *def, Vector3 tip, f32 scale,
                                f32 *tx, f32 *ty) {
   f32 cr = cosf(def->ads_cant_deg * DEG2RAD);
@@ -500,31 +453,22 @@ static void ads_target_for_tip(const WeaponDef *def, Vector3 tip, f32 scale,
   *ty = -y2;
 }
 
-// Per-weapon ADS target dispatcher. To add a gun, define its sight-tip
-// constant + case here. No fallback: unknown ids hold hip pose (no zoom
-// shift), which reads as broken and forces adding the case.
 static void gun_ads_target(u8 wid, const WeaponDef *def, f32 *tx, f32 *ty) {
   switch (wid) {
   case WEAPON_P99:
     ads_target_for_tip(def, P99_SIGHT_TIP, VIEWMODEL_SCALE, tx, ty);
     break;
   default:
-    *tx = def->hip_off_x;
-    *ty = def->hip_off_y;
+    *tx = def->hip_off.x;
+    *ty = def->hip_off.y;
     break;
   }
 }
 
-// Wire outlines are drawn on a slightly expanded shell, never coplanar
-// with their fill faces. Coplanar RL_LINES z-fight with the faces and drop
-// out for a frame at a time whenever the camera or gun moves, which reads
-// as bright flicker around every outlined edge at this resolution.
-#define OUTLINE_WIRE_EXPAND 1.04f
-
 static void draw_box_wires(Vector3 p, Vector3 s, Color wire) {
-  DrawCubeWiresV(p, (Vector3){s.x * OUTLINE_WIRE_EXPAND,
-                              s.y * OUTLINE_WIRE_EXPAND,
-                              s.z * OUTLINE_WIRE_EXPAND},
+  DrawCubeWiresV(p,
+                 (Vector3){s.x * OUTLINE_WIRE_EXPAND, s.y * OUTLINE_WIRE_EXPAND,
+                           s.z * OUTLINE_WIRE_EXPAND},
                  wire);
 }
 
@@ -533,51 +477,35 @@ static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
   rlPushMatrix();
   rlScalef(scale, scale, scale);
   gun_reload_pose_p99(reload_t);
-  // Slide-only recoil: the top slide snaps back sharply (recoil+slide) while
-  // the frame/grip/trigger stay with a much smaller damped push, so the
-  // cycling top half reads separately from the lower half like a real P99.
   f32 slide_off = recoil + slide;
   f32 frame_off = recoil * 0.6f;
   f32 grip_off = recoil * 0.5f;
-  // Top slide (narrow P99 slide, rides full slide_off).
   Vector3 sl = {-0.32f, 0.02f, 0.30f - slide_off};
   Vector3 sls = {0.14f, 0.10f, 0.48f};
   DrawCubeV(sl, sls, PAL_MID);
   draw_box_wires(sl, sls, PAL_DARK);
-  // Lower frame / dust cover (static with frame_off, never with slide).
-  // Full slide thickness; only the grip below stays slim. Rear end flush
-  // with the slide rear (0.06) so no gap shows at the back.
   Vector3 fr = {-0.32f, -0.055f, 0.275f - frame_off};
   Vector3 frs = {0.14f, 0.05f, 0.43f};
   DrawCubeV(fr, frs, PAL_PURPLE);
   draw_box_wires(fr, frs, PAL_DARK);
-  // P99 grip: slim.
   Vector3 gr = {-0.32f, -0.20f, 0.14f - grip_off};
   Vector3 grs = {0.10f, 0.28f, 0.13f};
   DrawCubeV(gr, grs, PAL_PURPLE);
   draw_box_wires(gr, grs, PAL_DARK);
-  // Trigger guard (thin U below the frame, rides frame only).
   Vector3 gb = {-0.32f, -0.125f, 0.30f - frame_off};
   DrawCubeV(gb, (Vector3){0.02f, 0.015f, 0.22f}, PAL_DARK);
   Vector3 gf = {-0.32f, -0.095f, 0.40f - frame_off};
   DrawCubeV(gf, (Vector3){0.02f, 0.06f, 0.02f}, PAL_DARK);
   Vector3 grr = {-0.32f, -0.095f, 0.20f - frame_off};
   DrawCubeV(grr, (Vector3){0.02f, 0.06f, 0.02f}, PAL_DARK);
-  // Trigger blade inside the guard.
   DrawCubeV((Vector3){-0.32f, -0.085f, 0.28f - frame_off},
             (Vector3){0.018f, 0.05f, 0.018f}, PAL_DARK);
-  // Ejection port cut on the top-right of the slide (rides the slide, marks
-  // where brass exits above the trigger guard). Screen-right is -X, so the
-  // right edge of the slide is the more negative X.
   DrawCubeV((Vector3){-0.385f, 0.045f, 0.18f - slide_off},
             (Vector3){0.012f, 0.025f, 0.14f}, PAL_DARK);
-  // Rear slide serrations (two grooves, ride the slide so motion reads).
   DrawCubeV((Vector3){-0.32f, 0.02f, 0.10f - slide_off},
             (Vector3){0.145f, 0.06f, 0.015f}, PAL_DARK);
   DrawCubeV((Vector3){-0.32f, 0.02f, 0.135f - slide_off},
             (Vector3){0.145f, 0.06f, 0.015f}, PAL_DARK);
-  // Sights: lowered rear notch pair + front post. All three ride the slide.
-  // Rear tops now sit just above the slide instead of towering over it.
   f32 sz = -slide_off;
   Vector3 rss = {0.022f, 0.028f, 0.04f};
   Vector3 rl = {-0.375f, 0.080f, 0.09f + sz};
@@ -597,9 +525,6 @@ static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
   rlPopMatrix();
 }
 
-// Fallback for unknown/future weapon ids: plain housing, deliberately no
-// P99 whip. Add draw_gun_<name> + gun_reload_pose_<name> and wire them into
-// draw_gun_local instead of reusing the P99 animation.
 static void draw_gun_fallback(f32 recoil, f32 slide, f32 scale, bool firing) {
   (void)firing;
   rlPushMatrix();
@@ -613,11 +538,6 @@ static void draw_gun_fallback(f32 recoil, f32 slide, f32 scale, bool firing) {
   rlPopMatrix();
 }
 
-// Per-weapon viewmodel dispatcher. To add a gun (e.g. P90), add a WeaponId +
-// WeaponDef entry (FOV/spread/sens) plus one SHELL_DEFS line for its brass,
-// write draw_gun_p90 + gun_reload_pose_p90, add a case below and a sight-tip
-// case in gun_ads_target. Game logic stays in shared.c; unknown ids fall
-// back to the plain housing and never play the P99 whip.
 static void draw_gun_local(u8 weapon_id, f32 recoil, f32 slide, f32 scale,
                            bool firing, f32 reload_t) {
   switch (weapon_id) {
@@ -639,38 +559,26 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool hurt = g->flash[e] > PLAYER_FIRE_FLASH_TICKS;
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
-  // Smooth look with the position alpha so body and gun glide together.
-  f32 yaw_r =
-      present_lerp_angle(g->yaw[e], lag_decode(g->lag_yaw[e]), a);
+  f32 yaw_r = present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
   f32 pitch_r =
-      present_lerp_angle(g->pitch[e], lag_decode(g->lag_pitch[e]), a);
-  f32 reload_t = g->r_reload[e] == 0
-                     ? 0.0f
-                     : (f32)(g->r_reload[e] - 1) / 254.0f;
+      present_lerp_angle(g->aim[e].pitch, lag_decode(g->lag[e].pitch), a);
+  f32 reload_t =
+      g->r_reload[e] == 0 ? 0.0f : (f32)(g->r_reload[e] - 1) / 254.0f;
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
   rlRotatef(yaw_r, 0.0f, 1.0f, 0.0f);
-  draw_cube_lit((Vector3){0.0f, 0.72f, 0.0f}, (Vector3){0.50f, 1.36f, 0.30f},
-                body);
-  draw_cube_lit((Vector3){0.0f, 1.44f, 0.06f}, (Vector3){0.26f, 0.26f, 0.26f},
+  draw_cube_lit((Vector3){0.0f, PLAYER_BODY_Y * 0.5f, 0.0f},
+                (Vector3){PLAYER_BODY_X, PLAYER_BODY_Y, PLAYER_BODY_Z}, body);
+  draw_cube_lit((Vector3){0.0f, PLAYER_HEAD_Y, 0.06f},
+                (Vector3){PLAYER_HEAD_S, PLAYER_HEAD_S, PLAYER_HEAD_S},
                 hurt ? PAL_LIGHT : PAL_PURPLE);
   rlPopMatrix();
-  // Hip carry on the shooter's right, converged onto the sight ray at the
-  // true eye-ray distance: clearly beside the torso, yet the muzzle axis
-  // meets the crosshair — aiming at a head reads as pointing at it at any
-  // range. Closed-form tracking of a smoothed distance, so nothing snaps.
-  Vector3 feet = {pos.x, pos.y, pos.z};
-  Vector3 eye = {pos.x, pos.y + EYE_HEIGHT_M, pos.z};
-  Vector3 f = sight_dir(yaw_r, pitch_r);
-  f32 zero = sight_zero_m(g, e, eye, f);
-  Vector3 gp;
-  f32 gyaw, gpitch;
-  sight_gun_pose_m(feet, yaw_r, pitch_r, zero, &gp, &gyaw, &gpitch);
+  GunPose gp = player_gun_pose(g, e, pos, yaw_r, pitch_r, a);
   rlPushMatrix();
-  rlTranslatef(gp.x, gp.y, gp.z);
-  rlRotatef(gyaw, 0.0f, 1.0f, 0.0f);
-  rlRotatef(-gpitch, 1.0f, 0.0f, 0.0f);
+  rlTranslatef(gp.origin.x, gp.origin.y, gp.origin.z);
+  rlRotatef(gp.yaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-gp.pitch, 1.0f, 0.0f, 0.0f);
   rlTranslatef(GUN_CENTER_X_M, 0.0f, 0.0f);
   draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
                  reload_t);
@@ -690,10 +598,6 @@ static Color shell_pal_color(u8 idx) {
   }
 }
 
-// Per-gun casing renderer. Size/rim come from SHELL_DEFS via weapon_id,
-// so a new gun's shells need only one more SHELL_DEFS line. The dark outer
-// sleeve is a readability outline; the inner + rim carry the per-shell
-// palette.
 static void draw_casing(const GameState *g, u32 e, Vector3 p) {
   u8 sid = g->weapon_id[e] < WEAPON_COUNT ? g->weapon_id[e] : WEAPON_P99;
   const ShellDef *sh = shell_def(sid);
@@ -705,27 +609,18 @@ static void draw_casing(const GameState *g, u32 e, Vector3 p) {
   f32 roll = (f32)g->held_by[e] * (360.0f / 256.0f);
   rlPushMatrix();
   rlTranslatef(p.x, p.y, p.z);
-  rlRotatef((f32)g->yaw[e], 0.0f, 1.0f, 0.0f);
-  rlRotatef((f32)g->pitch[e], 1.0f, 0.0f, 0.0f);
+  rlRotatef((f32)g->aim[e].yaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef((f32)g->aim[e].pitch, 1.0f, 0.0f, 0.0f);
   rlRotatef(roll, 0.0f, 0.0f, 1.0f);
   DrawCylinderEx((Vector3){0.0f, -half * 1.06f, 0.0f},
-                 (Vector3){0.0f, half * 1.06f, 0.0f}, rim * 1.08f,
-                 rad * 1.08f, 6, PAL_DARK);
-  DrawCylinderEx((Vector3){0.0f, -half, 0.0f}, (Vector3){0.0f, half, 0.0f},
-                 rad, rad * 0.92f, 6, body);
+                 (Vector3){0.0f, half * 1.06f, 0.0f}, rim * 1.08f, rad * 1.08f,
+                 6, PAL_DARK);
+  DrawCylinderEx((Vector3){0.0f, -half, 0.0f}, (Vector3){0.0f, half, 0.0f}, rad,
+                 rad * 0.92f, 6, body);
   DrawCylinderEx((Vector3){0.0f, -half * 1.06f, 0.0f},
                  (Vector3){0.0f, -half * 0.72f, 0.0f}, rim, rim, 6, rimc);
   rlPopMatrix();
 }
-
-// Impact marks: one small flat black 2D splat on the hit face (strength-
-// sized, 1-N px radius) plus material-colored spatter along the reflection.
-// No 3D cube, no second blotch.
-#define MARK_SPLAT_BASE 0.08f
-#define MARK_SPLAT_STEP 0.04f
-#define MARK_SPATTER_BASE 2
-#define MARK_SPATTER_LIFE 12
-#define MARK_SPATTER_LIFE_STEP 4
 
 static void mark_basis(Vector3 n, Vector3 *u, Vector3 *v) {
   if (n.y != 0.0f) {
@@ -740,7 +635,6 @@ static void mark_basis(Vector3 n, Vector3 *u, Vector3 *v) {
   }
 }
 
-// Flat quad, drawn double-sided so the splat reads from any view angle.
 static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size) {
   f32 h = size * 0.5f;
   Vector3 a = {c.x + (u.x + v.x) * h, c.y + (u.y + v.y) * h,
@@ -757,24 +651,11 @@ static void draw_mark_quad(Vector3 c, Vector3 u, Vector3 v, f32 size) {
   DrawTriangle3D(a, d, cc, PAL_DARK);
 }
 
-static Vector3 vcross(Vector3 a, Vector3 b) {
-  return (Vector3){a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
-                   a.x * b.y - a.y * b.x};
-}
-
-static Vector3 vnorm(Vector3 a) {
-  f32 l = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
-  if (l < 1e-6f)
-    return (Vector3){1.0f, 0.0f, 0.0f};
-  return (Vector3){a.x / l, a.y / l, a.z / l};
-}
-
-// Orthonormal pair around r for spreading the spatter cone.
 static void reflect_basis(Vector3 r, Vector3 *u, Vector3 *v) {
-  Vector3 ref =
-      fabsf(r.y) < 0.9f ? (Vector3){0.0f, 1.0f, 0.0f} : (Vector3){1.0f, 0.0f, 0.0f};
-  *u = vnorm(vcross(r, ref));
-  *v = vcross(r, *u);
+  Vector3 ref = fabsf(r.y) < 0.9f ? (Vector3){0.0f, 1.0f, 0.0f}
+                                  : (Vector3){1.0f, 0.0f, 0.0f};
+  *u = vec3_norm(vec3_cross(r, ref));
+  *v = vec3_cross(r, *u);
 }
 
 static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
@@ -786,26 +667,17 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
   Color mat = mark_ex_mat(ex) == MARK_MAT_MID ? PAL_MID : PAL_PURPLE;
   Vector3 u, v;
   mark_basis(n, &u, &v);
-  // Nudge off the face so the flat splat never z-fights the surface. The
-  // server already backs the contact point just off the face, so this stays
-  // tight on every solid (floor, cubes, players).
-  Vector3 c = {p.x + n.x * 0.012f, p.y + n.y * 0.012f, p.z + n.z * 0.012f};
-  // Random in-plane rotation per mark so the splat reads as spatter, not a
-  // stamp. Deterministic from the entity so it stays put while it lives.
+  Vector3 c = vec3_add(p, vec3_mul(n, MARK_DRAW_NUDGE));
   u32 seed = mix32((u32)e * 2654435761u + 7u);
   f32 ang = (f32)(seed % 360u) * DEG2RAD;
   f32 ca = cosf(ang), sa = sinf(ang);
   Vector3 ru = {u.x * ca + v.x * sa, u.y * ca + v.y * sa, u.z * ca + v.z * sa};
   Vector3 rv = {v.x * ca - u.x * sa, v.y * ca - u.y * sa, v.z * ca - u.z * sa};
   draw_mark_quad(c, ru, rv, MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str);
-  // Spatter in the impacted material's color, along the reflection of the
-  // incoming travel dir (yaw/pitch survive on the mark from the bullet).
-  // Mark lifetime ticks down every 2nd tick, so age back into tick units.
   Vector3 d;
-  aim_dir(g->yaw[e], g->pitch[e], &d);
-  float dn = d.x * n.x + d.y * n.y + d.z * n.z;
-  Vector3 r = {d.x - 2.0f * dn * n.x, d.y - 2.0f * dn * n.y,
-               d.z - 2.0f * dn * n.z};
+  aim_dir(g->aim[e].yaw, g->aim[e].pitch, &d);
+  float dn = vec3_dot(d, n);
+  Vector3 r = vec3_sub(d, vec3_mul(n, 2.0f * dn));
   Vector3 cu, cv;
   reflect_basis(r, &cu, &cv);
   int age = (IMPACT_MARK_LIFETIME_TICKS - (int)g->lifetime[e]) * 2;
@@ -815,16 +687,15 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
     f32 fade = 1.0f - (f32)age / (f32)life;
     int count = MARK_SPATTER_BASE + (int)str;
     for (int i = 0; i < count; ++i) {
-      u32 h = mix32(seed + (u32)i * 2246822519u);
-      f32 a = ((f32)(h % 100u) / 100.0f - 0.5f) * 0.9f;
-      f32 b = ((f32)((h >> 7) % 100u) / 100.0f - 0.5f) * 0.9f;
-      Vector3 dir = vnorm((Vector3){r.x + cu.x * a + cv.x * b,
-                                    r.y + cu.y * a + cv.y * b,
-                                    r.z + cu.z * a + cv.z * b});
-      f32 sp = 1.0f + (f32)((h >> 14) % 100u) / 100.0f * 2.0f;
+      u32 hh = mix32(seed + (u32)i * 2246822519u);
+      f32 aa = ((f32)(hh % 100u) / 100.0f - 0.5f) * 0.9f;
+      f32 bb = ((f32)((hh >> 7) % 100u) / 100.0f - 0.5f) * 0.9f;
+      Vector3 dir =
+          vec3_norm(vec3_add(r, vec3_add(vec3_mul(cu, aa), vec3_mul(cv, bb))));
+      f32 sp = 1.0f + (f32)((hh >> 14) % 100u) / 100.0f * 2.0f;
       Vector3 dp = {c.x + dir.x * sp * t, c.y + dir.y * sp * t - 4.9f * t * t,
                     c.z + dir.z * sp * t};
-      f32 s = (0.030f + 0.010f * (f32)((h >> 21) & 3u)) * fade + 0.008f;
+      f32 s = (0.030f + 0.010f * (f32)((hh >> 21) & 3u)) * fade + 0.008f;
       DrawCubeV(dp, (Vector3){s, s, s}, mat);
     }
   }
@@ -835,11 +706,12 @@ static void draw_world(const GameState *g, f32 a) {
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    Vector3 p = entity_pos(g, e, a);
+    Vector3 p = entity_pos_m(g, e, a);
     switch (g->kind[e]) {
     case KIND_CUBE: {
       f32 s = scale_value(g, e);
-      draw_cube_lit(p, (Vector3){0.9f * s, 1.0f * s, 0.9f * s},
+      draw_cube_lit(p,
+                    (Vector3){CUBE_VIS_X * s, CUBE_VIS_Y * s, CUBE_VIS_Z * s},
                     g->held_by[e] ? PAL_LIGHT : PAL_MID);
       break;
     }
@@ -848,12 +720,9 @@ static void draw_world(const GameState *g, f32 a) {
         draw_remote_player(g, e, p, a);
       break;
     case KIND_BULLET: {
-      Vector3 dir;
-      aim_dir(g->yaw[e], g->pitch[e], &dir);
-      Vector3 shoulder = {p.x - dir.x * 0.20f, p.y - dir.y * 0.20f,
-                          p.z - dir.z * 0.20f};
-      Vector3 base = {shoulder.x - dir.x * 0.34f, shoulder.y - dir.y * 0.34f,
-                      shoulder.z - dir.z * 0.34f};
+      Vector3 dir = sight_dir((f32)g->aim[e].yaw, (f32)g->aim[e].pitch);
+      Vector3 shoulder = vec3_sub(p, vec3_mul(dir, 0.20f));
+      Vector3 base = vec3_sub(shoulder, vec3_mul(dir, 0.34f));
       DrawCylinderEx(base, shoulder, 0.040f, 0.040f, 7, PAL_DARK);
       DrawCylinderEx(base, shoulder, 0.032f, 0.032f, 7, PAL_MID);
       DrawCylinderEx(shoulder, p, 0.032f, 0.0f, 7, PAL_LIGHT);
@@ -866,8 +735,6 @@ static void draw_world(const GameState *g, f32 a) {
       draw_impact_mark(g, e, p);
       break;
     case KIND_FLOOR:
-      // The ground plane is drawn separately; the floor solid exists only
-      // for the universal hitscan path.
       break;
     }
   }
@@ -945,7 +812,6 @@ static Color ammo_color(unsigned ammo, unsigned mag, bool reloading) {
     return PAL_MID;
   if (f <= 0.001f)
     return PAL_PURPLE;
-  // Low ammo: cool pulse between mid and dark-purple.
   int blink = ((int)(GetTime() * 6.0)) & 1;
   return blink ? PAL_MID : PAL_PURPLE;
 }
@@ -957,7 +823,7 @@ static int small_text_width(String text) {
 static void draw_hit_indicator(const GameState *g, u32 e) {
   if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
     return;
-  int rel = wrap_degrees(unpack_yaw(g->held_by[e]) - g->view_yaw);
+  int rel = wrap_degrees(unpack_yaw(g->held_by[e]) - g->view.yaw);
   f32 r = (f32)rel * DEG2RAD;
   f32 s = sinf(r);
   f32 f = cosf(r);
@@ -983,22 +849,6 @@ static void draw_hit_indicator(const GameState *g, u32 e) {
     DrawRectangle(x, LOGICAL_H - 3, len, 3, c);
   }
 }
-
-// Help overlay: left-aligned, two bindings per row (key + action on each
-// half: four visual columns). Keys are display strings matching the KEY_* /
-// MOUSE_BUTTON_* bindings in update_input, which always use the raylib
-// constants (never raw codes).
-#define HELP_COL0_X 2
-#define HELP_COL1_X (LOGICAL_W / 2 + 1)
-#define HELP_TITLE_Y 3
-#define HELP_ROWS_Y 11
-#define HELP_ROW_DY 6
-#define HELP_KEY_ADV 24
-
-// TAB stats: values start past the widest (4-letter) label + space so FPS
-// lines up with PING; the readout latches at 10 Hz so it stays readable.
-#define STAT_NUM_ADV 20
-#define STAT_UPDATE_DT 0.1
 
 typedef struct HelpEntry {
   const char *key;
@@ -1057,17 +907,14 @@ static void draw_hud(GameState *g) {
     draw_small_text(2, 2, STR("T"), PAL_MID);
     draw_small_text(10, 2, chat, PAL_LIGHT);
   }
-  // TAB-only debug stats, drawn last (over notice/chat, which may become
-  // temporarily unreadable while held). Line 1: FPS, one line below: PING.
   if (IsKeyDown(KEY_TAB)) {
     static unsigned shown_fps, shown_ping;
     static double last_stat_update = -1.0;
     double now = GetTime();
     if (now - last_stat_update >= STAT_UPDATE_DT) {
       shown_fps = (unsigned)GetFPS();
-      shown_ping = (g->connected && g->ping.have)
-                       ? (unsigned)(g->ping.rtt_ms + 0.5)
-                       : 0;
+      shown_ping =
+          (g->connected && g->ping.have) ? (unsigned)(g->ping.rtt_ms + 0.5) : 0;
       last_stat_update = now;
     }
     unsigned fps = shown_fps;
@@ -1111,43 +958,34 @@ static void draw_hud(GameState *g) {
 static void update_viewmodel(GameState *g, f32 dt) {
   if (dt > 0.05f)
     dt = 0.05f;
-  // Local prediction steps the shared present_* helpers — the exact ones
-  // the server runs per player for replication.
   u32 aim_e = local_player_entity(g);
-  bool aim_reloading = aim_e != ECS_INVALID_ENTITY &&
-                       weapon_is_reloading(g, aim_e);
+  bool aim_reloading =
+      aim_e != ECS_INVALID_ENTITY && weapon_is_reloading(g, aim_e);
   present_blend_tick(&g->aim_blend,
                      present_aim_want(g->input[0].buttons, aim_reloading),
                      12.0f, dt);
   present_walk_tick(&g->walk_phase, &g->walk_blend, g->input[0].move_x,
                     g->input[0].move_z, dt);
-  present_lean_tick(&g->move_sway_x, &g->move_vel_x,
-                    (f32)g->input[0].move_x, dt);
-  present_lean_tick(&g->move_sway_z, &g->move_vel_z,
-                    (f32)g->input[0].move_z, dt);
+  present_lean_tick(&g->move_sway.x, &g->move_vel.x, (f32)g->input[0].move_x,
+                    dt);
+  present_lean_tick(&g->move_sway.y, &g->move_vel.y, (f32)g->input[0].move_z,
+                    dt);
   present_blend_tick(&g->sprint_blend,
                      present_sprint_want(g->input[0].buttons,
                                          g->input[0].move_x,
                                          g->input[0].move_z),
                      8.0f, dt);
-  // Screen shake decay (view-texture offset only, never the camera).
   g->screen_shake *= expf(-11.0f * dt);
   if (g->screen_shake < 0.02f)
     g->screen_shake = 0.0f;
-  // Turn bob: side-side tuned down ~25%, steadier while aiming.
   f32 steady = 1.0f - g->aim_blend * 0.55f;
-  f32 tx = g->look_delta_x * 0.048f * steady;
-  f32 ty = -g->look_delta_y * 0.045f * steady;
+  f32 tx = g->look_delta.x * 0.048f * steady;
+  f32 ty = -g->look_delta.y * 0.045f * steady;
   tx = clamp_float(tx, -0.50f, 0.50f);
   ty = clamp_float(ty, -0.45f, 0.45f);
   f32 k = 1.0f - expf(-5.2f * dt);
-  g->gun_sway_x += (tx - g->gun_sway_x) * k;
-  g->gun_sway_y += (ty - g->gun_sway_y) * k;
-  // Recoil feel: the bullet shoves the gun straight back (fast stiff spring),
-  // the wrist breaks a beat later into muzzle flip (softer, laggier spring),
-  // then the hand shoves back forward past rest before settling. Both springs
-  // are slightly underdamped on purpose; the small negative travel is the
-  // hand visibly driving the gun back on target instead of stopping dead.
+  g->gun_sway.x += (tx - g->gun_sway.x) * k;
+  g->gun_sway.y += (ty - g->gun_sway.y) * k;
   g->gun_slide *= expf(-26.0f * dt);
   g->gun_recoil_velocity +=
       (-140.0f * g->gun_recoil - 13.0f * g->gun_recoil_velocity) * dt;
@@ -1155,7 +993,6 @@ static void update_viewmodel(GameState *g, f32 dt) {
   g->gun_recoil = clamp_float(g->gun_recoil, -0.02f, 0.09f);
   if (fabsf(g->gun_recoil) < 0.0005f && fabsf(g->gun_recoil_velocity) < 0.005f)
     g->gun_recoil = g->gun_recoil_velocity = 0.0f;
-  // Muzzle flip lags the punch and recovers slower, like a wrist.
   g->gun_rise_velocity +=
       (-70.0f * g->gun_rise - 9.0f * g->gun_rise_velocity) * dt;
   g->gun_rise += g->gun_rise_velocity * dt;
@@ -1164,19 +1001,17 @@ static void update_viewmodel(GameState *g, f32 dt) {
     g->gun_rise = g->gun_rise_velocity = 0.0f;
 }
 
-static void render_frame(GameState *g, RenderTexture2D view,
-                         RenderTexture2D ui, f32 a) {
+static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
+                         f32 a) {
   Camera3D cam = make_camera(g, a);
   u32 local_e = local_player_entity(g);
   u8 local_wid =
       local_e != ECS_INVALID_ENTITY ? g->weapon_id[local_e] : WEAPON_P99;
   const WeaponDef *wdef = weapon_def(local_wid);
-  // View layer: world + viewmodel only. HUD lives on the ui layer so screen
-  // shake never touches it.
   BeginTextureMode(view);
   ClearBackground(PAL_DARK);
   BeginMode3D(cam);
-  DrawPlane((Vector3){0.0f, -0.02f, 0.0f}, (Vector2){32.0f, 32.0f}, PAL_PURPLE);
+  DrawPlane((Vector3){0.0f, 0.0f, 0.0f}, (Vector2){32.0f, 32.0f}, PAL_PURPLE);
   draw_world(g, a);
   EndMode3D();
   Camera3D wcam = {.position = (Vector3){0.0f, 0.0f, 0.0f},
@@ -1191,52 +1026,36 @@ static void render_frame(GameState *g, RenderTexture2D view,
   f32 sway_scale = 1.0f - b * 0.75f;
   f32 reload_t =
       local_e != ECS_INVALID_ENTITY ? weapon_reload_progress(g, local_e) : 0.0f;
-  // Per-gun ADS pose: hip comes from the WeaponDef, full-zoom comes from
-  // the sight-tip solver (gun_ads_target) so the front post lands exactly on
-  // the screen center at rest. Walk bob keeps its ADS damping.
-  // Sway/bob/lean/rise still offset transiently; those settle to zero at rest.
   f32 ads_tx, ads_ty;
   gun_ads_target(local_wid, wdef, &ads_tx, &ads_ty);
-  f32 base_x = wdef->hip_off_x * (1.0f - b) + ads_tx * b;
-  f32 base_y = wdef->hip_off_y * (1.0f - b) + ads_ty * b;
-  // Walk feel: steady lean rides the spring position, swing rides its
-  // velocity (always continuous, never a step). Shared helpers — the same
-  // ones draw_remote_player uses for replicated state.
-  f32 lean_x, lean_z;
-  present_lean_offsets(g->move_sway_x, g->move_sway_z, &lean_x, &lean_z);
-  f32 swing_yaw = g->move_vel_x * 1.2f * sway_scale;
-  f32 swing_pitch = -g->move_vel_z * 0.5f * sway_scale;
-  f32 swing_roll = -g->move_vel_x * 0.6f * sway_scale;
-  f32 bob_x, bob_y, bob_z, bob_roll;
-  present_bob_offsets(g->walk_phase, g->walk_blend, 1.0f - 0.5f * b, &bob_x,
-                      &bob_y, &bob_z, &bob_roll);
-  // Sprint pose: muzzle tilts skyward with the sprint blend (per-gun).
+  f32 base_x = wdef->hip_off.x * (1.0f - b) + ads_tx * b;
+  f32 base_y = wdef->hip_off.y * (1.0f - b) + ads_ty * b;
+  Vector2 lean = present_lean_offsets(g->move_sway);
+  f32 swing_yaw = g->move_vel.x * 1.2f * sway_scale;
+  f32 swing_pitch = -g->move_vel.y * 0.5f * sway_scale;
+  f32 swing_roll = -g->move_vel.x * 0.6f * sway_scale;
+  PresentBob bob =
+      present_bob_offsets(g->walk_phase, g->walk_blend, 1.0f - 0.5f * b);
   f32 sprint_pitch = wdef->sprint_tilt_deg * g->sprint_blend;
-  rlTranslatef(base_x + g->gun_sway_x * 1.02f * sway_scale + lean_x + bob_x,
-               base_y + g->gun_sway_y * 1.28f * sway_scale +
-                   rise * 0.70f * (1.0f - b * 0.8f) + bob_y,
-               0.75f + lean_z + bob_z);
-  rlRotatef(g->gun_sway_x * -52.0f * sway_scale + swing_yaw, 0.0f, 1.0f,
-            0.0f);
-  // Up/down rotation: direct pitch response plus a smaller cross-coupling
-  // from turning so yaw motion also tilts the gun vertically.
-  // Reload whips in place inside draw_gun (no dip/tilt here).
-  // ads_pitch_deg re-zeroes the zoomed muzzle angle (negative lifts it).
-  rlRotatef((g->gun_sway_y * -46.0f + g->gun_sway_x * -11.0f) * sway_scale -
+  rlTranslatef(base_x + g->gun_sway.x * 1.02f * sway_scale + lean.x + bob.pos.x,
+               base_y + g->gun_sway.y * 1.28f * sway_scale +
+                   rise * 0.70f * (1.0f - b * 0.8f) + bob.pos.y,
+               0.75f + lean.y + bob.pos.z);
+  rlRotatef(g->gun_sway.x * -52.0f * sway_scale + swing_yaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef((g->gun_sway.y * -46.0f + g->gun_sway.x * -11.0f) * sway_scale -
                 rise * 230.0f * (1.0f - b * 0.85f) + swing_pitch +
                 wdef->ads_pitch_deg * b + sprint_pitch,
             1.0f, 0.0f, 0.0f);
-  rlRotatef(g->gun_sway_x * -29.0f * sway_scale + wdef->ads_cant_deg * b +
-                bob_roll + swing_roll,
+  rlRotatef(g->gun_sway.x * -29.0f * sway_scale + wdef->ads_cant_deg * b +
+                bob.roll + swing_roll,
             0.0f, 0.0f, 1.0f);
   draw_gun_local(local_wid, g->gun_recoil / VIEWMODEL_SCALE,
-                   g->gun_slide / VIEWMODEL_SCALE, VIEWMODEL_SCALE,
-                   g->gun_kick != 0, reload_t);
+                 g->gun_slide / VIEWMODEL_SCALE, VIEWMODEL_SCALE,
+                 g->gun_kick != 0, reload_t);
   rlPopMatrix();
   EndMode3D();
   EndTextureMode();
 
-  // UI layer: HUD only, transparent so the view shows through. Never shaken.
   BeginTextureMode(ui);
   ClearBackground(BLANK);
   draw_hud(g);
@@ -1255,9 +1074,6 @@ static void render_frame(GameState *g, RenderTexture2D view,
   Rectangle dst = {(f32)((GetScreenWidth() - w) / 2),
                    (f32)((GetScreenHeight() - h) / 2), (f32)w, (f32)h};
   Rectangle ui_dst = dst;
-  // Screen shake on the view texture only, never the camera or UI layer.
-  // Integer screen-pixel offsets only: fractional dst offsets fight the
-  // point filter + integer scaling and read as blur.
   if (g->screen_shake > 0.01f) {
     int range = (int)(g->screen_shake * 2.0f + 0.5f);
     if (range > 0) {
@@ -1270,16 +1086,10 @@ static void render_frame(GameState *g, RenderTexture2D view,
   EndDrawing();
 }
 
-static void client_predict_weapon(GameState *g) {
+static void weapon_predict_system(GameState *g) {
   u32 e = local_player_entity(g);
   if (e == ECS_INVALID_ENTITY)
     return;
-  // Discrete weapon changes (fire / reload start / refill) advance prediction
-  // ahead of the server by RTT. Record the input sequence that caused them so
-  // snapshots can prove staleness via acknowledged_sequence instead of
-  // regressing (see sequence_newer). Cooldown/prev/timer countdowns are
-  // deterministic or unsnapshotted and must NOT dirty (else every snapshot
-  // would look stale).
   u8 before_ammo = g->weapon_ammo[e];
   u16 before_reload = g->weapon_reload[e];
   u8 before_id = g->weapon_id[e];
@@ -1291,23 +1101,17 @@ static void client_predict_weapon(GameState *g) {
     u8 wid = g->weapon_id[e];
     weapon_on_fired(g, e, holding);
     g->gun_kick = 4;
-    // Tap is soft, holding dumps the mag faster with a harder kick.
     g->gun_slide = holding ? def->slide_hold : def->slide_tap;
-    g->gun_recoil_velocity += holding ? def->recoil_vel_hold : def->recoil_vel_tap;
+    g->gun_recoil_velocity +=
+        holding ? def->recoil_vel_hold : def->recoil_vel_tap;
     g->gun_rise_velocity += holding ? def->rise_vel_hold : def->rise_vel_tap;
-    // View-texture shake (never the camera) on every shot.
     g->screen_shake = holding ? 1.0f : 0.7f;
-    // True recoil: muzzle climbs, so push the aim up. Same step the server
-    // applies to the authoritative pitch on confirmation.
-    g->view_pitch = weapon_recoil_pitch(g->view_pitch, wid, holding);
+    g->view.pitch = weapon_recoil_pitch(g->view.pitch, wid, holding);
   }
   weapon_set_prev(g, e, want);
-  if (g->weapon_ammo[e] != before_ammo || g->weapon_reload[e] != before_reload ||
-      g->weapon_id[e] != before_id) {
-    // Upcoming sequence will carry the causative input; the server can't have
-    // acked it yet, so snapshots until then are provably stale for this field.
+  if (g->weapon_ammo[e] != before_ammo ||
+      g->weapon_reload[e] != before_reload || g->weapon_id[e] != before_id)
     g->weapon_dirty_seq[e] = g->next_sequence;
-  }
 }
 
 static int client_run(String host, u16 port, String name) {
@@ -1321,7 +1125,7 @@ static int client_run(String host, u16 port, String name) {
   }
   client_init(&game);
   renew_client_session(&game);
-  game.view_yaw = 180;
+  game.view.yaw = 180;
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
     game.requested_name[i] = name.items[i];
     game.player_name[0][i] = name.items[i];
@@ -1367,7 +1171,7 @@ static int client_run(String host, u16 port, String name) {
       }
       if (game.gun_kick > 0)
         --game.gun_kick;
-      client_predict_weapon(&game);
+      weapon_predict_system(&game);
       acc -= SIM_DT;
     }
     client_receive(&game, fd);

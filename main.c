@@ -1,10 +1,11 @@
-#include "server.c"
 #include "client.c"
+#include "server.c"
 
 static void print_usage(String program) {
   fprintf(stderr, "usage: %.*s --server [port]\n", (int)program.length,
           (char *)program.items);
-  fprintf(stderr, "       %.*s --client <ipv4|localhost> <port> <five-letter-name>\n",
+  fprintf(stderr,
+          "       %.*s --client <ipv4|localhost> <port> <five-letter-name>\n",
           (int)program.length, (char *)program.items);
 }
 
@@ -12,19 +13,16 @@ int main(int argc, char **argv) {
   u16 port;
   u8 name_storage[PLAYER_NAME_LENGTH];
   String name_out = {name_storage, 0, PLAYER_NAME_LENGTH};
-  if (argc >= 2 &&
-      string_eq(string_from_cstr(argv[1]), STR("--server"))) {
+  if (argc >= 2 && string_eq(string_from_cstr(argv[1]), STR("--server"))) {
     port = 4242;
-    if (argc >= 3 &&
-        !valid_port(string_from_cstr(argv[2]), &port)) {
+    if (argc >= 3 && !valid_port(string_from_cstr(argv[2]), &port)) {
       print_usage(string_from_cstr(argv[0]));
       return 1;
     }
     server_run(port);
     return 0;
   }
-  if (argc == 5 &&
-      string_eq(string_from_cstr(argv[1]), STR("--client"))) {
+  if (argc == 5 && string_eq(string_from_cstr(argv[1]), STR("--client"))) {
     String host = string_from_cstr(argv[2]);
     String port_text = string_from_cstr(argv[3]);
     String name_in = string_from_cstr(argv[4]);

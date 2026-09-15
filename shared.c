@@ -43,6 +43,18 @@ typedef struct {
 #define STR(lit)                                                               \
   ((String){(u8 *)(lit), (i32)(sizeof(lit) - 1), (i32)(sizeof(lit) - 1)})
 
+typedef struct {
+  i16 x, y, z;
+} IVec3;
+
+typedef struct {
+  i16 yaw, pitch;
+} Aim;
+
+typedef struct {
+  u8 yaw, pitch;
+} LagAim;
+
 #define LOGICAL_W 92
 #define LOGICAL_H 64
 #define POS_SCALE 64
@@ -81,10 +93,6 @@ enum NetPacketKind {
 #define BTN_SPRINT 16u
 #define BTN_ALL (BTN_FIRE | BTN_GRAB | BTN_JUMP | BTN_AIM | BTN_SPRINT)
 
-// Weapon catalog: single source of truth for fire rate, mag size, reload and
-// recoil. To add a weapon, append a WeaponId and a WeaponDef entry; the
-// server, client prediction and snapshot code all read from here so no
-// per-weapon branching is needed elsewhere.
 enum WeaponId { WEAPON_P99 = 0, WEAPON_COUNT };
 
 typedef struct WeaponDef {
@@ -106,18 +114,9 @@ typedef struct WeaponDef {
   f32 aim_fov;
   f32 aim_sens_scale;
   f32 aim_move_scale;
-  // Viewmodel hip base + ADS cant in degrees, per gun. Full-zoom ADS
-  // translation is solved per weapon from its sight tip (see gun_ads_target
-  // in client.c), not stored, so sight alignment can't drift from the data.
-  f32 hip_off_x;
-  f32 hip_off_y;
+  Vector2 hip_off;
   f32 ads_cant_deg;
-  // Static ADS pitch trim in degrees, blended in with aim. Positive tips
-  // the muzzle down, negative raises it. Purely cosmetic (bullets follow
-  // the view angles); one number to re-zero the zoomed sight picture.
   f32 ads_pitch_deg;
-  // Sprint pose: static pitch added with the sprint blend. Negative raises
-  // the muzzle skyward classic-sprint style. Cosmetic only, per gun.
   f32 sprint_tilt_deg;
 } WeaponDef;
 
@@ -132,10 +131,6 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .reload_ticks = 120,
             .slide_tap = 0.09f,
             .slide_hold = 0.126f,
-            // Viewmodel impulses (velocity kicks into the client springs in
-            // update_viewmodel): sharp straight-back punch + lagging muzzle
-            // flip. Peaks ride the spring clamps; the spring rates shape the
-            // punch/recover timing, so tune feel there, magnitude here.
             .recoil_vel_tap = 1.05f,
             .recoil_vel_hold = 1.9f,
             .rise_vel_tap = 1.0f,
@@ -146,8 +141,7 @@ static const WeaponDef WEAPON_DEFS[WEAPON_COUNT] = {
             .aim_fov = 45.0f,
             .aim_sens_scale = 0.55f,
             .aim_move_scale = 0.5f,
-            .hip_off_x = 0.06f,
-            .hip_off_y = -0.18f,
+            .hip_off = {0.06f, -0.18f},
             .ads_cant_deg = -12.0f,
             .ads_pitch_deg = -3.0f,
             .sprint_tilt_deg = -32.0f,
@@ -158,22 +152,11 @@ static const WeaponDef *weapon_def(u8 id) {
   return &WEAPON_DEFS[id < WEAPON_COUNT ? id : WEAPON_P99];
 }
 
-// Shell catalog: one entry per WeaponId, parallel to WEAPON_DEFS.
-// To add different shells per gun, add one more line here, e.g.
-//   [WEAPON_P90] = { .len = 0.06f, ... },
-// The server spawns (spawn_casing) and the client renders (draw_casing)
-// both read through shell_def(), so no per-shell branching is needed
-// elsewhere. Units are meters and m/s; eject_* kick along the gun's own
-// forward/right/up at the moment of the shot.
-// body_pal/rim_pal select the palette for the brass: 0 dark, 1 purple,
-// 2 mid, 3 light. The dark outline is always drawn for readability.
 typedef struct ShellDef {
   f32 len;
   f32 radius;
   f32 rim_radius;
-  f32 eject_right;
-  f32 eject_up;
-  f32 eject_back;
+  Vector3 eject;
   f32 jitter;
   u8 body_pal;
   u8 rim_pal;
@@ -185,9 +168,7 @@ static const ShellDef SHELL_DEFS[WEAPON_COUNT] = {
             .len = 0.07f,
             .radius = 0.014f,
             .rim_radius = 0.017f,
-            .eject_right = 2.4f,
-            .eject_up = 1.9f,
-            .eject_back = 0.55f,
+            .eject = {2.4f, 1.9f, 0.55f},
             .jitter = 0.35f,
             .body_pal = 3,
             .rim_pal = 2,
@@ -205,18 +186,9 @@ static const ShellDef *shell_def(u8 id) {
 #define IMPACT_MARK_LIFETIME_TICKS 128
 
 #define ARENA 32
-// Muzzle velocity in fixed-point units/tick (POS_SCALE units == 1 m, so 64
-// is 1 m/tick == 100 m/s at SIM_HZ). Kept well above sprint speed so tracers
-// read as hitscan-fast; projectile_system substeps so it still cannot tunnel
-// thin targets.
 #define BULLET_SPEED 64.0f
 #define ARENA_POS (15 * POS_SCALE)
 
-// Perspective-hold tuning. While holding E the cube slides on the ground
-// around the holder: yaw steers it, pitch drives distance/scale (look down
-// brings it close/tiny, looking forward/far pushes it out/giant). Y stays
-// grounded at half height. Scale persists after release. The pitch curve is
-// deliberately gentle so small look adjustments only nudge the cube.
 #define HOLD_BASE_DIST 2.0f
 #define HOLD_PITCH_STEP 0.02f
 #define HOLD_MIN_DIST 1.0f
@@ -224,8 +196,28 @@ static const ShellDef *shell_def(u8 id) {
 #define CUBE_SCALE_MIN 0.12f
 #define CUBE_SCALE_MAX 2.0f
 
-// Shared clamps: single source of truth for all range limiting.
-// Integers use plain comparisons; floats use fminf/fmaxf from <math.h>.
+#define CUBE_VIS_X 0.9f
+#define CUBE_VIS_Y 1.0f
+#define CUBE_VIS_Z 0.9f
+#define PLAYER_BODY_X 0.50f
+#define PLAYER_BODY_Y 1.36f
+#define PLAYER_BODY_Z 0.30f
+#define PLAYER_HEAD_Y 1.44f
+#define PLAYER_HEAD_S 0.26f
+#define PLAYER_HIT_RADIUS_M 0.30f
+#define PLAYER_HIT_HEIGHT_M 1.58f
+
+#define EYE_HEIGHT_M 1.5f
+#define GUN_HIP_SIDE_M 0.36f
+#define GUN_HIP_UP_M 0.98f
+#define GUN_HIP_FWD_M 0.24f
+#define GUN_CENTER_X_M 0.32f
+#define GUN_MUZZLE_Z_M 0.72f
+#define SHOT_SPAWN_M 0.20f
+#define MARK_NUDGE 1.0f
+#define SIGHT_SKY_DIST_M 12.0f
+#define SIGHT_MAX_DIST_M 60.0f
+
 static int clamp_int(int v, int lo, int hi) {
   if (v < lo)
     return lo;
@@ -239,8 +231,24 @@ static f32 clamp_float(f32 v, f32 lo, f32 hi) {
 }
 
 static f32 hold_dist_for_pitch(i16 pitch_deg) {
-  f32 d = HOLD_BASE_DIST + (f32)pitch_deg * HOLD_PITCH_STEP;
-  return clamp_float(d, HOLD_MIN_DIST, HOLD_MAX_DIST);
+  return clamp_float(HOLD_BASE_DIST + (f32)pitch_deg * HOLD_PITCH_STEP,
+                     HOLD_MIN_DIST, HOLD_MAX_DIST);
+}
+
+static u8 encode_unorm8(f32 t) {
+  return (u8)clamp_int((int)lroundf(clamp_float(t, 0.0f, 1.0f) * 255.0f), 0,
+                       255);
+}
+
+static f32 decode_unorm8(u8 q) { return (f32)q / 255.0f; }
+
+static u8 encode_centered8(int v) { return (u8)clamp_int(v + 128, 0, 255); }
+
+static int decode_centered8(u8 q) { return (int)q - 128; }
+
+static u8 encode_range8(f32 t, u8 lo, u8 hi) {
+  return (u8)(lo +
+              (u8)lroundf(decode_unorm8(encode_unorm8(t)) * (f32)(hi - lo)));
 }
 
 static u8 scale_encode(f32 s) {
@@ -254,30 +262,6 @@ static f32 scale_decode(u8 q) {
   return (f32)q / 64.0f;
 }
 
-// Unified third-person gun: hip carry on the shooter's right, converged onto
-// the sight ray at a fixed zero. Pose is a pure function of feet/yaw/pitch —
-// never of what is aimed at — so sweeping across a person never snaps the
-// gun, and server (bullets, brass) and client (render) share one helper.
-#define EYE_HEIGHT_M 1.5f
-// Hip carry in body space (feet origin, yaw-only frame): shooter's right is
-// -X (screen-right is -X), so -X sits the gun beside the torso with a visible
-// gap like a real stance — above the hip, clear of the chest.
-#define GUN_HIP_SIDE_M 0.36f
-#define GUN_HIP_UP_M 0.98f
-#define GUN_HIP_FWD_M 0.24f
-// Zero distance is the true eye-ray distance (see sight_zero_m): the muzzle
-// axis meets the eye ray exactly where the crosshair sits, at any range —
-// aiming at a head zeroes on the head, so shots land where aimed.
-// Recenters the P99 mesh (barrel x -0.32) onto the gun axis for remote
-// rendering; the server applies the same shift in its muzzle/port math.
-#define GUN_CENTER_X_M 0.32f
-// Muzzle forward in (recentered) mesh space: flash front z 0.72.
-#define GUN_MUZZLE_Z_M 0.72f
-
-// Impact-mark surface orientation. The server stores the hit face normal in
-// the mark's held_by slot (free: marks never hold cubes), so the client can
-// draw a flat 2D splat on the surface instead of a 3D cube. No protocol
-// change: held_by already rides NetEntity.extra.
 enum MarkNormal {
   MARK_NORM_NONE = 0,
   MARK_NORM_PX = 1,
@@ -288,8 +272,6 @@ enum MarkNormal {
   MARK_NORM_NZ = 6
 };
 
-// Face normal opposing the dominant vector axis. Used both ways: the slab
-// test yields a face vector, this folds it back to a code.
 static u8 mark_code_for_vec(Vector3 n) {
   float ax = fabsf(n.x), ay = fabsf(n.y), az = fabsf(n.z);
   if (ax >= ay && ax >= az)
@@ -317,10 +299,6 @@ static Vector3 mark_normal_vec(u8 code) {
   }
 }
 
-// Impact extra packing (held_by / NetEntity.extra): face normal in bits
-// 0-2, impact-strength level in bits 3-4, spatter material in bits 5-6.
-// Strength is the normal share of the impact velocity: dead-on hits splat
-// big, grazes leave a dot.
 #define MARK_STR_LEVELS 4u
 #define MARK_EXTRA_STR_SHIFT 3
 #define MARK_EXTRA_MAT_SHIFT 5
@@ -333,9 +311,13 @@ static u8 mark_extra_pack(u8 norm, u8 strength, u8 mat) {
 
 static u8 mark_ex_norm(u8 ex) { return (u8)(ex & 0x07u); }
 
-static u8 mark_ex_str(u8 ex) { return (u8)((ex >> MARK_EXTRA_STR_SHIFT) & 0x03u); }
+static u8 mark_ex_str(u8 ex) {
+  return (u8)((ex >> MARK_EXTRA_STR_SHIFT) & 0x03u);
+}
 
-static u8 mark_ex_mat(u8 ex) { return (u8)((ex >> MARK_EXTRA_MAT_SHIFT) & 0x03u); }
+static u8 mark_ex_mat(u8 ex) {
+  return (u8)((ex >> MARK_EXTRA_MAT_SHIFT) & 0x03u);
+}
 
 enum EntityKind {
   KIND_CUBE = 1,
@@ -378,19 +360,12 @@ typedef struct NetInputPacket {
   i8 move_x, move_z;
   i16 aim_yaw, aim_pitch;
   u8 name[PLAYER_NAME_LENGTH];
-  // Explicit tail: struct would pad 21 -> 24 anyway. Named so
-  // initializers zero it deterministically (padding bytes would stay
-  // unspecified per C11 6.2.6.1p6). Always send zero, ignore on receive.
   u8 reserved[3];
 } NetInputPacket;
 
 typedef struct NetEntity {
   u8 entity, kind, owner, flags, extra, weapon, ammo, reloading;
-  // Quantized reload progress for the remote reload whip (0 == not reloading).
   u8 reload_q;
-  // World scale for scaled entities (cubes). Quantized like the other
-  // presentation fields; 0 means 1.0 for backwards-tolerant decode.
-  // Proper protocol field, not padding reuse.
   u8 scale;
   i16 x, y, z, yaw, pitch;
 } NetEntity;
@@ -401,7 +376,6 @@ typedef struct NetChatPacket {
   u16 sequence;
   u8 name[PLAYER_NAME_LENGTH];
   u8 text[CHAT_LENGTH];
-  // Explicit tail: 33 -> 36. See NetInputPacket.reserved.
   u8 reserved[3];
 } NetChatPacket;
 
@@ -413,9 +387,6 @@ typedef struct NetSnapshot {
   u8 names[MAX_PLAYERS][PLAYER_NAME_LENGTH];
 } NetSnapshot;
 
-// Dense snapshot wire format: header + count * entities + names.
-// Zero-filling of unused slots never hits the wire. The header size is
-// derived from the struct layout so no magic length can drift.
 #define NET_SNAPSHOT_HEADER_SIZE (offsetof(NetSnapshot, entities))
 #define NET_SNAPSHOT_NAMES_SIZE (MAX_PLAYERS * PLAYER_NAME_LENGTH)
 #define NET_MAX_DATAGRAM sizeof(NetSnapshot)
@@ -425,8 +396,8 @@ typedef struct NetSnapshot {
 static i32 net_snapshot_wire_size(u8 count) {
   if (count > NET_ENTITY_LIMIT)
     return -1;
-  return (i32)(NET_SNAPSHOT_HEADER_SIZE +
-               (i32)count * (i32)sizeof(NetEntity) + NET_SNAPSHOT_NAMES_SIZE);
+  return (i32)(NET_SNAPSHOT_HEADER_SIZE + (i32)count * (i32)sizeof(NetEntity) +
+               NET_SNAPSHOT_NAMES_SIZE);
 }
 
 #define ECS_MAX_ENTITIES 32u
@@ -514,9 +485,6 @@ static bool ecs_next(EcsQuery *q) {
   return true;
 }
 
-// Tom Thumb 3x5 font
-// source: https://opengameart.org/content/tom-thumb-tiny-ascii-font-3x5
-
 #define TOM_THUMB_3X5_CHARS " !+-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 #define TOM_THUMB_3X5_COUNT 44u
 
@@ -528,9 +496,6 @@ static const uint16_t tom_thumb_3x5[TOM_THUMB_3X5_COUNT] = {
     0x388E, 0x7492, 0x5B6B, 0x5B52, 0x5BFD, 0x5AAD, 0x5A92, 0x72A7,
 };
 
-// TAB ping estimator (client-only presentation, never simulated or
-// snapshotted). Ring of input-sequence send times keyed by low bits;
-// snapshots carry acknowledged_sequence so the client can sample RTT.
 #define PING_WINDOW 64u
 #define PING_WINDOW_MASK (PING_WINDOW - 1u)
 #define PING_MS_PER_SEC 1000.0
@@ -546,34 +511,20 @@ typedef struct PingState {
 
 typedef struct GameState {
   ECS ecs;
-  i16 px[ECS_MAX_ENTITIES], py[ECS_MAX_ENTITIES], pz[ECS_MAX_ENTITIES];
-  i16 vx[ECS_MAX_ENTITIES], vy[ECS_MAX_ENTITIES], vz[ECS_MAX_ENTITIES];
-  i16 yaw[ECS_MAX_ENTITIES], pitch[ECS_MAX_ENTITIES];
+  IVec3 pos[ECS_MAX_ENTITIES];
+  IVec3 vel[ECS_MAX_ENTITIES];
+  Aim aim[ECS_MAX_ENTITIES];
   u8 kind[ECS_MAX_ENTITIES], lifetime[ECS_MAX_ENTITIES];
-  // Client-side interpolation scratch, never simulated or snapshotted.
-  // lag_yaw/lag_pitch hold the encoded yaw/pitch delta (+LAG_NEUTRAL) from
-  // the last snapshot so remotes can exaggerate turn bob between snapshots.
-  // lifetime stays purely an expiry counter for bullets/casings/marks.
-  u8 owner[ECS_MAX_ENTITIES], lag_yaw[ECS_MAX_ENTITIES];
-  u8 lag_pitch[ECS_MAX_ENTITIES];
+  u8 owner[ECS_MAX_ENTITIES];
+  LagAim lag[ECS_MAX_ENTITIES];
   u8 flash[ECS_MAX_ENTITIES], held_by[ECS_MAX_ENTITIES];
-  // Per-entity weapon state (player entities only). Single source of truth
-  // for ammo / reload / fire-rate; no parallel per-player arrays.
   u8 weapon_id[ECS_MAX_ENTITIES];
   u8 weapon_ammo[ECS_MAX_ENTITIES];
   u8 weapon_cooldown[ECS_MAX_ENTITIES];
   u8 weapon_prev[ECS_MAX_ENTITIES];
   u16 weapon_reload[ECS_MAX_ENTITIES];
-  // Client-side prediction metadata for stale-snapshot guards (never
-  // simulated, never snapshotted). weapon_dirty_seq[e] is the input sequence
-  // that caused the last local weapon change on e; compared against the
-  // snapshot's acknowledged_sequence to prove the server had seen our change
-  // before we let it regress predicted state. Zero means synced (stale while
-  // sequence_newer(dirty_seq, snap_ack)). last_snapshot_ack is the ack from
-  // the last applied snapshot, for debugging/future predicted fields.
   u16 weapon_dirty_seq[ECS_MAX_ENTITIES];
   u16 last_snapshot_ack;
-  // RTT estimator ring for the TAB overlay (client-only, see PingState).
   PingState ping;
   InputCommand input[MAX_PLAYERS];
   Peer peers[MAX_PLAYERS];
@@ -590,28 +541,22 @@ typedef struct GameState {
   u8 player_name[MAX_PLAYERS][PLAYER_NAME_LENGTH];
   u8 chat_input[CHAT_LENGTH];
   u8 notice[NOTICE_LENGTH];
-  i16 view_yaw, view_pitch;
+  Aim view;
   f32 gun_recoil, gun_recoil_velocity, gun_slide;
   f32 gun_rise, gun_rise_velocity;
-  f32 gun_sway_x, gun_sway_y, look_delta_x, look_delta_y;
+  Vector2 gun_sway, look_delta;
   f32 aim_blend, screen_shake;
   f32 walk_phase, walk_blend;
-  f32 move_sway_x, move_sway_z;
-  f32 move_vel_x, move_vel_z;
+  Vector2 move_sway, move_vel;
   f32 sprint_blend;
-  // Per-entity world scale backing COMP_SCALE (cubes only for now,
-  // 1.0 == normal). Authoritative on the server, replicated via
-  // NetEntity.scale, applied by renderer/collision through scale_value().
   f32 scale[ECS_MAX_ENTITIES];
-  // Reload progress per entity for the remote reload whip (0 == not reloading).
   u8 r_reload[ECS_MAX_ENTITIES];
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
-_Static_assert(ECS_MAX_ENTITIES <= 32u, "current ecs can only handle 32 entities");
+_Static_assert(ECS_MAX_ENTITIES <= 32u,
+               "current ecs can only handle 32 entities");
 _Static_assert(MAX_PLAYERS <= 8, "visible_players is an 8-bit mask");
-
-// string helpers
 
 static i32 cstr_len(const char *s) {
   i32 n = 0;
@@ -632,8 +577,6 @@ static bool string_eq(String a, String b) {
     return true;
   return memcmp(a.items, b.items, (size_t)a.length) == 0;
 }
-
-// math / time / session helpers
 
 static i16 wrap_degrees(int value) {
   value %= 360;
@@ -676,23 +619,10 @@ static u8 pack_yaw(int deg) {
 
 static int unpack_yaw(u8 packed) { return (int)packed * 360 / 256 - 180; }
 
-// Client interp lag codec: encoded yaw/pitch delta centred on LAG_NEUTRAL
-// so 128 means "no turn since last snapshot". Only ever stored in
-// lag_yaw/lag_pitch, never in lifetime or weapon state.
 #define LAG_NEUTRAL 128
+#define lag_encode(d) encode_centered8(d)
+#define lag_decode(v) decode_centered8(v)
 
-static u8 lag_encode(int delta) {
-  return (u8)clamp_int(delta + LAG_NEUTRAL, 0, 255);
-}
-
-static int lag_decode(u8 v) { return (int)v - LAG_NEUTRAL; }
-
-// Weapon state helpers: single source of truth for server simulation and
-// client prediction. All weapon state lives on the player entity itself
-// (weapon_id/ammo/weapon_cooldown/weapon_reload/weapon_prev arrays indexed
-// by entity), never in a parallel per-player slot. All firing, reload and
-// snapshot reconciliation goes through here so adding a WeaponDef entry is
-// enough for a new weapon.
 static bool weapon_entity_valid(u32 e) { return e < ECS_MAX_ENTITIES; }
 
 static void weapon_init_entity(GameState *g, u32 e) {
@@ -705,7 +635,6 @@ static void weapon_init_entity(GameState *g, u32 e) {
   g->weapon_prev[e] = 0;
 }
 
-// Authoritative overwrite from a snapshot (fresh entities, remotes).
 static void weapon_set_from_snapshot(GameState *g, u32 e, u8 srv_weapon,
                                      u8 srv_ammo, bool srv_reloading) {
   if (!weapon_entity_valid(e))
@@ -738,8 +667,6 @@ static bool weapon_holding(const GameState *g, u32 e, bool want) {
   return want && weapon_entity_valid(e) && g->weapon_prev[e] != 0;
 }
 
-// Tick reload and fire cooldown. Auto-starts a reload when the mag is empty
-// so callers never need their own ammo==0 branches.
 static void weapon_tick(GameState *g, u32 e) {
   if (!weapon_entity_valid(e))
     return;
@@ -773,12 +700,10 @@ static void weapon_on_fired(GameState *g, u32 e, bool holding) {
     g->weapon_reload[e] = def->reload_ticks;
 }
 
-// Server ran out of bullet slots: rate-limit without consuming ammo.
 static void weapon_on_blocked(GameState *g, u32 e) {
   if (!weapon_entity_valid(e))
     return;
-  g->weapon_cooldown[e] =
-      weapon_def(g->weapon_id[e])->cooldown_tap_ticks;
+  g->weapon_cooldown[e] = weapon_def(g->weapon_id[e])->cooldown_tap_ticks;
 }
 
 static void weapon_set_prev(GameState *g, u32 e, bool want) {
@@ -786,8 +711,6 @@ static void weapon_set_prev(GameState *g, u32 e, bool want) {
     g->weapon_prev[e] = (u8)(want ? 1 : 0);
 }
 
-// Shared recoil step so client prediction (view_pitch) and server
-// confirmation (authoritative entity/input pitch) stay in sync.
 static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
   const WeaponDef *def = weapon_def(weapon_id);
   int kick = holding ? (int)def->recoil_pitch_hold_deg
@@ -795,8 +718,6 @@ static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
   return (i16)clamp_int((int)pitch + kick, -75, 75);
 }
 
-// Per-weapon imprecision in degrees. Hip is deliberately loose, ADS is
-// tight but never perfectly exact.
 static f32 weapon_spread_deg(u8 weapon_id, bool aiming) {
   const WeaponDef *def = weapon_def(weapon_id);
   return aiming ? def->spread_aim_deg : def->spread_hip_deg;
@@ -818,22 +739,16 @@ static f32 weapon_aim_move_scale(u8 weapon_id) {
   return weapon_def(weapon_id)->aim_move_scale;
 }
 
-// Reload progress 0..1 (0 when not reloading) so the viewmodel can play
-// one smooth whip across the reload.
 static f32 weapon_reload_progress(const GameState *g, u32 e) {
   if (!weapon_entity_valid(e) || g->weapon_reload[e] == 0)
     return 0.0f;
   const WeaponDef *def = weapon_def(g->weapon_id[e]);
   if (def->reload_ticks == 0)
     return 0.0f;
-  f32 t = 1.0f - (f32)g->weapon_reload[e] / (f32)def->reload_ticks;
-  return clamp_float(t, 0.0f, 1.0f);
+  return clamp_float(1.0f - (f32)g->weapon_reload[e] / (f32)def->reload_ticks,
+                     0.0f, 1.0f);
 }
 
-// ---- shared presentation tick/pose helpers (single source of truth) ----
-// The client (local prediction) and the server (per-player smoothing for
-// replication) both step through these, and both render paths pose through
-// the ones below. No private copies anywhere.
 static void present_blend_tick(f32 *b, bool want, f32 rate, f32 dt) {
   f32 k = 1.0f - expf(-rate * dt);
   *b += ((want ? 1.0f : 0.0f) - *b) * k;
@@ -858,79 +773,44 @@ static void present_lean_tick(f32 *pos, f32 *vel, f32 target, f32 dt) {
   *pos += *vel * dt;
 }
 
-// Sprint wants forward motion without ADS held (ADS wins if both held).
 static bool present_sprint_want(u8 buttons, i8 mx, i8 mz) {
   (void)mx;
-  return (buttons & BTN_SPRINT) != 0 && mz > 0 &&
-         (buttons & BTN_AIM) == 0;
+  return (buttons & BTN_SPRINT) != 0 && mz > 0 && (buttons & BTN_AIM) == 0;
 }
 
 static bool present_aim_want(u8 buttons, bool reloading) {
   return (buttons & BTN_AIM) != 0 && !reloading;
 }
 
-// Walk bob offsets; ads_damp is (1 - 0.5*aim) on both render paths.
-static void present_bob_offsets(f32 phase, f32 blend, f32 ads_damp, f32 *x,
-                                f32 *y, f32 *z, f32 *roll) {
+typedef struct {
+  Vector3 pos;
+  f32 roll;
+} PresentBob;
+
+static PresentBob present_bob_offsets(f32 phase, f32 blend, f32 ads_damp) {
   f32 s = blend * ads_damp;
-  *x = sinf(phase) * 0.014f * s;
-  *y = -fabsf(cosf(phase)) * 0.012f * s;
-  *z = sinf(phase * 2.0f) * 0.008f * s;
-  *roll = sinf(phase) * 2.5f * s;
+  return (PresentBob){{sinf(phase) * 0.014f * s,
+                       -fabsf(cosf(phase)) * 0.012f * s,
+                       sinf(phase * 2.0f) * 0.008f * s},
+                      sinf(phase) * 2.5f * s};
 }
 
-// Steady lean from smoothed strafe/push (screen-right is viewmodel -X).
-static void present_lean_offsets(f32 sx, f32 sz, f32 *ox, f32 *oz) {
-  *ox = -sx * 0.045f;
-  *oz = sz * 0.05f;
+static Vector2 present_lean_offsets(Vector2 sway) {
+  return (Vector2){-sway.x * 0.045f, sway.y * 0.05f};
 }
 
-// Reload progress quantized: 0 means not reloading, otherwise 1..255.
 static u8 encode_reload_q(bool reloading, f32 t) {
   if (!reloading)
     return 0;
-  return (u8)(clamp_int((int)lroundf(clamp_float(t, 0.0f, 1.0f) * 254.0f), 0,
-                        254) +
-              1);
+  return encode_range8(t, 1, 255);
 }
 
-// ---- generic stale-snapshot guards (source fix) ----
-// Reconciliation policy, single source of truth for ALL predicted state.
-// - Authoritative state (remotes, cubes, casings, presentation, names):
-//   overwrite from the snapshot. Global tick ordering in
-//   net_validate_snapshot_fields guarantees snapshots apply in order.
-// - Predicted state (local weapon ammo/reload/id today; local position or
-//   any future client-predicted field): NEVER overwrite directly from a
-//   snapshot. A snapshot is stale by RTT: the server hadn't seen our latest
-//   inputs when it was taken (see acknowledged_sequence, which the old code
-//   discarded). Blind overwrite regresses fresh prediction (the mag-dump
-//   15->14->0 wipe). Route every predicted field through the policy below:
-//   (a) monotonic-down counters (ammo, health, ...): adopt only if server is
-//       lower (server fired extra shots we haven't, e.g. delayed release).
-//       Ignore higher (server hasn't seen our shots yet).
-//   (b) ack proof: sequence_newer(dirty_seq, snap_ack) is true while the
-//       server hasn't acked our last change -> must not regress to it.
-//   (c) forward-only progress (reload remaining): adopt the minimum
-//       remaining, never extend.
-// Adding a new predicted field means adding a dirty_seq for it and using
-// sequence_newer + plain comparisons, not a new ad-hoc guard.
-
-// Decode the wire reload_q (0 = not reloading, else 1..255) to a remaining
-// tick count so both-reloading sides can take the minimum (forward only).
-// Unknown/zero progress while reloading means "just started": return the
-// full duration so we never fast-forward on bad data.
 static u16 decode_reload_q(u8 reload_q, u16 reload_ticks) {
-  if (reload_q == 0)
-    return 0;
-  if (reload_ticks == 0)
+  if (reload_q == 0 || reload_ticks == 0)
     return 0;
   return (u16)(((u32)reload_ticks * (u32)(255u - reload_q) + 127u) / 254u);
 }
 
-// Reconcile a snapshot weapon state onto a client entity. Remote entities
-// are fully authoritative. The local entity keeps its prediction and only
-// moves towards the server via the generic guards above: monotonic ammo,
-// ack-proof reload start, forward-only reload progress, ack-gated weapon id.
 static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
                                   u8 srv_ammo, bool srv_reloading,
                                   u8 srv_reload_q, u16 snap_ack) {
@@ -941,14 +821,12 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
   const WeaponDef *srv_def = weapon_def(srv_weapon);
   if (srv_ammo > srv_def->mag_size)
     srv_ammo = srv_def->mag_size;
-  bool is_local = g->local_player < MAX_PLAYERS && g->owner[e] == g->local_player;
+  bool is_local =
+      g->local_player < MAX_PLAYERS && g->owner[e] == g->local_player;
   if (!is_local) {
     weapon_set_from_snapshot(g, e, srv_weapon, srv_ammo, srv_reloading);
     return;
   }
-  // Predicted path: gate the weapon id itself. While our switch hasn't been
-  // acked, keep predicting with the local id; once acked, adopt the server
-  // id (today always identical; future pickups need this to avoid snap-back).
   u16 dirty = g->weapon_dirty_seq[e];
   bool stale = sequence_newer(dirty, snap_ack);
   if (!stale && g->weapon_id[e] != srv_weapon) {
@@ -968,42 +846,22 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
   }
   if (srv_reloading) {
     if (g->weapon_reload[e] != 0) {
-      // Both reloading: forward-only via remaining minimum so a stale
-      // snapshot can never extend the reload. Ammo stays empty.
       g->weapon_ammo[e] = 0;
       u16 local_remaining = g->weapon_reload[e];
       u16 srv_remaining = decode_reload_q(srv_reload_q, def->reload_ticks);
       if (srv_reload_q != 0 && srv_remaining < local_remaining)
         g->weapon_reload[e] = srv_remaining;
     } else if (g->weapon_ammo[e] == 0) {
-      // Local emptied but hasn't started its reload yet (the one-tick gap
-      // before weapon_tick auto-starts it): adopt the server reload.
       g->weapon_ammo[e] = 0;
       g->weapon_reload[e] = def->reload_ticks;
       g->weapon_dirty_seq[e] = snap_ack;
-    } else if (stale) {
-      // Local has ammo and isn't reloading, and the server hasn't acked our
-      // last weapon change (refill + predicted shots): this reloading
-      // snapshot predates our refill and is stale. Ignore it instead of
-      // wiping the fresh mag back to 0. This subsumes the old
-      // `ammo == mag_size` guard, which only covered the exact refill tick.
-    } else {
-      // Fresh (server saw our refill yet still says reloading): genuine new
-      // cycle the local missed. Adopt it to converge.
+    } else if (!stale) {
       g->weapon_ammo[e] = 0;
       g->weapon_reload[e] = def->reload_ticks;
       g->weapon_dirty_seq[e] = snap_ack;
     }
   } else if (g->weapon_reload[e] != 0) {
-    // Server done while local still reloading: fast-forward ONLY if fresh
-    // (server has acked our reload start, so it truly finished ahead and we
-    // started late). If stale, the server simply hasn't emptied yet (it is
-    // behind: e.g. local 0/118 reloading while server still shows 1/0 live):
-    // keep reloading, else we snap back out of reload (0->1) and wipe again
-    // on the next snapshot. Ammo stays empty while reloading either way.
     if (!stale) {
-      // Fresh: client started late, jump to the server state (done + its
-      // ammo, which may already include post-refill shots). Forward only.
       g->weapon_ammo[e] = srv_ammo;
       g->weapon_reload[e] = 0;
       g->weapon_dirty_seq[e] = snap_ack;
@@ -1011,14 +869,10 @@ static void weapon_apply_snapshot(GameState *g, u32 e, u8 srv_weapon,
       g->weapon_ammo[e] = 0;
     }
   } else if (srv_ammo < g->weapon_ammo[e]) {
-    // Both live: server fired extra shots we haven't (delayed release).
-    // Adopt the lower count; ignore higher (server hasn't seen our shots).
     g->weapon_ammo[e] = srv_ammo;
     g->weapon_dirty_seq[e] = snap_ack;
   }
 }
-
-// string validation
 
 static bool valid_port(String text, u16 *port) {
   unsigned long value = 0;
@@ -1081,11 +935,6 @@ static void socket_nonblocking(int fd) {
     (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Packet framing (exact size + magic + type). Semantic checks live in
-// net_validate_*_fields. All decoders zero-fill *out and copy field-wise,
-// so wire padding never propagates and struct padding never leaks.
-// Offsets always come from offsetof(), never literals, so layout changes
-// stay correct without touching this code.
 static bool net_packet_ok(const u8 *buf, i32 n, u8 type, i32 size) {
   return n == size && n >= 2 &&
          buf[offsetof(NetSnapshot, magic)] == NET_MAGIC &&
@@ -1130,7 +979,6 @@ static bool net_validate_snapshot_fields(const NetSnapshot *snap,
   return true;
 }
 
-// Framing check for a dense snapshot: exact size for the claimed count.
 static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
   if (!buf || n < (i32)NET_SNAPSHOT_HEADER_SIZE ||
       buf[offsetof(NetSnapshot, magic)] != NET_MAGIC ||
@@ -1143,10 +991,6 @@ static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
   return want >= 0 && n == want && (size_t)n <= sizeof(NetSnapshot);
 }
 
-// Returns wire length, or -1 when count invalid / buffer too small.
-// The header prefix has no padding (see asserts), so one memcpy moves
-// magic/type/local_player/count/session/tick/ack together; entities and
-// names follow as dense blobs.
 static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
   if (!snap || !out || snap->count > NET_ENTITY_LIMIT)
     return -1;
@@ -1163,9 +1007,6 @@ static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
   return want;
 }
 
-// Validates framing, then expands into a zero-filled struct.
-// Never partially fills *out. Semantic checks still need
-// net_validate_snapshot_fields.
 static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
   if (!buf || !out || !net_snapshot_wire_ok(buf, n))
     return false;
@@ -1176,14 +1017,12 @@ static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
   if (count > 0)
     memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
            (size_t)count * sizeof(NetEntity));
-  memcpy(out->names, buf + NET_SNAPSHOT_HEADER_SIZE +
-                         (size_t)count * sizeof(NetEntity),
+  memcpy(out->names,
+         buf + NET_SNAPSHOT_HEADER_SIZE + (size_t)count * sizeof(NetEntity),
          NET_SNAPSHOT_NAMES_SIZE);
   return true;
 }
 
-// Fixed-size decoders: exact-size framing + zero-fill + field copy.
-// Wire pad bytes are ignored, struct pad bytes stay zero.
 static bool net_input_decode(const u8 *buf, i32 n, NetInputPacket *out) {
   if (!buf || !out || n != (i32)sizeof(NetInputPacket))
     return false;
@@ -1239,8 +1078,6 @@ static void net_sanitize_chat_text(String text) {
   }
 }
 
-// notice helpers
-
 static void notice_set(GameState *g, String s) {
   i32 n = s.length < NOTICE_LENGTH ? s.length : NOTICE_LENGTH;
   if (n > 0)
@@ -1281,8 +1118,6 @@ static void notice_chat_msg(GameState *g, String name, String text) {
   g->notice_ticks = SIM_HZ * 5;
 }
 
-// GameState string views
-
 static String game_requested_name(GameState *g) {
   return (String){g->requested_name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
 }
@@ -1299,8 +1134,6 @@ static String game_notice(GameState *g) {
   return (String){g->notice, (i32)g->notice_length, NOTICE_LENGTH};
 }
 
-// entity lifecycle
-
 static void game_zero(GameState *g) {
   *g = (GameState){.local_player = NET_PACKET_NONE};
   memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
@@ -1308,18 +1141,15 @@ static void game_zero(GameState *g) {
 }
 
 static void clear_entity_data(GameState *g, u32 e) {
-  // SoA layout: each field is its own array, so one memset cannot clear a
-  // single entity. Zero every zero-default slot, then restore the non-zero
-  // defaults (lag neutral, unit scale, default weapon which is == 0).
-  g->px[e] = g->py[e] = g->pz[e] = 0;
-  g->vx[e] = g->vy[e] = g->vz[e] = 0;
-  g->yaw[e] = g->pitch[e] = 0;
+  g->pos[e] = (IVec3){0, 0, 0};
+  g->vel[e] = (IVec3){0, 0, 0};
+  g->aim[e] = (Aim){0, 0};
   g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
   g->flash[e] = g->held_by[e] = 0;
   g->weapon_ammo[e] = g->weapon_cooldown[e] = g->weapon_prev[e] = 0;
   g->weapon_reload[e] = g->weapon_dirty_seq[e] = 0;
   g->r_reload[e] = 0;
-  g->lag_yaw[e] = g->lag_pitch[e] = LAG_NEUTRAL;
+  g->lag[e] = (LagAim){LAG_NEUTRAL, LAG_NEUTRAL};
   g->scale[e] = 1.0f;
   g->weapon_id[e] = WEAPON_P99;
 }
@@ -1393,18 +1223,14 @@ static u32 create_cube(GameState *g, u32 index) {
   if (e == ECS_INVALID_ENTITY)
     return e;
   clear_entity_data(g, e);
-  g->px[e] = (i16)(((int)((index * 7u + 3u) % 17u) - 8) * POS_SCALE);
-  g->py[e] = POS_SCALE / 2;
-  g->pz[e] = (i16)(((int)((index * 11u + 5u) % 17u) - 8) * POS_SCALE);
+  g->pos[e].x = (i16)(((int)((index * 7u + 3u) % 17u) - 8) * POS_SCALE);
+  g->pos[e].y = POS_SCALE / 2;
+  g->pos[e].z = (i16)(((int)((index * 11u + 5u) % 17u) - 8) * POS_SCALE);
   g->kind[e] = KIND_CUBE;
   add_kind_components(g, e, KIND_CUBE);
   return e;
 }
 
-// The arena floor as a solid entity: an arena-wide slab from deep below up
-// to y=0. Never rendered (the ground plane is drawn separately) and never
-// destroyed; it exists only so the hitscan segment test covers the ground
-// with zero special cases.
 static u32 create_floor(GameState *g) {
   u32 e = ecs_create(&g->ecs);
   if (e == ECS_INVALID_ENTITY)
@@ -1416,24 +1242,19 @@ static u32 create_floor(GameState *g) {
 }
 
 static void game_init(GameState *g) {
-  // Server-only world init: authoritative cubes plus the floor slab live
-  // here. The floor is a real solid entity so hitscan treats ground, cubes
-  // and players through one universal path.
   game_zero(g);
   for (u32 i = 0; i < MAX_CUBES; ++i)
     (void)create_cube(g, i);
   (void)create_floor(g);
 }
 
-// Client world lifecycle (proper place for world resets, not a patch in
-// apply_snapshot). The client world is purely snapshot-driven: it starts
-// empty and is populated only by the server. game_init() is server-only.
 static void client_clear_world(GameState *g) {
-  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
-    if (ecs_alive(&g->ecs, e))
-      ecs_destroy(&g->ecs, e);
+  u32 comps[] = {COMP_POSITION};
+  EcsQuery q = ecs_query(&g->ecs, comps, 1);
+  while (ecs_next(&q))
+    ecs_destroy(&g->ecs, q.entity);
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
     g->scale[e] = 1.0f;
-  }
   memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
   g->snapshot_seen = 0;
 }
@@ -1443,7 +1264,35 @@ static void client_init(GameState *g) {
   client_clear_world(g);
 }
 
-// spatial / gun helpers
+static Vector3 vec3(f32 x, f32 y, f32 z) { return (Vector3){x, y, z}; }
+
+static Vector3 vec3_add(Vector3 a, Vector3 b) {
+  return vec3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+static Vector3 vec3_sub(Vector3 a, Vector3 b) {
+  return vec3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+static Vector3 vec3_mul(Vector3 a, f32 s) {
+  return vec3(a.x * s, a.y * s, a.z * s);
+}
+
+static f32 vec3_dot(Vector3 a, Vector3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static f32 vec3_len(Vector3 a) { return sqrtf(vec3_dot(a, a)); }
+
+static Vector3 vec3_cross(Vector3 a, Vector3 b) {
+  return vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+              a.x * b.y - a.y * b.x);
+}
+
+static Vector3 vec3_norm(Vector3 a) {
+  f32 l = vec3_len(a);
+  return l < 1e-6f ? vec3(1.0f, 0.0f, 0.0f) : vec3_mul(a, 1.0f / l);
+}
 
 static f32 scale_value(const GameState *g, u32 e) {
   if (e >= ECS_MAX_ENTITIES || !ecs_has(&g->ecs, e, COMP_SCALE))
@@ -1454,144 +1303,132 @@ static f32 scale_value(const GameState *g, u32 e) {
   return clamp_float(s, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
 }
 
+static Vector3 interp_center_fp(const GameState *g, u32 e, f32 a) {
+  f32 k = 1.0f - a;
+  return vec3((f32)g->pos[e].x - (f32)g->vel[e].x * k,
+              (f32)g->pos[e].y - (f32)g->vel[e].y * k,
+              (f32)g->pos[e].z - (f32)g->vel[e].z * k);
+}
+
+static Vector3 entity_pos_m(const GameState *g, u32 e, f32 a) {
+  return vec3_mul(interp_center_fp(g, e, a), 1.0f / (f32)POS_SCALE);
+}
+
 static bool cube_overlap(const GameState *g, i16 x, i16 z, i16 radius) {
-  u32 comps[] = {COMP_POSITION, COMP_RENDERABLE};
+  u32 comps[] = {COMP_POSITION, COMP_SOLID};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    if (g->kind[e] == KIND_CUBE && g->held_by[e] == 0) {
-      int half = (int)((f32)(POS_SCALE / 2) * scale_value(g, e));
-      if (abs((int)x - g->px[e]) < half + radius &&
-          abs((int)z - g->pz[e]) < half + radius)
-        return true;
-    }
+    if (g->kind[e] != KIND_CUBE || g->held_by[e] != 0)
+      continue;
+    f32 s = scale_value(g, e);
+    int hx = (int)lroundf(0.5f * CUBE_VIS_X * s * (f32)POS_SCALE);
+    int hz = (int)lroundf(0.5f * CUBE_VIS_Z * s * (f32)POS_SCALE);
+    if (abs((int)x - g->pos[e].x) < hx + radius &&
+        abs((int)z - g->pos[e].z) < hz + radius)
+      return true;
   }
   return false;
 }
 
-static void aim_dir(i16 yaw_deg, i16 pitch_deg, Vector3 *out) {
-  f32 yaw = (f32)yaw_deg * DEG2RAD;
-  f32 pitch = (f32)pitch_deg * DEG2RAD;
-  f32 h = cosf(pitch);
-  out->x = sinf(yaw) * h;
-  out->y = sinf(pitch);
-  out->z = cosf(yaw) * h;
-}
-
-// Float-angle look direction; gun local +Z maps to this after yaw/pitch.
 static Vector3 sight_dir(f32 yaw_deg, f32 pitch_deg) {
   f32 h = cosf(pitch_deg * DEG2RAD);
-  return (Vector3){sinf(yaw_deg * DEG2RAD) * h, sinf(pitch_deg * DEG2RAD),
-                   cosf(yaw_deg * DEG2RAD) * h};
+  return vec3(sinf(yaw_deg * DEG2RAD) * h, sinf(pitch_deg * DEG2RAD),
+              cosf(yaw_deg * DEG2RAD) * h);
 }
 
-// Full third-person pose from feet/yaw/pitch plus the eye-ray distance.
-// Origin at the hip carry; yaw_g/pitch_g aim the (recentered) barrel at the
-// eye-ray point at zero_m, so the muzzle axis meets the crosshair exactly
-// there. Closed form, no iteration; a pure function of its inputs, so the
-// gun glides instead of snapping.
-static void sight_gun_pose_m(Vector3 feet, f32 yaw_deg, f32 pitch_deg,
-                             f32 zero_m, Vector3 *origin, f32 *yaw_g,
-                             f32 *pitch_g) {
+static void aim_dir(i16 yaw_deg, i16 pitch_deg, Vector3 *out) {
+  *out = sight_dir((f32)yaw_deg, (f32)pitch_deg);
+}
+
+static void look_basis(f32 yaw_deg, f32 pitch_deg, Vector3 *fwd, Vector3 *right,
+                       Vector3 *up) {
+  *fwd = sight_dir(yaw_deg, pitch_deg);
   f32 cy = cosf(yaw_deg * DEG2RAD), sy = sinf(yaw_deg * DEG2RAD);
-  // Body-local (-SIDE, UP, FWD) through yaw-only rotation, so the gun keeps
-  // its carry height while the view pitches.
-  Vector3 a = {feet.x - GUN_HIP_SIDE_M * cy + GUN_HIP_FWD_M * sy,
-               feet.y + GUN_HIP_UP_M,
-               feet.z + GUN_HIP_SIDE_M * sy + GUN_HIP_FWD_M * cy};
-  Vector3 f = sight_dir(yaw_deg, pitch_deg);
-  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
-  Vector3 s = {eye.x + f.x * zero_m, eye.y + f.y * zero_m,
-               eye.z + f.z * zero_m};
-  // Recentered mesh has the barrel on the gun axis, so aiming the axis at
-  // the zero puts the muzzle axis through it exactly.
-  Vector3 d = {s.x - a.x, s.y - a.y, s.z - a.z};
-  f32 len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-  if (len < 1e-6f) {
-    *origin = a;
-    *yaw_g = yaw_deg;
-    *pitch_g = pitch_deg;
-    return;
-  }
-  d.x /= len;
-  d.y /= len;
-  d.z /= len;
-  *origin = a;
-  *yaw_g = atan2f(d.x, d.z) * RAD2DEG;
-  *pitch_g = asinf(clamp_float(d.y, -1.0f, 1.0f)) * RAD2DEG;
+  *right = vec3(-cy, 0.0f, sy);
+  *up = vec3_cross(*right, *fwd);
 }
 
-// Ejection cut in recentered mesh space (mesh x -0.385 + centering 0.32),
-// rotated yaw-then-pitch exactly like the render transform.
-static Vector3 sight_gun_port_m(Vector3 origin, f32 yaw_g, f32 pitch_g) {
+static Vector3 player_eye_m(Vector3 feet) {
+  return vec3(feet.x, feet.y + EYE_HEIGHT_M, feet.z);
+}
+
+static Vector3 hip_origin_m(Vector3 feet, f32 yaw_deg) {
+  f32 cy = cosf(yaw_deg * DEG2RAD), sy = sinf(yaw_deg * DEG2RAD);
+  return vec3(feet.x - GUN_HIP_SIDE_M * cy + GUN_HIP_FWD_M * sy,
+              feet.y + GUN_HIP_UP_M,
+              feet.z + GUN_HIP_SIDE_M * sy + GUN_HIP_FWD_M * cy);
+}
+
+typedef struct {
+  Vector3 origin, fwd, right, up;
+  f32 yaw, pitch;
+} GunPose;
+
+static GunPose gun_pose_at(Vector3 feet, f32 look_yaw, f32 look_pitch,
+                           f32 zero_m) {
+  GunPose p;
+  p.origin = hip_origin_m(feet, look_yaw);
+  Vector3 target =
+      vec3_add(player_eye_m(feet),
+               vec3_mul(sight_dir(look_yaw, look_pitch), fmaxf(zero_m, 0.35f)));
+  Vector3 d = vec3_sub(target, p.origin);
+  f32 len = vec3_len(d);
+  if (len < 1e-5f) {
+    p.yaw = look_yaw;
+    p.pitch = look_pitch;
+  } else {
+    d = vec3_mul(d, 1.0f / len);
+    p.yaw = atan2f(d.x, d.z) * RAD2DEG;
+    p.pitch = asinf(clamp_float(d.y, -1.0f, 1.0f)) * RAD2DEG;
+  }
+  look_basis(p.yaw, p.pitch, &p.fwd, &p.right, &p.up);
+  return p;
+}
+
+static Vector3 gun_port_m(const GunPose *p) {
   f32 x = GUN_CENTER_X_M - 0.385f, y = 0.045f, z = 0.18f;
-  f32 pt = -pitch_g * DEG2RAD;
+  f32 pt = -p->pitch * DEG2RAD;
   f32 cp = cosf(pt), sp = sinf(pt);
   f32 y1 = y * cp - z * sp, z1 = y * sp + z * cp;
-  f32 cy = cosf(yaw_g * DEG2RAD), sy = sinf(yaw_g * DEG2RAD);
-  return (Vector3){origin.x + x * cy + z1 * sy, origin.y + y1,
-                   origin.z - x * sy + z1 * cy};
+  f32 cy = cosf(p->yaw * DEG2RAD), sy = sinf(p->yaw * DEG2RAD);
+  return vec3(p->origin.x + x * cy + z1 * sy, p->origin.y + y1,
+              p->origin.z - x * sy + z1 * cy);
 }
 
-// Smooth remote yaw/pitch: snapshot base plus the lag delta scaled by the
-// position alpha, so body and gun glide together instead of snapping.
 static f32 present_lerp_angle(i16 base, int delta, f32 a) {
   return (f32)base - (f32)delta * (1.0f - a);
 }
 
-// ---- universal hitscan (single path for floor, cubes and players) ----
-// Every solid answers the same question: where does the segment p0->p0+d
-// enter my box, and through which face? The projectile loop takes the
-// nearest entry over all solids, so mark placement, orientation, strength
-// and spatter never branch on what was hit. Differences between hittables
-// are data below (bounds, material), not code paths.
-
-// Spatter material per kind, indexed table so resolving it is a lookup.
-// Cubes and players chip the mid tone, the floor chips purple.
 static const u8 SOLID_MAT[] = {
-    MARK_MAT_PURPLE, // 0: unused
-    MARK_MAT_MID,    // KIND_CUBE
-    MARK_MAT_MID,    // KIND_PLAYER
-    MARK_MAT_PURPLE, // KIND_BULLET (never solid)
-    MARK_MAT_PURPLE, // KIND_IMPACT_MARK (never solid)
-    MARK_MAT_PURPLE, // KIND_CASING (never solid)
-    MARK_MAT_PURPLE, // KIND_FLOOR
+    MARK_MAT_PURPLE, MARK_MAT_MID,    MARK_MAT_MID,    MARK_MAT_PURPLE,
+    MARK_MAT_PURPLE, MARK_MAT_PURPLE, MARK_MAT_PURPLE,
 };
 
-// World-space bounds of a solid, in fixed-point units as floats. Cube
-// extents follow world scale exactly like the old discrete test; players
-// keep the same 64-wide, 0..128-tall hitbox; the floor is the arena slab.
-static void solid_bounds(const GameState *g, u32 e, Vector3 *bmin,
-                         Vector3 *bmax) {
+static void solid_bounds_fp(const GameState *g, u32 e, f32 a, Vector3 *bmin,
+                            Vector3 *bmax) {
+  Vector3 c = interp_center_fp(g, e, a);
   if (g->kind[e] == KIND_FLOOR) {
-    float a = (float)(ARENA * POS_SCALE);
-    *bmin = (Vector3){-a, -a, -a};
-    *bmax = (Vector3){a, 0.0f, a};
+    float r = (float)(ARENA * POS_SCALE);
+    *bmin = vec3(-r, -r, -r);
+    *bmax = vec3(r, 0.0f, r);
     return;
   }
   if (g->kind[e] == KIND_PLAYER) {
-    *bmin = (Vector3){(float)g->px[e] - 32.0f, 0.0f,
-                      (float)g->pz[e] - 32.0f};
-    *bmax = (Vector3){(float)g->px[e] + 32.0f, 128.0f,
-                      (float)g->pz[e] + 32.0f};
+    float r = PLAYER_HIT_RADIUS_M * (float)POS_SCALE;
+    float h = PLAYER_HIT_HEIGHT_M * (float)POS_SCALE;
+    *bmin = vec3(c.x - r, c.y, c.z - r);
+    *bmax = vec3(c.x + r, c.y + h, c.z + r);
     return;
   }
-  float s = scale_value(g, e);
-  float rxz = 42.0f * s, ry = 48.0f * s;
-  if (rxz < 8.0f)
-    rxz = 8.0f;
-  if (ry < 8.0f)
-    ry = 8.0f;
-  *bmin = (Vector3){(float)g->px[e] - rxz, (float)g->py[e] - ry,
-                    (float)g->pz[e] - rxz};
-  *bmax = (Vector3){(float)g->px[e] + rxz, (float)g->py[e] + ry,
-                    (float)g->pz[e] + rxz};
+  f32 s = scale_value(g, e);
+  f32 hx = 0.5f * CUBE_VIS_X * s * (f32)POS_SCALE;
+  f32 hy = 0.5f * CUBE_VIS_Y * s * (f32)POS_SCALE;
+  f32 hz = 0.5f * CUBE_VIS_Z * s * (f32)POS_SCALE;
+  *bmin = vec3(c.x - hx, c.y - hy, c.z - hz);
+  *bmax = vec3(c.x + hx, c.y + hy, c.z + hz);
 }
 
-// Slab test: entry t in [0,1] plus entry-face normal. Exact, so fast
-// bullets cannot tunnel and the contact point sits on the face (no sampling
-// grid, no backoff tables). A segment starting inside reports t=0 with the
-// face opposing travel (point-blank shots still mark).
 static bool seg_box_hit(Vector3 p0, Vector3 d, Vector3 bmin, Vector3 bmax,
                         float *t_out, Vector3 *n_out) {
   float tmin = 0.0f, tmax = 1.0f;
@@ -1672,43 +1509,90 @@ static bool seg_box_hit(Vector3 p0, Vector3 d, Vector3 bmin, Vector3 bmax,
       return false;
   }
   if (n.x == 0.0f && n.y == 0.0f && n.z == 0.0f)
-    n = mark_normal_vec(mark_code_for_vec(
-        (Vector3){-d.x, -d.y, -d.z}));
+    n = mark_normal_vec(mark_code_for_vec(vec3(-d.x, -d.y, -d.z)));
   *t_out = tmin;
   *n_out = n;
   return true;
 }
 
-// True aim distance for the gun zero: nearest solid along the eye ray,
-// players included, shooter excluded. Both ends run this same helper — the
-// server on authoritative state for bullets, the client on snapshot state
-// for render — so tracers match the visible gun and aiming at a head zeroes
-// on the head at any range. Sky falls back to a near-parallel distance.
-#define SIGHT_SKY_DIST_M 12.0f
-#define SIGHT_MAX_DIST_M 60.0f
+typedef struct {
+  bool hit;
+  f32 t;
+  Vector3 n;
+  u32 entity;
+} TraceHit;
 
-static f32 sight_zero_m(const GameState *g, u32 skip, Vector3 eye, Vector3 f) {
-  Vector3 p0 = {eye.x * (f32)POS_SCALE, eye.y * (f32)POS_SCALE,
-                eye.z * (f32)POS_SCALE};
-  Vector3 d = {f.x * SIGHT_MAX_DIST_M * (f32)POS_SCALE,
-               f.y * SIGHT_MAX_DIST_M * (f32)POS_SCALE,
-               f.z * SIGHT_MAX_DIST_M * (f32)POS_SCALE};
-  f32 best = 1.0f;
+static bool player_seg_hit(const GameState *g, u32 e, f32 a, Vector3 p0,
+                           Vector3 d, float *t_out, Vector3 *n_out) {
+  Vector3 feet = interp_center_fp(g, e, a);
+  f32 yaw = present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
+  f32 cy = cosf(yaw * DEG2RAD), sy = sinf(yaw * DEG2RAD);
+  Vector3 w0 = vec3_sub(p0, feet);
+  Vector3 lp0 = vec3(w0.x * cy - w0.z * sy, w0.y, w0.x * sy + w0.z * cy);
+  Vector3 ld = vec3(d.x * cy - d.z * sy, d.y, d.x * sy + d.z * cy);
+  f32 hx = 0.5f * PLAYER_BODY_X * (f32)POS_SCALE;
+  f32 zn = 0.5f * PLAYER_BODY_Z * (f32)POS_SCALE;
+  f32 zp = (0.06f + 0.5f * PLAYER_HEAD_S) * (f32)POS_SCALE;
+  Vector3 bmin = vec3(-hx, 0.0f, -zn);
+  Vector3 bmax = vec3(hx, PLAYER_HIT_HEIGHT_M * (f32)POS_SCALE, zp);
+  Vector3 ln;
+  float t;
+  if (!seg_box_hit(lp0, ld, bmin, bmax, &t, &ln))
+    return false;
+  *n_out = vec3(ln.x * cy + ln.z * sy, ln.y, -ln.x * sy + ln.z * cy);
+  *t_out = t;
+  return true;
+}
+
+static TraceHit trace_solids(const GameState *g, Vector3 p0, Vector3 d,
+                             u32 skip_e, u8 skip_owner, f32 a) {
+  TraceHit r = {false, 1.0f, {0.0f, 1.0f, 0.0f}, ECS_INVALID_ENTITY};
   u32 comps[] = {COMP_SOLID};
   EcsQuery q = ecs_query(&g->ecs, comps, 1);
   while (ecs_next(&q)) {
-    u32 o = q.entity;
-    if (o == skip)
+    u32 s = q.entity;
+    if (s == skip_e)
       continue;
-    Vector3 bmin, bmax, n;
+    if (g->kind[s] == KIND_CUBE && g->held_by[s] != 0)
+      continue;
+    if (g->kind[s] == KIND_PLAYER && skip_owner < MAX_PLAYERS &&
+        g->owner[s] == skip_owner)
+      continue;
+    Vector3 n;
     f32 t;
-    solid_bounds(g, o, &bmin, &bmax);
-    if (seg_box_hit(p0, d, bmin, bmax, &t, &n) && t < best)
-      best = t;
+    bool hit;
+    if (g->kind[s] == KIND_PLAYER) {
+      hit = player_seg_hit(g, s, a, p0, d, &t, &n);
+    } else {
+      Vector3 bmin, bmax;
+      solid_bounds_fp(g, s, a, &bmin, &bmax);
+      hit = seg_box_hit(p0, d, bmin, bmax, &t, &n);
+    }
+    if (hit && t < r.t) {
+      r.hit = true;
+      r.t = t;
+      r.n = n;
+      r.entity = s;
+    }
   }
-  if (best >= 1.0f)
+  return r;
+}
+
+static f32 sight_zero_m(const GameState *g, u32 skip, Vector3 eye, Vector3 f,
+                        f32 a) {
+  Vector3 p0 = vec3_mul(eye, (f32)POS_SCALE);
+  Vector3 d = vec3_mul(f, SIGHT_MAX_DIST_M * (f32)POS_SCALE);
+  TraceHit h = trace_solids(g, p0, d, skip, NET_PACKET_NONE, a);
+  if (!h.hit)
     return SIGHT_SKY_DIST_M;
-  return clamp_float(best * SIGHT_MAX_DIST_M, 0.5f, SIGHT_MAX_DIST_M);
+  return clamp_float(h.t * SIGHT_MAX_DIST_M, 0.35f, SIGHT_MAX_DIST_M);
+}
+
+static GunPose player_gun_pose(const GameState *g, u32 e, Vector3 feet, f32 yaw,
+                               f32 pitch, f32 a) {
+  Vector3 eye = player_eye_m(feet);
+  Vector3 look = sight_dir(yaw, pitch);
+  return gun_pose_at(feet, yaw, pitch, sight_zero_m(g, e, eye, look, a));
 }
 
 #endif

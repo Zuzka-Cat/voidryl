@@ -35,7 +35,7 @@ static void movement_system(GameState *g) {
     if (g->owner[e] >= MAX_PLAYERS)
       continue;
     InputCommand *in = &g->input[g->owner[e]];
-    f32 yaw = (f32)g->yaw[e] * DEG2RAD;
+    f32 yaw = (f32)g->aim[e].yaw * DEG2RAD;
     f32 dx = (f32)in->move_z * sinf(yaw) - (f32)in->move_x * cosf(yaw);
     f32 dz = (f32)in->move_z * cosf(yaw) + (f32)in->move_x * sinf(yaw);
     f32 len = sqrtf(dx * dx + dz * dz);
@@ -44,8 +44,7 @@ static void movement_system(GameState *g) {
       dz /= len;
     }
     bool aiming = (in->buttons & BTN_AIM) != 0;
-    bool sprinting =
-        present_sprint_want(in->buttons, in->move_x, in->move_z);
+    bool sprinting = present_sprint_want(in->buttons, in->move_x, in->move_z);
     f32 speed = 3.0f;
     if (aiming)
       speed *= weapon_aim_move_scale(g->weapon_id[e]);
@@ -53,25 +52,25 @@ static void movement_system(GameState *g) {
       speed = 4.5f;
     i16 step_x = (i16)lroundf(dx * speed);
     i16 step_z = (i16)lroundf(dz * speed);
-    g->vx[e] = step_x;
-    g->vz[e] = step_z;
-    if ((in->buttons & BTN_JUMP) != 0 && g->py[e] == 0)
-      g->vy[e] = 6;
-    if (g->py[e] > 0 || g->vy[e] > 0) {
-      g->py[e] = (i16)(g->py[e] + g->vy[e]);
-      if (g->tick % 6u == 0 && g->vy[e] > -6)
-        --g->vy[e];
-      if (g->py[e] <= 0) {
-        g->py[e] = 0;
-        g->vy[e] = 0;
+    g->vel[e].x = step_x;
+    g->vel[e].z = step_z;
+    if ((in->buttons & BTN_JUMP) != 0 && g->pos[e].y == 0)
+      g->vel[e].y = 6;
+    if (g->pos[e].y > 0 || g->vel[e].y > 0) {
+      g->pos[e].y = (i16)(g->pos[e].y + g->vel[e].y);
+      if (g->tick % 6u == 0 && g->vel[e].y > -6)
+        --g->vel[e].y;
+      if (g->pos[e].y <= 0) {
+        g->pos[e].y = 0;
+        g->vel[e].y = 0;
       }
     }
-    i16 nx = (i16)clamp_int((int)g->px[e] + step_x, -ARENA_POS, ARENA_POS);
-    i16 nz = (i16)clamp_int((int)g->pz[e] + step_z, -ARENA_POS, ARENA_POS);
-    if (!cube_overlap(g, nx, g->pz[e], POS_SCALE / 4))
-      g->px[e] = nx;
-    if (!cube_overlap(g, g->px[e], nz, POS_SCALE / 4))
-      g->pz[e] = nz;
+    i16 nx = (i16)clamp_int((int)g->pos[e].x + step_x, -ARENA_POS, ARENA_POS);
+    i16 nz = (i16)clamp_int((int)g->pos[e].z + step_z, -ARENA_POS, ARENA_POS);
+    if (!cube_overlap(g, nx, g->pos[e].z, POS_SCALE / 4))
+      g->pos[e].x = nx;
+    if (!cube_overlap(g, g->pos[e].x, nz, POS_SCALE / 4))
+      g->pos[e].z = nz;
   }
 }
 
@@ -82,14 +81,14 @@ static void aim_system(GameState *g) {
     u8 p = g->owner[q.entity];
     if (p >= MAX_PLAYERS)
       continue;
-    g->yaw[q.entity] = wrap_degrees(g->input[p].aim_yaw);
-    g->pitch[q.entity] = (i16)clamp_int(g->input[p].aim_pitch, -75, 75);
+    g->aim[q.entity].yaw = wrap_degrees(g->input[p].aim_yaw);
+    g->aim[q.entity].pitch = (i16)clamp_int(g->input[p].aim_pitch, -75, 75);
   }
 }
 
 static u32 held_cube_for(const GameState *g, u8 player) {
-  u32 comps[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED, COMP_SCALE};
-  EcsQuery q = ecs_query(&g->ecs, comps, 4);
+  u32 comps[] = {COMP_POSITION, COMP_SCALE, COMP_SOLID};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q))
     if (g->kind[q.entity] == KIND_CUBE && g->held_by[q.entity] == player + 1u)
       return q.entity;
@@ -112,23 +111,20 @@ static void holding_system(GameState *g) {
     }
     if (want && held == ECS_INVALID_ENTITY) {
       Vector3 dir;
-      u32 cubes[] = {COMP_POSITION, COMP_RENDERABLE, COMP_NETWORKED,
-                     COMP_SCALE};
-      EcsQuery cq = ecs_query(&g->ecs, cubes, 4);
+      u32 cubes[] = {COMP_POSITION, COMP_SCALE, COMP_SOLID};
+      EcsQuery cq = ecs_query(&g->ecs, cubes, 3);
       f32 best_d = 1000.0f;
       u32 best = ECS_INVALID_ENTITY;
-      aim_dir(g->yaw[pe], g->pitch[pe], &dir);
+      aim_dir(g->aim[pe].yaw, g->aim[pe].pitch, &dir);
       while (ecs_next(&cq)) {
         u32 c = cq.entity;
         if (g->kind[c] != KIND_CUBE || g->held_by[c] != 0)
           continue;
-        Vector3 off = {(f32)(g->px[c] - g->px[pe]) / POS_SCALE,
-                       (f32)(g->py[c] - (g->py[pe] + 96)) / POS_SCALE,
-                       (f32)(g->pz[c] - g->pz[pe]) / POS_SCALE};
-        f32 d = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
-        f32 dot = d > 0.01f
-                      ? (off.x * dir.x + off.y * dir.y + off.z * dir.z) / d
-                      : -1.0f;
+        Vector3 off = {(f32)(g->pos[c].x - g->pos[pe].x) / POS_SCALE,
+                       (f32)(g->pos[c].y - (g->pos[pe].y + 96)) / POS_SCALE,
+                       (f32)(g->pos[c].z - g->pos[pe].z) / POS_SCALE};
+        f32 d = vec3_len(off);
+        f32 dot = d > 0.01f ? vec3_dot(off, dir) / d : -1.0f;
         if (d < 5.0f && dot > 0.55f && d < best_d) {
           best_d = d;
           best = c;
@@ -140,33 +136,38 @@ static void holding_system(GameState *g) {
       }
     }
     if (held != ECS_INVALID_ENTITY) {
-      // Grounded perspective play: the cube slides on the floor around the
-      // holder. Yaw steers it, pitch drives distance/scale (look down ->
-      // close/tiny, look forward/far -> distant/giant). Y is always
-      // grounded at half height so it never floats. Scale persists after
-      // release.
-      Vector3 dir;
-      aim_dir(g->yaw[pe], g->pitch[pe], &dir);
-      (void)dir;
-      f32 dist = hold_dist_for_pitch(g->pitch[pe]);
-      f32 scale = clamp_float(dist / HOLD_BASE_DIST, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
+      f32 dist = hold_dist_for_pitch(g->aim[pe].pitch);
+      f32 scale =
+          clamp_float(dist / HOLD_BASE_DIST, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
       g->scale[held] = scale;
-      f32 yaw_rad = (f32)g->yaw[pe] * DEG2RAD;
+      f32 yaw_rad = (f32)g->aim[pe].yaw * DEG2RAD;
       f32 hx = sinf(yaw_rad);
       f32 hz = cosf(yaw_rad);
-      f32 half_h = 32.0f * scale;
-      f32 half_xz = 28.8f * scale;
+      f32 half_h = 0.5f * CUBE_VIS_Y * scale * (f32)POS_SCALE;
+      f32 half_xz = 0.5f * CUBE_VIS_X * scale * (f32)POS_SCALE;
       f32 limit_x = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
       f32 limit_z = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
-      f32 tx = (f32)g->px[pe] + hx * dist * (f32)POS_SCALE;
-      f32 tz = (f32)g->pz[pe] + hz * dist * (f32)POS_SCALE;
+      f32 tx = (f32)g->pos[pe].x + hx * dist * (f32)POS_SCALE;
+      f32 tz = (f32)g->pos[pe].z + hz * dist * (f32)POS_SCALE;
       tx = clamp_float(tx, -limit_x, limit_x);
       tz = clamp_float(tz, -limit_z, limit_z);
-      g->px[held] = (i16)lroundf(tx);
-      g->py[held] = (i16)lroundf(half_h);
-      g->pz[held] = (i16)lroundf(tz);
+      g->pos[held].x = (i16)lroundf(tx);
+      g->pos[held].y = (i16)lroundf(half_h);
+      g->pos[held].z = (i16)lroundf(tz);
     }
   }
+}
+
+static Vector3 apply_spread(Vector3 dir, Vector3 right, Vector3 up, f32 spread,
+                            u32 h) {
+  if (spread <= 0.001f)
+    return dir;
+  u32 h2 = mix32(h ^ 0x85ebca6bu);
+  f32 u1 = (f32)(h & 0xFFFFu) / 32767.5f - 1.0f;
+  f32 u2 = (f32)(h2 & 0xFFFFu) / 32767.5f - 1.0f;
+  f32 s = spread * DEG2RAD;
+  return vec3_norm(vec3_add(
+      dir, vec3_mul(vec3_add(vec3_mul(right, u1), vec3_mul(up, u2)), s)));
 }
 
 static u32 spawn_bullet(GameState *g, u32 pe) {
@@ -176,65 +177,28 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
   if (e == ECS_INVALID_ENTITY)
     return e;
   clear_entity_data(g, e);
-  // Shots leave the converged hip-gun muzzle along the barrel (+spread only),
-  // from the exact pose the client renders, so tracers match the visible gun.
-  Vector3 feet = {(f32)g->px[pe] / POS_SCALE, (f32)g->py[pe] / POS_SCALE,
-                  (f32)g->pz[pe] / POS_SCALE};
-  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
-  Vector3 fv = sight_dir((f32)g->yaw[pe], (f32)g->pitch[pe]);
-  f32 zero = sight_zero_m(g, pe, eye, fv);
-  Vector3 gp;
-  f32 gyaw, gpitch;
-  sight_gun_pose_m(feet, (f32)g->yaw[pe], (f32)g->pitch[pe], zero, &gp, &gyaw,
-                   &gpitch);
-  Vector3 gd = sight_dir(gyaw, gpitch);
-  Vector3 muzzle = {gp.x + gd.x * GUN_MUZZLE_Z_M, gp.y + gd.y * GUN_MUZZLE_Z_M,
-                    gp.z + gd.z * GUN_MUZZLE_Z_M};
-  Vector3 dir = gd;
-  // Spread basis around the barrel: yaw-only right plus r x dir up.
-  f32 gcy = cosf(gyaw * DEG2RAD), gsy = sinf(gyaw * DEG2RAD);
-  Vector3 r = {-gcy, 0.0f, gsy};
-  Vector3 u = {r.y * gd.z - r.z * gd.y, r.z * gd.x - r.x * gd.z,
-               r.x * gd.y - r.y * gd.x};
-  // Per-weapon imprecision: slight cone, tighter while aiming.
-  {
-    u8 owner = g->owner[pe];
-    bool aiming = owner < MAX_PLAYERS &&
-                  (g->input[owner].buttons & BTN_AIM) != 0;
-    f32 spread = weapon_spread_deg(g->weapon_id[pe], aiming);
-    if (spread > 0.001f) {
-      u32 h = mix32(g->tick * 2654435761u ^ (u32)pe * 40503u ^
-                    (u32)owner * 65599u ^ (u32)g->weapon_ammo[pe] * 97u ^
-                    0x9e3779b9u);
-      u32 h2 = mix32(h ^ 0x85ebca6bu);
-      f32 u1 = (f32)(h & 0xFFFFu) / 32767.5f - 1.0f;
-      f32 u2 = (f32)(h2 & 0xFFFFu) / 32767.5f - 1.0f;
-      f32 s = spread * DEG2RAD;
-      dir.x += (r.x * u1 + u.x * u2) * s;
-      dir.y += (r.y * u1 + u.y * u2) * s;
-      dir.z += (r.z * u1 + u.z * u2) * s;
-      f32 dlen = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-      if (dlen > 0.001f) {
-        dir.x /= dlen;
-        dir.y /= dlen;
-        dir.z /= dlen;
-      }
-    }
-  }
-  g->px[e] = (i16)lroundf(muzzle.x * POS_SCALE);
-  g->py[e] = (i16)lroundf(muzzle.y * POS_SCALE);
-  g->pz[e] = (i16)lroundf(muzzle.z * POS_SCALE);
-  // No shooter-velocity inheritance: at 3 u/tick strafe vs 64 u/tick shots it
-  // would angle tracers ~3 deg off the crosshair. Shots stay on the ray.
-  f32 bvx = dir.x * BULLET_SPEED;
-  f32 bvy = dir.y * BULLET_SPEED;
-  f32 bvz = dir.z * BULLET_SPEED;
-  g->vx[e] = (i16)lroundf(bvx);
-  g->vy[e] = (i16)lroundf(bvy);
-  g->vz[e] = (i16)lroundf(bvz);
-  g->yaw[e] = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
-  g->pitch[e] =
-      (i16)clamp_int((int)lroundf(asinf(clamp_float(dir.y, -1.0f, 1.0f)) * RAD2DEG), -89, 89);
+  Vector3 feet = entity_pos_m(g, pe, 1.0f);
+  f32 yaw = (f32)g->aim[pe].yaw;
+  f32 pitch = (f32)g->aim[pe].pitch;
+  Vector3 fwd, right, up;
+  look_basis(yaw, pitch, &fwd, &right, &up);
+  u8 owner = g->owner[pe];
+  bool aiming = owner < MAX_PLAYERS && (g->input[owner].buttons & BTN_AIM) != 0;
+  u32 h = mix32(g->tick * 2654435761u ^ (u32)pe * 40503u ^ (u32)owner * 65599u ^
+                (u32)g->weapon_ammo[pe] * 97u ^ 0x9e3779b9u);
+  Vector3 dir = apply_spread(fwd, right, up,
+                             weapon_spread_deg(g->weapon_id[pe], aiming), h);
+  Vector3 eye = player_eye_m(feet);
+  Vector3 spawn = vec3_add(eye, vec3_mul(dir, SHOT_SPAWN_M));
+  g->pos[e].x = (i16)lroundf(spawn.x * (f32)POS_SCALE);
+  g->pos[e].y = (i16)lroundf(spawn.y * (f32)POS_SCALE);
+  g->pos[e].z = (i16)lroundf(spawn.z * (f32)POS_SCALE);
+  g->vel[e].x = (i16)lroundf(dir.x * BULLET_SPEED);
+  g->vel[e].y = (i16)lroundf(dir.y * BULLET_SPEED);
+  g->vel[e].z = (i16)lroundf(dir.z * BULLET_SPEED);
+  g->aim[e].yaw = wrap_degrees((int)lroundf(atan2f(dir.x, dir.z) * RAD2DEG));
+  g->aim[e].pitch = (i16)clamp_int(
+      (int)lroundf(asinf(clamp_float(dir.y, -1.0f, 1.0f)) * RAD2DEG), -89, 89);
   g->owner[e] = g->owner[pe];
   g->kind[e] = KIND_BULLET;
   g->lifetime[e] = BULLET_LIFETIME_TICKS;
@@ -242,13 +206,6 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
   return e;
 }
 
-// Shooter velocity inherited by ejected brass. Horizontal is full (1.0):
-// brass leaves with the gun's velocity plus the ejector kick, so in the
-// shooter's own view the walk cancels out and ejection always reads
-// rightward at ejector speed. Anything less lets a strafe (3 u/tick)
-// outrun the brass drift (~1.5 u/tick), which reads as shells flying
-// backwards. Vertical is damped (0.3): the game jump is superhuman and full
-// inheritance would fountain brass meters high.
 #define CASING_INHERIT_XZ 1.0f
 #define CASING_INHERIT_Y 0.3f
 
@@ -264,56 +221,33 @@ static void spawn_casing(GameState *g, u32 pe) {
   if (wid >= WEAPON_COUNT)
     wid = WEAPON_P99;
   const ShellDef *sh = shell_def(wid);
-  // Brass leaves the converged gun's ejection cut, kicked along the gun's own
-  // right/up/back like the extractor/ejector throw it.
-  Vector3 feet = {(f32)g->px[pe] / POS_SCALE, (f32)g->py[pe] / POS_SCALE,
-                  (f32)g->pz[pe] / POS_SCALE};
-  Vector3 eye = {feet.x, feet.y + EYE_HEIGHT_M, feet.z};
-  Vector3 fv = sight_dir((f32)g->yaw[pe], (f32)g->pitch[pe]);
-  f32 zero = sight_zero_m(g, pe, eye, fv);
-  Vector3 gp;
-  f32 gyaw, gpitch;
-  sight_gun_pose_m(feet, (f32)g->yaw[pe], (f32)g->pitch[pe], zero, &gp, &gyaw,
-                   &gpitch);
-  Vector3 port = sight_gun_port_m(gp, gyaw, gpitch);
-  Vector3 f = sight_dir(gyaw, gpitch);
-  f32 gcy = cosf(gyaw * DEG2RAD), gsy = sinf(gyaw * DEG2RAD);
-  Vector3 r = {-gcy, 0.0f, gsy};
-  Vector3 u = {r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z,
-               r.x * f.y - r.y * f.x};
-  h = mix32(g->tick * 33u + e * 17u + (u32)g->owner[pe] * 91u + (u32)g->px[pe]);
-  // P99 ejection: outward right, up at ~30-45 deg elevation, slightly
-  // rearward (extractor pivots the case around its right rim, fixed ejector
-  // kicks the left base). Jitter is +/- shell jitter in m/s.
+  Vector3 feet = entity_pos_m(g, pe, 1.0f);
+  GunPose gp = player_gun_pose(g, pe, feet, (f32)g->aim[pe].yaw,
+                               (f32)g->aim[pe].pitch, 1.0f);
+  Vector3 port = gun_port_m(&gp);
+  h = mix32(g->tick * 33u + e * 17u + (u32)g->owner[pe] * 91u +
+            (u32)g->pos[pe].x);
   f32 jx = ((f32)((int)(h & 255u) - 128) / 128.0f) * sh->jitter;
   f32 jy = ((f32)((int)((h >> 8) & 255u) - 128) / 128.0f) * sh->jitter;
   f32 jz = ((f32)((int)((h >> 16) & 255u) - 128) / 128.0f) * sh->jitter;
-  f32 right_ms = sh->eject_right + jx;
-  f32 up_ms = sh->eject_up + jy;
-  f32 back_ms = sh->eject_back + jz * 0.5f;
-  // Fixed-point velocity is units/tick: m/s * POS_SCALE * SIM_DT (0.64x).
   f32 k = (f32)POS_SCALE * SIM_DT;
-  f32 side = right_ms * k;
-  f32 up = up_ms * k;
-  f32 back = back_ms * k;
-  g->px[e] = (i16)lroundf(port.x * POS_SCALE);
-  g->py[e] = (i16)lroundf(port.y * POS_SCALE);
-  g->pz[e] = (i16)lroundf(port.z * POS_SCALE);
-  // r is the gun's screen-right, so eject right with +r.
-  // Plus full horizontal shooter velocity (same fixed-point units, so
-  // directly addable): the case is flung from a moving gun, and matching the
-  // observer's motion keeps the rightward snap reading correctly in view.
-  g->vx[e] =
-      (i16)(lroundf(r.x * side + u.x * up - f.x * back) +
-            lroundf((f32)g->vx[pe] * CASING_INHERIT_XZ));
-  g->vy[e] =
-      (i16)(lroundf(r.y * side + u.y * up - f.y * back) +
-            lroundf((f32)g->vy[pe] * CASING_INHERIT_Y));
-  g->vz[e] =
-      (i16)(lroundf(r.z * side + u.z * up - f.z * back) +
-            lroundf((f32)g->vz[pe] * CASING_INHERIT_XZ));
-  g->yaw[e] = wrap_degrees(g->yaw[pe] + 50 + (int)(h % 41u));
-  g->pitch[e] = (i16)(18 + (int)((h >> 5) % 29u));
+  f32 side = (sh->eject.x + jx) * k;
+  f32 up = (sh->eject.y + jy) * k;
+  f32 back = (sh->eject.z + jz * 0.5f) * k;
+  g->pos[e].x = (i16)lroundf(port.x * (f32)POS_SCALE);
+  g->pos[e].y = (i16)lroundf(port.y * (f32)POS_SCALE);
+  g->pos[e].z = (i16)lroundf(port.z * (f32)POS_SCALE);
+  g->vel[e].x =
+      (i16)(lroundf(gp.right.x * side + gp.up.x * up - gp.fwd.x * back) +
+            lroundf((f32)g->vel[pe].x * CASING_INHERIT_XZ));
+  g->vel[e].y =
+      (i16)(lroundf(gp.right.y * side + gp.up.y * up - gp.fwd.y * back) +
+            lroundf((f32)g->vel[pe].y * CASING_INHERIT_Y));
+  g->vel[e].z =
+      (i16)(lroundf(gp.right.z * side + gp.up.z * up - gp.fwd.z * back) +
+            lroundf((f32)g->vel[pe].z * CASING_INHERIT_XZ));
+  g->aim[e].yaw = wrap_degrees(g->aim[pe].yaw + 50 + (int)(h % 41u));
+  g->aim[e].pitch = (i16)(18 + (int)((h >> 5) % 29u));
   g->held_by[e] = (u8)h;
   g->owner[e] = g->owner[pe];
   g->weapon_id[e] = wid;
@@ -337,10 +271,7 @@ static void weapon_system(GameState *g) {
       if (spawn_bullet(g, e) != ECS_INVALID_ENTITY) {
         u8 wid = g->weapon_id[e];
         weapon_on_fired(g, e, holding);
-        // Authoritative recoil: same pitch step the client predicts, so
-        // bullets and snapshots stay in sync even before the echoed input
-        // arrives. Persist it in the input so aim_system keeps it.
-        g->pitch[e] = weapon_recoil_pitch(g->pitch[e], wid, holding);
+        g->aim[e].pitch = weapon_recoil_pitch(g->aim[e].pitch, wid, holding);
         g->input[p].aim_pitch =
             weapon_recoil_pitch(g->input[p].aim_pitch, wid, holding);
         if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
@@ -356,25 +287,16 @@ static void weapon_system(GameState *g) {
   }
 }
 
-// Backoff from the exact contact point along travel, in fixed-point units:
-// the flat splat then sits just off the face instead of inside the solid.
-#define MARK_BACKOFF 2.0f
-
 static void make_impact_mark(GameState *g, u32 e, i16 x, i16 y, i16 z,
                              u8 extra) {
   if (count_kind(g, KIND_IMPACT_MARK) >= MAX_IMPACT_MARKS)
     destroy_oldest(g, KIND_IMPACT_MARK);
-  g->px[e] = x;
-  g->py[e] = y;
-  g->pz[e] = z;
-  // Packed face normal + strength + spatter material. Yaw/pitch are left
-  // untouched: they still carry the bullet's travel dir, which the client
-  // reflects for the spatter cone.
+  g->pos[e] = (IVec3){x, y, z};
   g->held_by[e] = extra;
   g->kind[e] = KIND_IMPACT_MARK;
   g->lifetime[e] = IMPACT_MARK_LIFETIME_TICKS;
   g->flash[e] = 3;
-  g->vx[e] = g->vy[e] = g->vz[e] = 0;
+  g->vel[e] = (IVec3){0, 0, 0};
   ecs_remove(&g->ecs, e, COMP_PROJECTILE);
   ecs_remove(&g->ecs, e, COMP_VELOCITY);
 }
@@ -386,44 +308,38 @@ static void casing_system(GameState *g) {
     u32 e = q.entity;
     if (g->kind[e] != KIND_CASING)
       continue;
-    g->px[e] = (i16)(g->px[e] + g->vx[e]);
-    g->py[e] = (i16)(g->py[e] + g->vy[e]);
-    g->pz[e] = (i16)(g->pz[e] + g->vz[e]);
-    // Real gravity (~9.8m/s^2): 1 unit per 16 ticks == 0.0625 units/tick.
-    // Rises ~0.15-0.25s, then drops 1-2m right/rearward like real 9mm brass.
-    if (g->tick % 16u == 0 && g->vy[e] > -8)
-      --g->vy[e];
-    if (g->py[e] <= 2) {
-      g->py[e] = 2;
-      if (g->vy[e] <= -2) {
-        // Brass bounce: restitution ~0.35, horizontal loses ~25%.
-        g->vy[e] = (i16)(-g->vy[e] * 3 / 8);
-        g->vx[e] = (i16)(g->vx[e] * 3 / 4);
-        g->vz[e] = (i16)(g->vz[e] * 3 / 4);
+    g->pos[e].x = (i16)(g->pos[e].x + g->vel[e].x);
+    g->pos[e].y = (i16)(g->pos[e].y + g->vel[e].y);
+    g->pos[e].z = (i16)(g->pos[e].z + g->vel[e].z);
+    if (g->tick % 16u == 0 && g->vel[e].y > -8)
+      --g->vel[e].y;
+    if (g->pos[e].y <= 2) {
+      g->pos[e].y = 2;
+      if (g->vel[e].y <= -2) {
+        g->vel[e].y = (i16)(-g->vel[e].y * 3 / 8);
+        g->vel[e].x = (i16)(g->vel[e].x * 3 / 4);
+        g->vel[e].z = (i16)(g->vel[e].z * 3 / 4);
       } else {
-        // Resting/rolling: light friction so cases roll instead of halting.
-        g->vy[e] = 0;
-        g->vx[e] = (i16)(g->vx[e] * 15 / 16);
-        g->vz[e] = (i16)(g->vz[e] * 15 / 16);
-        if (abs(g->vx[e]) < 1)
-          g->vx[e] = 0;
-        if (abs(g->vz[e]) < 1)
-          g->vz[e] = 0;
+        g->vel[e].y = 0;
+        g->vel[e].x = (i16)(g->vel[e].x * 15 / 16);
+        g->vel[e].z = (i16)(g->vel[e].z * 15 / 16);
+        if (abs(g->vel[e].x) < 1)
+          g->vel[e].x = 0;
+        if (abs(g->vel[e].z) < 1)
+          g->vel[e].z = 0;
       }
     }
-    if (g->vx[e] || g->vy[e] || g->vz[e]) {
-      bool airborne = g->py[e] > 2 || g->vy[e] != 0;
+    if (g->vel[e].x || g->vel[e].y || g->vel[e].z) {
+      bool airborne = g->pos[e].y > 2 || g->vel[e].y != 0;
       if (airborne) {
-        // Rapid end-over-end tumble in flight.
-        g->yaw[e] = wrap_degrees(g->yaw[e] + 9 + (g->held_by[e] & 7));
-        g->pitch[e] =
-            wrap_degrees(g->pitch[e] + 11 + ((g->held_by[e] >> 3) & 7));
+        g->aim[e].yaw = wrap_degrees(g->aim[e].yaw + 9 + (g->held_by[e] & 7));
+        g->aim[e].pitch =
+            wrap_degrees(g->aim[e].pitch + 11 + ((g->held_by[e] >> 3) & 7));
         g->held_by[e] = (u8)(g->held_by[e] + 13u);
       } else {
-        // Slow roll on the ground.
-        g->yaw[e] = wrap_degrees(g->yaw[e] + 2 + (g->held_by[e] & 3));
-        g->pitch[e] =
-            wrap_degrees(g->pitch[e] + 2 + ((g->held_by[e] >> 2) & 3));
+        g->aim[e].yaw = wrap_degrees(g->aim[e].yaw + 2 + (g->held_by[e] & 3));
+        g->aim[e].pitch =
+            wrap_degrees(g->aim[e].pitch + 2 + ((g->held_by[e] >> 2) & 3));
         g->held_by[e] = (u8)(g->held_by[e] + 5u);
       }
     }
@@ -431,90 +347,52 @@ static void casing_system(GameState *g) {
 }
 
 static void mark_hit_dir(GameState *g, u32 victim, u32 from) {
-  int deg = (int)lroundf(atan2f((f32)(g->px[from] - g->px[victim]),
-                                (f32)(g->pz[from] - g->pz[victim])) *
+  int deg = (int)lroundf(atan2f((f32)(g->pos[from].x - g->pos[victim].x),
+                                (f32)(g->pos[from].z - g->pos[victim].z)) *
                          RAD2DEG);
   g->held_by[victim] = pack_yaw(deg);
   g->flash[victim] = PLAYER_HIT_FLASH_TICKS;
 }
 
-// Exact hitscan lives in shared.c (seg_box_hit over COMP_SOLID).
 static void projectile_system(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PROJECTILE, COMP_LIFETIME};
   EcsQuery q = ecs_query(&g->ecs, comps, 4);
   int bound = ARENA * POS_SCALE;
   while (ecs_next(&q)) {
     u32 e = q.entity;
-    Vector3 p0 = {(float)g->px[e], (float)g->py[e], (float)g->pz[e]};
-    Vector3 d = {(float)g->vx[e], (float)g->vy[e], (float)g->vz[e]};
-    // Nearest solid along the tick segment. Floor, cubes and players all
-    // answer the same segment query, so contact resolution below never
-    // branches on what was hit. Held cubes ride their holder and the owner
-    // cannot hit themselves: both are hit-eligibility rules, not mark logic.
-    bool hit = false;
-    float best = 1.0f;
-    Vector3 bn = {0.0f, 1.0f, 0.0f};
-    u32 bs = ECS_INVALID_ENTITY;
-    u32 solids[] = {COMP_SOLID};
-    EcsQuery sq = ecs_query(&g->ecs, solids, 1);
-    while (ecs_next(&sq)) {
-      u32 s = sq.entity;
-      if (s == e)
-        continue;
-      if (g->kind[s] == KIND_CUBE && g->held_by[s] != 0)
-        continue;
-      if (g->kind[s] == KIND_PLAYER && g->owner[s] == g->owner[e])
-        continue;
-      Vector3 bmin, bmax, n;
-      float t;
-      solid_bounds(g, s, &bmin, &bmax);
-      if (seg_box_hit(p0, d, bmin, bmax, &t, &n) && (!hit || t < best)) {
-        hit = true;
-        best = t;
-        bn = n;
-        bs = s;
-      }
-    }
-    if (!hit) {
-      g->px[e] = (i16)((int)g->px[e] + g->vx[e]);
-      g->py[e] = (i16)((int)g->py[e] + g->vy[e]);
-      g->pz[e] = (i16)((int)g->pz[e] + g->vz[e]);
-      if (g->py[e] > bound || g->px[e] < -bound || g->px[e] > bound ||
-          g->pz[e] < -bound || g->pz[e] > bound)
+    Vector3 dir = sight_dir((f32)g->aim[e].yaw, (f32)g->aim[e].pitch);
+    Vector3 p0 = {(f32)g->pos[e].x, (f32)g->pos[e].y, (f32)g->pos[e].z};
+    Vector3 d = vec3_mul(dir, BULLET_SPEED);
+    TraceHit h = trace_solids(g, p0, d, e, g->owner[e], 1.0f);
+    if (!h.hit) {
+      g->pos[e].x = (i16)lroundf(p0.x + d.x);
+      g->pos[e].y = (i16)lroundf(p0.y + d.y);
+      g->pos[e].z = (i16)lroundf(p0.z + d.z);
+      if (g->pos[e].y > bound || g->pos[e].x < -bound || g->pos[e].x > bound ||
+          g->pos[e].z < -bound || g->pos[e].z > bound)
         ecs_destroy(&g->ecs, e);
       continue;
     }
-    // Victim hit-feedback (direction indicator). Players are the only
-    // entities carrying flash state, so this stays type-aware; the mark
-    // itself is built uniformly below.
-    if (bs != ECS_INVALID_ENTITY && g->kind[bs] == KIND_PLAYER) {
+    if (h.entity != ECS_INVALID_ENTITY && g->kind[h.entity] == KIND_PLAYER) {
       u32 src = e;
       u8 ow = g->owner[e];
       if (ow < MAX_PLAYERS && g->player_entity[ow] != NET_PACKET_NONE &&
           ecs_alive(&g->ecs, g->player_entity[ow]))
         src = g->player_entity[ow];
-      mark_hit_dir(g, bs, src);
+      mark_hit_dir(g, h.entity, src);
     }
-    float spd = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-    float back = spd > 0.001f ? MARK_BACKOFF / spd : 0.0f;
-    float bt = best - back;
-    if (bt < 0.0f)
-      bt = 0.0f;
-    i16 mx = (i16)lroundf(p0.x + d.x * bt);
-    i16 my = (i16)lroundf(p0.y + d.y * bt);
-    i16 mz = (i16)lroundf(p0.z + d.z * bt);
-    // Strength is the normal share of the impact velocity: dead-on hits
-    // splat big, grazes leave a dot.
-    float frac = spd > 0.001f
-                     ? fabsf(d.x * bn.x + d.y * bn.y + d.z * bn.z) / spd
-                     : 0.0f;
+    Vector3 hit = vec3_add(p0, vec3_mul(d, h.t));
+    hit = vec3_add(hit, vec3_mul(h.n, MARK_NUDGE));
+    f32 spd = vec3_len(d);
+    f32 frac = spd > 0.001f ? fabsf(vec3_dot(d, h.n)) / spd : 0.0f;
     u8 str = (u8)(frac * (float)MARK_STR_LEVELS);
     if (str >= MARK_STR_LEVELS)
       str = MARK_STR_LEVELS - 1u;
-    u8 skind = g->kind[bs];
+    u8 skind = g->kind[h.entity];
     u8 mat = skind < sizeof(SOLID_MAT) ? SOLID_MAT[skind] : MARK_MAT_PURPLE;
-    make_impact_mark(g, e, mx, my, mz,
-                     mark_extra_pack(mark_code_for_vec(bn), str, mat));
+    make_impact_mark(g, e, (i16)lroundf(hit.x), (i16)lroundf(hit.y),
+                     (i16)lroundf(hit.z),
+                     mark_extra_pack(mark_code_for_vec(h.n), str, mat));
   }
 }
 
@@ -566,32 +444,28 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
     if (g->kind[e] == KIND_CUBE) {
       scale = scale_encode(scale_value(g, e));
     } else if (g->kind[e] == KIND_CASING) {
-      // Shell type rides the weapon field so every client renders the
-      // per-gun casing size. No protocol change: 0 decodes to P99.
       weapon = g->weapon_id[e] < WEAPON_COUNT ? g->weapon_id[e] : WEAPON_P99;
     } else if (g->kind[e] == KIND_PLAYER) {
       weapon = g->weapon_id[e];
       ammo = g->weapon_ammo[e];
       reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
-      reload_q =
-          encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
+      reload_q = encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
     }
-    snap->entities[snap->count++] =
-        (NetEntity){.entity = (u8)e,
-                    .kind = g->kind[e],
-                    .owner = g->owner[e],
-                    .flags = g->flash[e],
-                    .extra = g->held_by[e],
-                    .weapon = weapon,
-                    .ammo = ammo,
-                    .reloading = reloading,
-                    .reload_q = reload_q,
-                    .scale = scale,
-                    .x = g->px[e],
-                    .y = g->py[e],
-                    .z = g->pz[e],
-                    .yaw = g->yaw[e],
-                    .pitch = g->pitch[e]};
+    snap->entities[snap->count++] = (NetEntity){.entity = (u8)e,
+                                                .kind = g->kind[e],
+                                                .owner = g->owner[e],
+                                                .flags = g->flash[e],
+                                                .extra = g->held_by[e],
+                                                .weapon = weapon,
+                                                .ammo = ammo,
+                                                .reloading = reloading,
+                                                .reload_q = reload_q,
+                                                .scale = scale,
+                                                .x = g->pos[e].x,
+                                                .y = g->pos[e].y,
+                                                .z = g->pos[e].z,
+                                                .yaw = g->aim[e].yaw,
+                                                .pitch = g->aim[e].pitch};
   }
 }
 
@@ -604,8 +478,8 @@ static void send_peer_snapshot(int fd, const Peer *peer,
   struct sockaddr_in address = {.sin_family = AF_INET,
                                 .sin_addr.s_addr = peer->address,
                                 .sin_port = peer->port};
-  (void)sendto(fd, wire, (size_t)wire_len, 0,
-               (const struct sockaddr *)&address, sizeof(address));
+  (void)sendto(fd, wire, (size_t)wire_len, 0, (const struct sockaddr *)&address,
+               sizeof(address));
 }
 
 static int find_peer_session(const GameState *g, u32 session) {
@@ -640,9 +514,9 @@ static u32 create_player(GameState *g, u8 player) {
   if (e == ECS_INVALID_ENTITY)
     return e;
   clear_entity_data(g, e);
-  g->px[e] = (i16)(((int)player - (int)MAX_PLAYERS / 2) * 2 * POS_SCALE);
-  g->pz[e] = 5 * POS_SCALE;
-  g->yaw[e] = 180;
+  g->pos[e].x = (i16)(((int)player - (int)MAX_PLAYERS / 2) * 2 * POS_SCALE);
+  g->pos[e].z = 5 * POS_SCALE;
+  g->aim[e].yaw = 180;
   g->kind[e] = KIND_PLAYER;
   g->owner[e] = player;
   g->player_entity[player] = (u8)e;
@@ -678,10 +552,18 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
                           .last_seen = g->tick,
                           .active = 1,
                           .player = (u8)slot};
-  g->input[slot] = (InputCommand){.aim_yaw = g->yaw[e]};
+  g->input[slot] = (InputCommand){.aim_yaw = g->aim[e].yaw};
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
     g->player_name[slot][i] = name.items[i];
   return slot;
+}
+
+static void release_held_system(GameState *g, u8 player) {
+  u32 comps[] = {COMP_SCALE};
+  EcsQuery q = ecs_query(&g->ecs, comps, 1);
+  while (ecs_next(&q))
+    if (g->held_by[q.entity] == player + 1u)
+      g->held_by[q.entity] = 0;
 }
 
 static void remove_peer(GameState *g, int peer_index) {
@@ -694,9 +576,7 @@ static void remove_peer(GameState *g, int peer_index) {
   u32 e = g->player_entity[player];
   if (e != NET_PACKET_NONE && ecs_alive(&g->ecs, e))
     ecs_destroy(&g->ecs, e);
-  for (u32 i = 0; i < ECS_MAX_ENTITIES; ++i)
-    if (g->held_by[i] == player + 1u)
-      g->held_by[i] = 0;
+  release_held_system(g, player);
   g->player_entity[player] = NET_PACKET_NONE;
   g->input[player] = (InputCommand){0};
   peer->active = peer->got_sequence = peer->got_chat_sequence = 0;
@@ -707,7 +587,6 @@ static void server_relay_chat(GameState *g, int fd, int sender,
   if (sender < 0 || sender >= MAX_PLAYERS || !g->peers[sender].active ||
       g->peers[sender].player >= MAX_PLAYERS)
     return;
-  // Rebuild: never reflect sender-controlled player/sequence.
   if (received->length > CHAT_LENGTH)
     return;
   NetChatPacket out = {
@@ -727,19 +606,18 @@ static void server_relay_chat(GameState *g, int fd, int sender,
                                   .sin_addr.s_addr = g->peers[i].address,
                                   .sin_port = g->peers[i].port};
     out.session = g->peers[i].session;
-    (void)sendto(fd, &out, sizeof(out), 0,
-                 (const struct sockaddr *)&address, sizeof(address));
+    (void)sendto(fd, &out, sizeof(out), 0, (const struct sockaddr *)&address,
+                 sizeof(address));
   }
 }
 
 static void server_handle_chat(GameState *g, int fd,
-                                 const struct sockaddr_in *from,
-                                 NetChatPacket *packet) {
+                               const struct sockaddr_in *from,
+                               NetChatPacket *packet) {
   int pi = find_peer_session(g, packet->session);
   if (pi < 0 || pi >= MAX_PLAYERS)
     return;
-  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH,
-                  PLAYER_NAME_LENGTH};
+  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
   Peer *peer = &g->peers[pi];
   if (peer->player >= MAX_PLAYERS)
     return;
@@ -761,8 +639,7 @@ static void server_handle_input(GameState *g, int fd,
                                 const struct sockaddr_in *from,
                                 const NetInputPacket *packet) {
   (void)fd;
-  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH,
-                  PLAYER_NAME_LENGTH};
+  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
   if (!net_validate_input_fields(packet->session, wname))
     return;
   int pi = find_peer_session(g, packet->session);
@@ -802,8 +679,7 @@ static void server_handle_input(GameState *g, int fd,
   g->input[peer->player].move_x = (i8)clamp_int(packet->move_x, -1, 1);
   g->input[peer->player].move_z = (i8)clamp_int(packet->move_z, -1, 1);
   g->input[peer->player].aim_yaw = wrap_degrees(packet->aim_yaw);
-  g->input[peer->player].aim_pitch =
-      (i16)clamp_int(packet->aim_pitch, -75, 75);
+  g->input[peer->player].aim_pitch = (i16)clamp_int(packet->aim_pitch, -75, 75);
   g->input[peer->player].buttons = packet->buttons & BTN_ALL;
 }
 
@@ -829,11 +705,10 @@ static void server_receive(GameState *g, int fd) {
       server_handle_input(g, fd, &from, &input);
       continue;
     }
-    // Drop malformed datagrams.
   }
 }
 
-static void server_expire_peers(GameState *g) {
+static void expire_peers_system(GameState *g) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
     if (g->peers[i].active &&
         tick_age(g->tick, g->peers[i].last_seen) > SIM_HZ * 10)
@@ -874,7 +749,7 @@ static void server_run(u16 port) {
     server_receive(&game, fd);
     while (acc >= SIM_DT) {
       server_tick(&game);
-      server_expire_peers(&game);
+      expire_peers_system(&game);
       if (game.tick % SNAPSHOT_INTERVAL == 0)
         server_send_all(&game, fd);
       acc -= SIM_DT;

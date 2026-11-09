@@ -10,24 +10,7 @@ static void on_signal(int sig) {
   server_running = 0;
 }
 
-static int open_udp_server(u16 port) {
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  struct sockaddr_in address = {.sin_family = AF_INET,
-                                .sin_addr.s_addr = htonl(INADDR_ANY),
-                                .sin_port = htons(port)};
-  int reuse = 1;
-  if (fd < 0)
-    return -1;
-  (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-  if (bind(fd, (const struct sockaddr *)&address, sizeof(address)) < 0) {
-    close(fd);
-    return -1;
-  }
-  socket_nonblocking(fd);
-  return fd;
-}
-
-static void movement_system(GameState *g) {
+static void system_movement(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PLAYER};
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q)) {
@@ -55,10 +38,11 @@ static void movement_system(GameState *g) {
     g->vel[e].x = step_x;
     g->vel[e].z = step_z;
     if ((in->buttons & BTN_JUMP) != 0 && g->pos[e].y == 0)
-      g->vel[e].y = 6;
+      g->vel[e].y = PLAYER_JUMP_VELOCITY;
     if (g->pos[e].y > 0 || g->vel[e].y > 0) {
       g->pos[e].y = (i16)(g->pos[e].y + g->vel[e].y);
-      if (g->tick % 6u == 0 && g->vel[e].y > -6)
+      if (g->tick % PLAYER_GRAVITY_PERIOD_TICKS == 0 &&
+          g->vel[e].y > PLAYER_GRAVITY_TERMINAL)
         --g->vel[e].y;
       if (g->pos[e].y <= 0) {
         g->pos[e].y = 0;
@@ -74,7 +58,7 @@ static void movement_system(GameState *g) {
   }
 }
 
-static void aim_system(GameState *g) {
+static void system_aim(GameState *g) {
   u32 comps[] = {COMP_AIM, COMP_PLAYER};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
@@ -87,7 +71,7 @@ static void aim_system(GameState *g) {
   }
 }
 
-static void aim_point_system(GameState *g) {
+static void system_aim_point(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q)) {
@@ -108,71 +92,79 @@ static void aim_point_system(GameState *g) {
 static u32 held_cube_for(const GameState *g, u8 player) {
   u32 comps[] = {COMP_POSITION, COMP_SCALE, COMP_SOLID};
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
-  while (ecs_next(&q))
+  while (ecs_next(&q)) {
     if (g->kind[q.entity] == KIND_CUBE && g->held_by[q.entity] == player + 1u)
       return q.entity;
+  }
   return ECS_INVALID_ENTITY;
 }
 
-static void holding_system(GameState *g) {
-  u32 players[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
-  EcsQuery pq = ecs_query(&g->ecs, players, 3);
-  while (ecs_next(&pq)) {
-    u32 pe = pq.entity;
-    u8 player = g->owner[pe];
-    if (player >= MAX_PLAYERS)
+static u32 acquire_cube(GameState *g, u32 pe, u8 player) {
+  const u32 cubes[] = {COMP_POSITION, COMP_SCALE, COMP_SOLID};
+  EcsQuery q = ecs_query(&g->ecs, cubes, 3);
+  f32 best_distance = HOLD_PICK_RANGE_M;
+  u32 best = ECS_INVALID_ENTITY;
+  Vector3 dir = sight_dir((f32)g->aim[pe].yaw, (f32)g->aim[pe].pitch);
+  while (ecs_next(&q)) {
+    u32 e = q.entity;
+    if (g->kind[e] != KIND_CUBE || g->held_by[e] != 0) {
       continue;
+    }
+    Vector3 off = {
+        (f32)(g->pos[e].x - g->pos[pe].x) / POS_SCALE,
+        ((f32)g->pos[e].y - (f32)g->pos[pe].y - EYE_HEIGHT_M * (f32)POS_SCALE) /
+            POS_SCALE,
+        (f32)(g->pos[e].z - g->pos[pe].z) / POS_SCALE};
+    f32 distance = vec3_len(off);
+    f32 alignment =
+        distance > HOLD_PICK_EPSILON ? vec3_dot(off, dir) / distance : -1.0f;
+    if (distance < best_distance && alignment > HOLD_PICK_MIN_DOT) {
+      best_distance = distance;
+      best = e;
+    }
+  }
+  if (best != ECS_INVALID_ENTITY) {
+    g->held_by[best] = (u8)(player + 1u);
+  }
+  return best;
+}
+
+static void position_held_cube(GameState *g, u32 pe, u32 held) {
+  f32 dist = hold_dist_for_pitch(g->aim[pe].pitch);
+  f32 scale =
+      clamp_float(dist / HOLD_BASE_DIST, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
+  g->scale[held] = scale;
+  f32 yaw_rad = (f32)g->aim[pe].yaw * DEG2RAD;
+  f32 hx = sinf(yaw_rad), hz = cosf(yaw_rad);
+  f32 half_h = 0.5f * CUBE_VIS_Y * scale * (f32)POS_SCALE;
+  f32 half_xz = 0.5f * CUBE_VIS_X * scale * (f32)POS_SCALE;
+  f32 limit = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
+  f32 tx = (f32)g->pos[pe].x + hx * dist * (f32)POS_SCALE;
+  f32 tz = (f32)g->pos[pe].z + hz * dist * (f32)POS_SCALE;
+  g->pos[held] = (IVec3){(i16)lroundf(clamp_float(tx, -limit, limit)),
+                         (i16)lroundf(half_h),
+                         (i16)lroundf(clamp_float(tz, -limit, limit))};
+}
+
+static void system_holding(GameState *g) {
+  const u32 players[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
+  EcsQuery q = ecs_query(&g->ecs, players, 3);
+  while (ecs_next(&q)) {
+    u32 pe = q.entity;
+    u8 player = g->owner[pe];
+    if (player >= MAX_PLAYERS) {
+      continue;
+    }
     u32 held = held_cube_for(g, player);
     bool want = (g->input[player].buttons & BTN_GRAB) != 0;
     if (!want && held != ECS_INVALID_ENTITY) {
       g->held_by[held] = 0;
       held = ECS_INVALID_ENTITY;
-    }
-    if (want && held == ECS_INVALID_ENTITY) {
-      Vector3 dir;
-      u32 cubes[] = {COMP_POSITION, COMP_SCALE, COMP_SOLID};
-      EcsQuery cq = ecs_query(&g->ecs, cubes, 3);
-      f32 best_d = 1000.0f;
-      u32 best = ECS_INVALID_ENTITY;
-      dir = sight_dir((f32)g->aim[pe].yaw, (f32)g->aim[pe].pitch);
-      while (ecs_next(&cq)) {
-        u32 c = cq.entity;
-        if (g->kind[c] != KIND_CUBE || g->held_by[c] != 0)
-          continue;
-        Vector3 off = {(f32)(g->pos[c].x - g->pos[pe].x) / POS_SCALE,
-                       (f32)(g->pos[c].y - (g->pos[pe].y + 96)) / POS_SCALE,
-                       (f32)(g->pos[c].z - g->pos[pe].z) / POS_SCALE};
-        f32 d = vec3_len(off);
-        f32 dot = d > 0.01f ? vec3_dot(off, dir) / d : -1.0f;
-        if (d < 5.0f && dot > 0.55f && d < best_d) {
-          best_d = d;
-          best = c;
-        }
-      }
-      if (best != ECS_INVALID_ENTITY) {
-        g->held_by[best] = player + 1u;
-        held = best;
-      }
+    } else if (want && held == ECS_INVALID_ENTITY) {
+      held = acquire_cube(g, pe, player);
     }
     if (held != ECS_INVALID_ENTITY) {
-      f32 dist = hold_dist_for_pitch(g->aim[pe].pitch);
-      f32 scale =
-          clamp_float(dist / HOLD_BASE_DIST, CUBE_SCALE_MIN, CUBE_SCALE_MAX);
-      g->scale[held] = scale;
-      f32 yaw_rad = (f32)g->aim[pe].yaw * DEG2RAD;
-      f32 hx = sinf(yaw_rad);
-      f32 hz = cosf(yaw_rad);
-      f32 half_h = 0.5f * CUBE_VIS_Y * scale * (f32)POS_SCALE;
-      f32 half_xz = 0.5f * CUBE_VIS_X * scale * (f32)POS_SCALE;
-      f32 limit_x = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
-      f32 limit_z = fmaxf((f32)ARENA_POS - half_xz, 0.0f);
-      f32 tx = (f32)g->pos[pe].x + hx * dist * (f32)POS_SCALE;
-      f32 tz = (f32)g->pos[pe].z + hz * dist * (f32)POS_SCALE;
-      tx = clamp_float(tx, -limit_x, limit_x);
-      tz = clamp_float(tz, -limit_z, limit_z);
-      g->pos[held].x = (i16)lroundf(tx);
-      g->pos[held].y = (i16)lroundf(half_h);
-      g->pos[held].z = (i16)lroundf(tz);
+      position_held_cube(g, pe, held);
     }
   }
 }
@@ -273,7 +265,7 @@ static void spawn_casing(GameState *g, u32 pe) {
   add_kind_components(g, e, KIND_CASING);
 }
 
-static void weapon_system(GameState *g) {
+static void system_weapon(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q)) {
@@ -320,7 +312,7 @@ static void make_impact_mark(GameState *g, u32 e, i16 x, i16 y, i16 z,
   ecs_remove(&g->ecs, e, COMP_VELOCITY);
 }
 
-static void casing_system(GameState *g) {
+static void system_casing(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_LIFETIME};
   EcsQuery q = ecs_query(&g->ecs, comps, 3);
   while (ecs_next(&q)) {
@@ -373,7 +365,7 @@ static void mark_hit_dir(GameState *g, u32 victim, u32 from) {
   g->flash[victim] = PLAYER_HIT_FLASH_TICKS;
 }
 
-static void projectile_system(GameState *g) {
+static void system_projectile(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_VELOCITY, COMP_PROJECTILE, COMP_LIFETIME};
   EcsQuery q = ecs_query(&g->ecs, comps, 4);
   int bound = ARENA * POS_SCALE;
@@ -415,7 +407,7 @@ static void projectile_system(GameState *g) {
   }
 }
 
-static void lifetime_system(GameState *g) {
+static void system_lifetime(GameState *g) {
   u32 comps[] = {COMP_POSITION, COMP_LIFETIME};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
@@ -436,95 +428,30 @@ static void lifetime_system(GameState *g) {
 }
 
 static void server_tick(GameState *g) {
-  aim_system(g);
-  movement_system(g);
-  holding_system(g);
-  weapon_system(g);
-  casing_system(g);
-  projectile_system(g);
-  lifetime_system(g);
+  system_aim(g);
+  system_movement(g);
+  system_holding(g);
+  system_weapon(g);
+  system_casing(g);
+  system_projectile(g);
+  system_lifetime(g);
   ++g->tick;
 }
 
-static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
-                           u16 ack, u32 session) {
-  u32 comps[] = {COMP_POSITION, COMP_NETWORKED, COMP_RENDERABLE};
-  *snap = (NetSnapshot){.magic = NET_MAGIC,
-                        .type = NET_PACKET_SNAPSHOT,
-                        .local_player = recipient,
-                        .session = session,
-                        .tick = g->tick,
-                        .acknowledged_sequence = ack};
-  for (u32 p = 0; p < MAX_PLAYERS; ++p) {
-    String name = game_player_name(g, p);
-    memcpy(snap->names[p], name.items, PLAYER_NAME_LENGTH);
-  }
-  EcsQuery q = ecs_query(&g->ecs, comps, 3);
-  while (snap->count < NET_ENTITY_LIMIT && ecs_next(&q)) {
-    u32 e = q.entity;
-    u8 weapon = WEAPON_P99, ammo = 0, reloading = 0;
-    u8 reload_q = 0;
-    u8 scale = 0;
-    if (g->kind[e] == KIND_CUBE) {
-      scale = scale_encode(scale_value(g, e));
-    } else if (g->kind[e] == KIND_CASING) {
-      weapon = g->weapon_id[e] < WEAPON_COUNT ? g->weapon_id[e] : WEAPON_P99;
-    } else if (g->kind[e] == KIND_PLAYER) {
-      weapon = g->weapon_id[e];
-      ammo = g->weapon_ammo[e];
-      reloading = (u8)(g->weapon_reload[e] != 0 ? 1 : 0);
-      reload_q = encode_reload_q(reloading != 0, weapon_reload_progress(g, e));
-      if (g->owner[e] < MAX_PLAYERS)
-        scale = pack_player_locomotion(&g->input[g->owner[e]]);
-    }
-    snap->entities[snap->count++] = (NetEntity){
-        .entity = (u8)e,
-        .kind = g->kind[e],
-        .owner = g->owner[e],
-        .flags = g->flash[e],
-        .extra = g->held_by[e],
-        .weapon = weapon,
-        .ammo = ammo,
-        .reloading = reloading,
-        .reload_q = reload_q,
-        .scale = scale,
-        .x = g->pos[e].x,
-        .y = g->pos[e].y,
-        .z = g->pos[e].z,
-        .yaw = g->aim[e].yaw,
-        .pitch = g->aim[e].pitch,
-        .aim_dir =
-            g->kind[e] == KIND_PLAYER ? g->aim_dir[e] : (AimVectorQ){0, 0, 127},
-        .aim_point = g->kind[e] == KIND_PLAYER ? g->aim_point[e]
-                                               : (IVec3){0, 0, POS_SCALE}};
-  }
-}
-
-static void send_peer_snapshot(int fd, const Peer *peer,
-                               const NetSnapshot *snap) {
-  u8 wire[NET_MAX_DATAGRAM];
-  i32 wire_len = net_snapshot_encode(snap, wire, (i32)sizeof(wire));
-  if (wire_len < 0)
-    return;
-  struct sockaddr_in address = {.sin_family = AF_INET,
-                                .sin_addr.s_addr = peer->address,
-                                .sin_port = peer->port};
-  (void)sendto(fd, wire, (size_t)wire_len, 0, (const struct sockaddr *)&address,
-               sizeof(address));
-}
-
 static int find_peer_session(const GameState *g, u32 session) {
-  for (int i = 0; i < MAX_PLAYERS; ++i)
+  for (int i = 0; i < MAX_PLAYERS; ++i) {
     if (g->peers[i].active && g->peers[i].session == session)
       return i;
+  }
   return -1;
 }
 
 static bool session_was_retired(const GameState *g, u32 session) {
-  for (int i = 0; i < MAX_PLAYERS; ++i)
+  for (int i = 0; i < MAX_PLAYERS; ++i) {
     if ((!g->peers[i].active && g->peers[i].session == session) ||
         g->peers[i].retired_session == session)
       return true;
+  }
   return false;
 }
 
@@ -561,11 +488,12 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
                     String name) {
   int slot = peer_with_name(g, name);
   if (slot < 0) {
-    for (int i = 0; i < MAX_PLAYERS; ++i)
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
       if (!g->peers[i].active && g->player_entity[i] == NET_PACKET_NONE) {
         slot = i;
         break;
       }
+    }
   }
   if (slot < 0)
     return -1;
@@ -585,17 +513,19 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
                           .active = 1,
                           .player = (u8)slot};
   g->input[slot] = (InputCommand){.aim_dir = (AimVectorQ){0, 0, 127}};
-  for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
+  for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
     g->player_name[slot][i] = name.items[i];
+  }
   return slot;
 }
 
-static void release_held_system(GameState *g, u8 player) {
+static void system_release_held(GameState *g, u8 player) {
   u32 comps[] = {COMP_SCALE};
   EcsQuery q = ecs_query(&g->ecs, comps, 1);
-  while (ecs_next(&q))
+  while (ecs_next(&q)) {
     if (g->held_by[q.entity] == player + 1u)
       g->held_by[q.entity] = 0;
+  }
 }
 
 static void remove_peer(GameState *g, int peer_index) {
@@ -608,166 +538,21 @@ static void remove_peer(GameState *g, int peer_index) {
   u32 e = g->player_entity[player];
   if (e != NET_PACKET_NONE && ecs_alive(&g->ecs, e))
     ecs_destroy(&g->ecs, e);
-  release_held_system(g, player);
+  system_release_held(g, player);
   g->player_entity[player] = NET_PACKET_NONE;
   g->input[player] = (InputCommand){0};
   peer->active = peer->got_sequence = peer->got_chat_sequence = 0;
 }
-
-static void server_relay_chat(GameState *g, int fd, int sender,
-                              const NetChatPacket *received) {
-  if (sender < 0 || sender >= MAX_PLAYERS || !g->peers[sender].active ||
-      g->peers[sender].player >= MAX_PLAYERS)
-    return;
-  if (received->length > CHAT_LENGTH)
-    return;
-  NetChatPacket out = {
-      .magic = NET_MAGIC,
-      .type = NET_PACKET_CHAT,
-      .player = g->peers[sender].player,
-      .length = received->length,
-      .sequence = g->next_chat_sequence++,
-  };
-  String src = game_player_name(g, out.player);
-  memcpy(out.name, src.items, PLAYER_NAME_LENGTH);
-  memcpy(out.text, received->text, out.length);
+static void system_drop_afk_player(GameState *g) {
   for (int i = 0; i < MAX_PLAYERS; ++i) {
-    if (!g->peers[i].active)
-      continue;
-    struct sockaddr_in address = {.sin_family = AF_INET,
-                                  .sin_addr.s_addr = g->peers[i].address,
-                                  .sin_port = g->peers[i].port};
-    out.session = g->peers[i].session;
-    (void)sendto(fd, &out, sizeof(out), 0, (const struct sockaddr *)&address,
-                 sizeof(address));
-  }
-}
-
-static void server_handle_chat(GameState *g, int fd,
-                               const struct sockaddr_in *from,
-                               NetChatPacket *packet) {
-  int pi = find_peer_session(g, packet->session);
-  if (pi < 0 || pi >= MAX_PLAYERS)
-    return;
-  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
-  Peer *peer = &g->peers[pi];
-  if (peer->player >= MAX_PLAYERS)
-    return;
-  if (!net_validate_chat_fields(wname, packet->length, packet->sequence,
-                                peer->got_chat_sequence != 0,
-                                peer->last_chat_sequence))
-    return;
-  peer->got_chat_sequence = 1;
-  peer->last_chat_sequence = packet->sequence;
-  peer->last_seen = g->tick;
-  peer->address = from->sin_addr.s_addr;
-  peer->port = from->sin_port;
-  String text = {packet->text, packet->length, CHAT_LENGTH};
-  net_sanitize_chat_text(text);
-  server_relay_chat(g, fd, pi, packet);
-}
-
-static void server_handle_input(GameState *g, int fd,
-                                const struct sockaddr_in *from,
-                                const NetInputPacket *packet) {
-  (void)fd;
-  String wname = {(u8 *)packet->name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
-  if (!net_validate_input_fields(packet->session, wname))
-    return;
-  int pi = find_peer_session(g, packet->session);
-  if (packet->type == NET_PACKET_DISCONNECT) {
-    if (pi >= 0 && pi < MAX_PLAYERS) {
-      String have = game_player_name(g, (u32)pi);
-      if (string_eq(have, wname))
-        remove_peer(g, pi);
-    }
-    return;
-  }
-  if (pi < 0) {
-    if (packet->claimed_player != NET_PACKET_NONE ||
-        session_was_retired(g, packet->session))
-      return;
-    pi = add_peer(g, from, packet->session, wname);
-    if (pi < 0)
-      return;
-  }
-  if (pi < 0 || pi >= MAX_PLAYERS)
-    return;
-  Peer *peer = &g->peers[pi];
-  if (peer->player >= MAX_PLAYERS)
-    return;
-  String have = game_player_name(g, peer->player);
-  if (!string_eq(have, wname) || (packet->claimed_player != NET_PACKET_NONE &&
-                                  packet->claimed_player != peer->player))
-    return;
-  if (!net_seq_fresh(packet->sequence, peer->got_sequence != 0,
-                     peer->last_sequence))
-    return;
-  peer->got_sequence = 1;
-  peer->last_sequence = packet->sequence;
-  peer->last_seen = g->tick;
-  peer->address = from->sin_addr.s_addr;
-  peer->port = from->sin_port;
-  g->input[peer->player].move_x = (i8)clamp_int(packet->move_x, -1, 1);
-  g->input[peer->player].move_z = (i8)clamp_int(packet->move_z, -1, 1);
-  g->input[peer->player].aim_dir = aim_vector_pitch_limited(packet->aim_dir);
-  g->input[peer->player].buttons = packet->buttons & BTN_ALL;
-}
-
-static void server_receive(GameState *g, int fd) {
-  u8 buf[NET_MAX_DATAGRAM];
-  for (;;) {
-    struct sockaddr_in from;
-    socklen_t from_size = sizeof(from);
-    ssize_t raw =
-        recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_size);
-    if (raw < 0)
-      return;
-    if (raw == 0 || raw > (ssize_t)sizeof(buf))
-      continue;
-    i32 n = (i32)raw;
-    NetChatPacket chat;
-    if (net_chat_decode(buf, n, &chat)) {
-      server_handle_chat(g, fd, &from, &chat);
-      continue;
-    }
-    NetInputPacket input;
-    if (net_input_decode(buf, n, &input)) {
-      server_handle_input(g, fd, &from, &input);
-      continue;
-    }
-  }
-}
-
-// TODO: put system_ in the front for all systems.
-static void drop_afk_player_system(GameState *g) {
-  for (int i = 0; i < MAX_PLAYERS; ++i)
     if (g->peers[i].active &&
         tick_age(g->tick, g->peers[i].last_seen) > SIM_HZ * 10)
       remove_peer(g, i);
-}
-
-static void server_send_all(GameState *g, int fd) {
-  NetSnapshot snap;
-  bool have_peer = false;
-  for (int i = 0; i < MAX_PLAYERS; ++i)
-    have_peer |= g->peers[i].active && g->peers[i].player < MAX_PLAYERS;
-  if (!have_peer)
-    return;
-  /* Sight targets are presentation-only and need one raycast per snapshot,
-   * not one on each of the five intervening simulation ticks. */
-  aim_point_system(g);
-  for (int i = 0; i < MAX_PLAYERS; ++i) {
-    if (!g->peers[i].active || g->peers[i].player >= MAX_PLAYERS)
-      continue;
-    u16 ack = g->peers[i].got_sequence ? g->peers[i].last_sequence : 0;
-    write_snapshot(g, &snap, g->peers[i].player, ack, g->peers[i].session);
-    send_peer_snapshot(fd, &g->peers[i], &snap);
   }
 }
 
 static void server_run(u16 port) {
-  GameState game;
+  GameState game = {0};
   int fd = open_udp_server(port);
   double current = hires_time_in_seconds(), acc = 0.0;
   struct timespec idle = {0, 1000000L};
@@ -789,7 +574,7 @@ static void server_run(u16 port) {
     server_receive(&game, fd);
     while (acc >= SIM_DT) {
       server_tick(&game);
-      drop_afk_player_system(&game);
+      system_drop_afk_player(&game);
       if (game.tick % SNAPSHOT_INTERVAL == 0)
         server_send_all(&game, fd);
       acc -= SIM_DT;

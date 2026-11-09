@@ -1,5 +1,8 @@
 #include "client.c"
+#include "models.c"
+#include "networking.c"
 #include "server.c"
+#include "shared.c"
 
 static void print_usage(String program) {
   fprintf(stderr, "usage: %.*s --server [port]\n", (int)program.length,

@@ -4,71 +4,25 @@
 #include "rlgl.h"
 #include "shared.c"
 
-// TODO: this needs to be like in a shared place with all UI constant and offsets and that sort of thing.
-#define PAL_DARK ((Color){16, 8, 24, 255})
-#define PAL_PURPLE ((Color){60, 30, 102, 255})
-#define PAL_MID ((Color){155, 123, 208, 255})
-#define PAL_LIGHT ((Color){246, 213, 232, 255})
-
-#define VIEWMODEL_SCALE 1.35f
-#define P99_SIGHT_TIP ((Vector3){-0.32f, 0.098f, 0.48f})
-#define OUTLINE_WIRE_EXPAND 1.04f
-#define MARK_SPLAT_BASE 0.08f
-#define MARK_SPLAT_STEP 0.04f
-#define MARK_SPATTER_BASE 2
-#define MARK_SPATTER_LIFE 12
-#define MARK_SPATTER_LIFE_STEP 4
-#define MARK_DRAW_NUDGE 0.008f
-#define HELP_COL0_X 2
-#define HELP_COL1_X (LOGICAL_W / 2 + 1)
-#define HELP_TITLE_Y 3
-#define HELP_ROWS_Y 11
-#define HELP_ROW_DY 6
-#define HELP_KEY_ADV 24
-#define STAT_NUM_ADV 20
-#define STAT_UPDATE_DT 0.1
-
-// TODO: ensure the player is always on same entity slot. this function should not exist. then add a define like PLAYER_ENTITY
-static u32 local_player_entity(const GameState *g);
-
-// TODO: remote gun should ont be sepeated like this. why is this outside of ecs / main ecs Game state???
-// im pretty sure this isn't even necessary at all to have.
 typedef struct RemoteGun {
   f32 walk_phase, walk_blend, aim_blend, sprint_blend;
   Vector2 move_sway, move_vel;
   u8 loco;
 } RemoteGun;
 
-static RemoteGun remote_gun[ECS_MAX_ENTITIES];
-static IVec3 remote_aim_point_prev[ECS_MAX_ENTITIES];
-static u8 remote_reload_q[ECS_MAX_ENTITIES];
+typedef struct ClientState {
+  RemoteGun remote_gun[ECS_MAX_ENTITIES];
+  IVec3 remote_aim_point_prev[ECS_MAX_ENTITIES];
+  u8 remote_reload_q[ECS_MAX_ENTITIES];
+  unsigned shown_fps, shown_ping;
+  double last_stat_update;
+} ClientState;
 
-// TODO: why is this function so stupid short???
-static void remote_gun_reset(u32 e) {
-  if (e < ECS_MAX_ENTITIES)
-    remote_gun[e] = (RemoteGun){0};
-}
-
-static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  struct in_addr address;
-  if (fd < 0 || !parse_ipv4(host, &address)) {
-    if (fd >= 0)
-      close(fd);
-    return -1;
-  }
-  *server = (struct sockaddr_in){
-      .sin_family = AF_INET, .sin_addr = address, .sin_port = htons(port)};
-  if (connect(fd, (const struct sockaddr *)server, sizeof(*server)) < 0) {
-    close(fd);
-    return -1;
-  }
-  socket_nonblocking(fd);
-  return fd;
-}
+#define CLIENT_PLAYER(g)                                                       \
+  (ecs_has(&(g)->ecs, PLAYER_ENTITY, COMP_PLAYER) ? PLAYER_ENTITY              \
+                                                  : ECS_INVALID_ENTITY)
 
 static void renew_client_session(GameState *g) {
-// TODO: do not init struct like this., use c initialiters. this is for all places
   g->session = make_session_id(g->session);
   g->connected = 0;
   g->local_player = NET_PACKET_NONE;
@@ -78,12 +32,7 @@ static void renew_client_session(GameState *g) {
   g->last_snapshot_tick = g->last_chat_sequence = 0;
   g->last_snapshot_ack = 0;
   g->snapshot_silence_ticks = 0;
-// TODO: use ecs functions for this. bad.
-  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
-    g->weapon_dirty_seq[e] = 0;
   client_clear_world(g);
-  // TODO: why is this some weird global. bad. if you need this. we should not have all things directly in global. need to have g->client-> maybe or something.
-  // more order
   g->gun_kick = 0;
   g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   g->gun_rise = g->gun_rise_velocity = 0.0f;
@@ -95,44 +44,121 @@ static void renew_client_session(GameState *g) {
   g->move_sway = (Vector2){0, 0};
   g->move_vel = (Vector2){0, 0};
   g->sprint_blend = 0.0f;
-// TODO: no memset
-  memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
-  g->ping.rtt_ms = 0.0;
-  g->ping.have = 0;
+  g->ping = (PingState){0};
   for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
-    remote_gun_reset(e);
-    remote_aim_point_prev[e] = (IVec3){0, 0, POS_SCALE};
+    g->weapon_dirty_seq[e] = 0;
+    g->client->remote_gun[e] = (RemoteGun){0};
+    g->client->remote_reload_q[e] = 0;
+    g->client->remote_aim_point_prev[e] = (IVec3){0, 0, POS_SCALE};
   }
 }
 
-static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
-  if (server_entity >= ECS_MAX_ENTITIES)
+static u32 client_entity_for(GameState *g, u8 wire_id, u8 kind, u8 owner) {
+  if (wire_id >= ECS_MAX_ENTITIES) {
     return ECS_INVALID_ENTITY;
-  u8 local = g->network_entity[server_entity];
-  if (local != NET_PACKET_NONE && ecs_alive(&g->ecs, local) &&
-      ecs_has(&g->ecs, local, COMP_NETWORKED) && g->kind[local] == kind)
-    return local;
-  if (local != NET_PACKET_NONE && ecs_alive(&g->ecs, local))
-    ecs_destroy(&g->ecs, local);
-  u32 e = ecs_create(&g->ecs);
-  if (e == ECS_INVALID_ENTITY || e >= ECS_MAX_ENTITIES)
+  }
+  bool is_local = kind == KIND_PLAYER && g->local_player < MAX_PLAYERS &&
+                  owner == g->local_player;
+  u8 mapped = g->network_entity[wire_id];
+  if (mapped != NET_PACKET_NONE && ecs_alive(&g->ecs, mapped) &&
+      g->kind[mapped] == kind && (mapped == PLAYER_ENTITY) == is_local) {
+    return mapped;
+  }
+  if (mapped != NET_PACKET_NONE && ecs_alive(&g->ecs, mapped)) {
+    if (mapped != PLAYER_ENTITY) {
+      ecs_destroy(&g->ecs, mapped);
+    } else {
+      ecs_remove_all(&g->ecs, mapped);
+      clear_entity_data(g, mapped);
+    }
+  }
+  u32 e = is_local ? PLAYER_ENTITY : ecs_create(&g->ecs);
+  if (e == ECS_INVALID_ENTITY || e >= ECS_MAX_ENTITIES ||
+      !ecs_alive(&g->ecs, e)) {
     return ECS_INVALID_ENTITY;
-  g->network_entity[server_entity] = (u8)e;
-  for (u32 c = 0; c < ECS_MAX_COMPONENTS; ++c)
-    ecs_remove(&g->ecs, e, c);
+  }
+  ecs_remove_all(&g->ecs, e);
   clear_entity_data(g, e);
-  remote_gun_reset(e);
-  remote_reload_q[e] = 0;
+  g->client->remote_gun[e] = (RemoteGun){0};
+  g->client->remote_reload_q[e] = 0;
+  g->network_entity[wire_id] = (u8)e;
   return e;
 }
 
-static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
+static void client_apply_entity(GameState *g, const NetSnapshot *snap,
+                                const NetEntity *w) {
+  if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_FLOOR)
+    return;
+  if (w->owner >= MAX_PLAYERS)
+    return;
+  g->snapshot_seen |= UINT64_C(1) << w->entity;
+  u8 mapped = g->network_entity[w->entity];
+  bool local = w->kind == KIND_PLAYER && w->owner == g->local_player;
+  bool had = mapped != NET_PACKET_NONE && ecs_alive(&g->ecs, mapped) &&
+             g->kind[mapped] == w->kind && (mapped == PLAYER_ENTITY) == local;
+  u32 e = client_entity_for(g, w->entity, w->kind, w->owner);
+  if (e == ECS_INVALID_ENTITY)
+    return;
+  i16 nx = w->x, ny = w->y, nz = w->z;
+  i16 dx = (i16)(nx - g->pos[e].x);
+  i16 dy = (i16)(ny - g->pos[e].y);
+  i16 dz = (i16)(nz - g->pos[e].z);
+  bool snap_pos = !had || abs(dx) > SNAP_MAX_XZ_DELTA ||
+                  abs(dz) > SNAP_MAX_XZ_DELTA || dy > SNAP_MAX_RISE_DELTA ||
+                  dy < -SNAP_MAX_FALL_DELTA;
+  g->vel[e].x = snap_pos ? 0 : dx;
+  g->vel[e].y = snap_pos ? 0 : dy;
+  g->vel[e].z = snap_pos ? 0 : dz;
+  if (w->kind == KIND_PLAYER) {
+    if (had)
+      g->lag[e].yaw = lag_encode(wrap_degrees(w->yaw - g->aim[e].yaw));
+    else
+      g->lag[e].yaw = LAG_NEUTRAL;
+    g->client->remote_aim_point_prev[e] = had ? g->aim_point[e] : w->aim_point;
+  }
+  g->kind[e] = w->kind;
+  g->owner[e] = w->owner;
+  g->pos[e] = (IVec3){nx, ny, nz};
+  g->aim[e] = (Aim){w->yaw, w->pitch};
+  if (w->kind == KIND_PLAYER) {
+    g->aim_dir[e] = w->aim_dir;
+    g->aim_point[e] = w->aim_point;
+  }
+  g->flash[e] = w->flags;
+  g->held_by[e] = w->extra;
+  switch (w->kind) {
+  case KIND_CUBE:
+    g->scale[e] = scale_decode(w->scale);
+    break;
+  case KIND_CASING:
+    g->weapon_id[e] = w->weapon < WEAPON_COUNT ? w->weapon : WEAPON_P99;
+    break;
+  case KIND_PLAYER: {
+    if (!had) {
+      weapon_set_from_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0);
+      g->weapon_dirty_seq[e] = snap->acknowledged_sequence;
+    } else {
+      weapon_apply_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0,
+                            w->reload_q, snap->acknowledged_sequence);
+    }
+    g->client->remote_reload_q[e] = w->reload_q;
+    g->client->remote_gun[e].loco = w->scale;
+    break;
+  }
+  default:
+    break;
+  }
+  add_kind_components(g, e, w->kind);
+}
+
+static void client_snapshot_players(GameState *g, const NetSnapshot *snap) {
   u8 mask = 0;
   bool was = g->connected != 0;
-  for (u8 i = 0; i < snap->count; ++i)
+  for (u8 i = 0; i < snap->count; ++i) {
     if (snap->entities[i].kind == KIND_PLAYER &&
         snap->entities[i].owner < MAX_PLAYERS)
       mask |= (u8)(1u << snap->entities[i].owner);
+  }
   if (!was) {
     notice_set(g, STR("LINKED"));
   } else {
@@ -151,11 +177,16 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
       }
     }
   }
-  // TODO: DO not use for loops without braces. this is true for everythwernere.
-  for (u32 p = 0; p < MAX_PLAYERS; ++p)
-    for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
+  for (u32 p = 0; p < MAX_PLAYERS; ++p) {
+    for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
       g->player_name[p][i] = snap->names[p][i];
+    }
+  }
   g->visible_players = mask;
+}
+
+static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
+  client_snapshot_players(g, snap);
   g->snapshot_seen = 0;
   g->local_player = snap->local_player;
   g->last_snapshot_tick = snap->tick;
@@ -163,179 +194,46 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   g->connected = 1;
   g->snapshot_silence_ticks = 0;
   for (u8 i = 0; i < snap->count; ++i) {
-    const NetEntity *w = &snap->entities[i];
-    if (w->entity >= ECS_MAX_ENTITIES || w->kind == 0 || w->kind > KIND_FLOOR)
-      continue;
-    if (w->owner >= MAX_PLAYERS)
-      continue;
-    g->snapshot_seen |= UINT64_C(1) << w->entity;
-    u8 mapped = g->network_entity[w->entity];
-    bool had = mapped != NET_PACKET_NONE && ecs_alive(&g->ecs, mapped) &&
-               g->kind[mapped] == w->kind;
-    u32 e = client_entity_for(g, w->entity, w->kind);
-    if (e == ECS_INVALID_ENTITY)
-      continue;
-    i16 nx = w->x, ny = w->y, nz = w->z;
-    i16 dx = (i16)(nx - g->pos[e].x);
-    i16 dy = (i16)(ny - g->pos[e].y);
-    i16 dz = (i16)(nz - g->pos[e].z);
-    bool snap_pos =
-        !had || abs(dx) > 240 || abs(dz) > 240 || dy > 48 || dy < -240;
-    g->vel[e].x = snap_pos ? 0 : dx;
-    g->vel[e].y = snap_pos ? 0 : dy;
-    g->vel[e].z = snap_pos ? 0 : dz;
-    if (w->kind == KIND_PLAYER) {
-      if (had)
-        g->lag[e].yaw = lag_encode(wrap_degrees(w->yaw - g->aim[e].yaw));
-      else
-        g->lag[e].yaw = LAG_NEUTRAL;
-      remote_aim_point_prev[e] = had ? g->aim_point[e] : w->aim_point;
-    }
-    g->kind[e] = w->kind;
-    g->owner[e] = w->owner;
-    g->pos[e] = (IVec3){nx, ny, nz};
-    g->aim[e] = (Aim){w->yaw, w->pitch};
-    if (w->kind == KIND_PLAYER) {
-      g->aim_dir[e] = w->aim_dir;
-      g->aim_point[e] = w->aim_point;
-    }
-    g->flash[e] = w->flags;
-    g->held_by[e] = w->extra;
-    if (w->kind == KIND_CUBE)
-      g->scale[e] = scale_decode(w->scale);
-    if (w->kind == KIND_CASING) {
-      u8 sid = w->weapon < WEAPON_COUNT ? w->weapon : WEAPON_P99;
-      g->weapon_id[e] = sid;
-    }
-    if (w->kind == KIND_PLAYER) {
-      if (!had) {
-        weapon_set_from_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0);
-        g->weapon_dirty_seq[e] = snap->acknowledged_sequence;
-      } else {
-        weapon_apply_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0,
-                              w->reload_q, snap->acknowledged_sequence);
-      }
-      remote_reload_q[e] = w->reload_q;
-      remote_gun[e].loco = w->scale;
-    }
-    add_kind_components(g, e, w->kind);
+    client_apply_entity(g, snap, &snap->entities[i]);
   }
   g->interpolation_ticks = 0;
   for (u32 s = 0; s < ECS_MAX_ENTITIES; ++s) {
     u8 local = g->network_entity[s];
     if (local != NET_PACKET_NONE &&
         (g->snapshot_seen & (UINT64_C(1) << s)) == 0) {
-      if (ecs_alive(&g->ecs, local))
-        ecs_destroy(&g->ecs, local);
+      if (ecs_alive(&g->ecs, local)) {
+        if (local == PLAYER_ENTITY) {
+          ecs_remove_all(&g->ecs, local);
+          clear_entity_data(g, local);
+        } else {
+          ecs_destroy(&g->ecs, local);
+        }
+      }
       g->network_entity[s] = NET_PACKET_NONE;
     }
   }
 }
 
-// TODO: put this in networking.c any networking / encoding decoding. inside networking. have different section for sending recieve, and encode decode.
-// have smaller functions than these huge conglomerates
-static void client_receive(GameState *g, int fd) {
-  u8 buf[NET_MAX_DATAGRAM];
-  for (;;) {
-    ssize_t raw = recv(fd, buf, sizeof(buf), 0);
-    if (raw < 0) {
-      if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (g->connected)
-          notice_set(g, STR("DROPPED"));
-        renew_client_session(g);
-      }
-      return;
+static void client_edit_chat(GameState *g, int fd) {
+  int c;
+  g->input[0].move_x = g->input[0].move_z = 0;
+  g->input[0].buttons = 0;
+  if (IsKeyPressed(KEY_ESCAPE)) {
+    g->chatting = g->chat_length = 0;
+  } else if (IsKeyPressed(KEY_ENTER)) {
+    if (g->chat_length > 0)
+      client_send_chat(g, fd);
+    g->chatting = g->chat_length = 0;
+  } else {
+    if (IsKeyPressed(KEY_BACKSPACE) && g->chat_length > 0)
+      --g->chat_length;
+    while ((c = GetKeyPressed()) != 0) {
+      c = CHAR_TO_UPPER(c);
+      if (CHAR_IS_CHAT(c) && g->chat_length < CHAT_LENGTH)
+        g->chat_input[g->chat_length++] = (u8)c;
     }
-    if (raw == 0 || raw > (ssize_t)sizeof(buf))
-      continue;
-    i32 n = (i32)raw;
-    NetChatPacket chat;
-    if (net_chat_decode(buf, n, &chat)) {
-      String wname = {(u8 *)chat.name, PLAYER_NAME_LENGTH, PLAYER_NAME_LENGTH};
-      if (chat.session != g->session)
-        continue;
-      if (!net_validate_chat_fields(wname, chat.length, chat.sequence,
-                                    g->got_chat_sequence != 0,
-                                    g->last_chat_sequence))
-        continue;
-      g->got_chat_sequence = 1;
-      g->last_chat_sequence = chat.sequence;
-      String text = {chat.text, chat.length, CHAT_LENGTH};
-      notice_chat_msg(g, wname, text);
-      continue;
-    }
-    NetSnapshot snap;
-    if (!net_snapshot_decode(buf, n, &snap))
-      continue;
-    if (!net_validate_snapshot_fields(&snap, g->session, g->got_snapshot != 0,
-                                      g->last_snapshot_tick))
-      continue;
-    {
-      u16 ack = snap.acknowledged_sequence;
-      u32 slot = (u32)ack & PING_WINDOW_MASK;
-      if (g->ping.slot_valid[slot] && g->ping.send_seq[slot] == ack) {
-        double now = hires_time_in_seconds();
-        double sample = (now - g->ping.send_time[slot]) * PING_MS_PER_SEC;
-        if (sample < 0.0)
-          sample = 0.0;
-        if (sample > PING_MAX_MS)
-          sample = PING_MAX_MS;
-        if (!g->ping.have) {
-          g->ping.rtt_ms = sample;
-          g->ping.have = 1;
-        } else {
-          g->ping.rtt_ms = g->ping.rtt_ms * (1.0 - PING_SMOOTH_NEW) +
-                           sample * PING_SMOOTH_NEW;
-        }
-      }
-    }
-    g->got_snapshot = 1;
-    apply_snapshot(g, &snap);
   }
-}
-
-static void client_send_input(GameState *g, int fd, u8 type) {
-  NetInputPacket packet = {
-      .magic = NET_MAGIC,
-      .type = type,
-      .claimed_player = g->local_player,
-      .session = g->session,
-  };
-  String req = game_requested_name(g);
-  memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
-  if (type == NET_PACKET_INPUT) {
-    packet.buttons = g->input[0].buttons & BTN_ALL;
-    packet.sequence = g->next_sequence++;
-    packet.move_x = g->input[0].move_x;
-    packet.move_z = g->input[0].move_z;
-    packet.aim_dir =
-        aim_vector_encode(sight_dir((f32)g->view.yaw, (f32)g->view.pitch));
-    u32 slot = (u32)packet.sequence & PING_WINDOW_MASK;
-    g->ping.send_time[slot] = hires_time_in_seconds();
-    g->ping.send_seq[slot] = packet.sequence;
-    g->ping.slot_valid[slot] = 1;
-  }
-  (void)send(fd, &packet, sizeof(packet), 0);
-}
-
-// TODO: again, no sepearation. this kind of code, in all places, should be more generalized and neat.
-static void client_send_chat(GameState *g, int fd) {
-  if (g->chat_length > CHAT_LENGTH)
-    return;
-  NetChatPacket packet = {
-      .magic = NET_MAGIC,
-      .type = NET_PACKET_CHAT,
-      .player = g->local_player,
-      .length = g->chat_length,
-      .session = g->session,
-      .sequence = g->next_chat_sequence++,
-  };
-  String req = game_requested_name(g);
-  String chat = game_chat_input(g);
-  memcpy(packet.name, req.items, PLAYER_NAME_LENGTH);
-  if (chat.length > 0)
-    memcpy(packet.text, chat.items, (size_t)chat.length);
-  (void)send(fd, &packet, sizeof(packet), 0);
+  (void)GetMouseDelta();
 }
 
 static void update_input(GameState *g, int fd) {
@@ -360,25 +258,7 @@ static void update_input(GameState *g, int fd) {
     return;
   }
   if (g->chatting) {
-    int c;
-    g->input[0].move_x = g->input[0].move_z = 0;
-    g->input[0].buttons = 0;
-    if (IsKeyPressed(KEY_ESCAPE)) {
-      g->chatting = g->chat_length = 0;
-    } else if (IsKeyPressed(KEY_ENTER)) {
-      if (g->chat_length > 0)
-        client_send_chat(g, fd);
-      g->chatting = g->chat_length = 0;
-    } else {
-      if (IsKeyPressed(KEY_BACKSPACE) && g->chat_length > 0)
-        --g->chat_length;
-      while ((c = GetKeyPressed()) != 0) {
-        c = CHAR_TO_UPPER(c);
-        if (CHAR_IS_CHAT(c) && g->chat_length < CHAT_LENGTH)
-          g->chat_input[g->chat_length++] = (u8)c;
-      }
-    }
-    (void)GetMouseDelta();
+    client_edit_chat(g, fd);
     return;
   }
   int mx = (IsKeyDown(KEY_D) ? 1 : 0) - (IsKeyDown(KEY_A) ? 1 : 0);
@@ -407,29 +287,20 @@ static void update_input(GameState *g, int fd) {
   if (!g->mouse_captured)
     return;
   Vector2 mouse = GetMouseDelta();
-  u32 sens_e = local_player_entity(g);
+  u32 sens_e = CLIENT_PLAYER(g);
   u8 sens_wid =
       sens_e != ECS_INVALID_ENTITY ? g->weapon_id[sens_e] : WEAPON_P99;
   f32 sens = aiming ? weapon_aim_sens_scale(sens_wid) : 1.0f;
   g->look_delta.x = mouse.x * sens;
   g->look_delta.y = mouse.y * sens;
   g->view.yaw = wrap_degrees((int)g->view.yaw - (int)lroundf(g->look_delta.x));
-  g->view.pitch = (i16)clamp_int(
-      (int)g->view.pitch - (int)lroundf(g->look_delta.y), -75, 75);
-}
-
-static u32 local_player_entity(const GameState *g) {
-  u32 comps[] = {COMP_PLAYER, COMP_POSITION};
-  EcsQuery q = ecs_query(&g->ecs, comps, 2);
-  while (ecs_next(&q))
-    if (g->owner[q.entity] == g->local_player)
-      return q.entity;
-  return ECS_INVALID_ENTITY;
+  g->view.pitch =
+      (i16)clamp_int((int)g->view.pitch - (int)lroundf(g->look_delta.y),
+                     -PLAYER_MAX_PITCH, PLAYER_MAX_PITCH);
 }
 
 static Camera3D make_camera(const GameState *g, f32 a) {
-  u32 e = local_player_entity(g);
-// TODO: again this can be initialized cleaner
+  u32 e = CLIENT_PLAYER(g);
   Vector3 dir = {0.0f, 0.0f, 1.0f};
   u8 wid = e != ECS_INVALID_ENTITY ? g->weapon_id[e] : WEAPON_P99;
   f32 hip_fov = weapon_hip_fov(wid);
@@ -446,139 +317,6 @@ static Camera3D make_camera(const GameState *g, f32 a) {
   cam.fovy = hip_fov * (1.0f - g->aim_blend) + aim_fov * g->aim_blend;
   cam.target = vec3_add(cam.position, dir);
   return cam;
-}
-
-static f32 reload_ss01(f32 x) {
-  if (x <= 0.0f)
-    return 0.0f;
-  if (x >= 1.0f)
-    return 1.0f;
-  return x * x * (3.0f - 2.0f * x);
-}
-
-static void gun_reload_pose_p99(f32 reload_t) {
-  if (reload_t <= 0.0f)
-    return;
-  f32 env = reload_ss01(reload_t / 0.38f);
-  f32 thud = 0.0f;
-  if (reload_t > 0.58f && reload_t < 0.72f)
-    thud = sinf(PI * (reload_t - 0.58f) / 0.14f);
-  f32 ret = 1.0f;
-  if (reload_t > 0.72f) {
-    f32 u = (reload_t - 0.72f) / 0.28f;
-    if (u > 1.0f)
-      u = 1.0f;
-    f32 c1 = 1.70158f, c3 = c1 + 1.0f;
-    f32 um = u - 1.0f;
-    ret = 1.0f - (1.0f + c3 * um * um * um + c1 * um * um);
-  }
-  f32 ang = (env * 34.0f + thud * 5.0f) * ret;
-  f32 fwd = (env * 0.09f + thud * 0.05f) * ret;
-  f32 dwn = env * 0.03f * ret;
-  rlTranslatef(0.0f, -dwn, fwd);
-  rlTranslatef(-0.32f, -0.05f, 0.25f);
-  rlRotatef(ang, 1.0f, 0.0f, 0.0f);
-  rlTranslatef(0.32f, 0.05f, -0.25f);
-}
-
-static void ads_target_for_tip(const WeaponDef *def, Vector3 tip, f32 scale,
-                               f32 *tx, f32 *ty) {
-  f32 cr = cosf(def->ads_cant_deg * DEG2RAD);
-  f32 sr = sinf(def->ads_cant_deg * DEG2RAD);
-  f32 cp = cosf(def->ads_pitch_deg * DEG2RAD);
-  f32 sp = sinf(def->ads_pitch_deg * DEG2RAD);
-  f32 x0 = tip.x * scale, y0 = tip.y * scale, z0 = tip.z * scale;
-  f32 x1 = x0 * cr - y0 * sr;
-  f32 y1 = x0 * sr + y0 * cr;
-  f32 y2 = y1 * cp - z0 * sp;
-  *tx = -x1;
-  *ty = -y2;
-}
-
-static void gun_ads_target(u8 wid, const WeaponDef *def, f32 *tx, f32 *ty) {
-  switch (wid) {
-  case WEAPON_P99:
-    ads_target_for_tip(def, P99_SIGHT_TIP, VIEWMODEL_SCALE, tx, ty);
-    break;
-  default:
-    *tx = def->hip_off.x;
-    *ty = def->hip_off.y;
-    break;
-  }
-}
-
-static void draw_box_wires(Vector3 p, Vector3 s, Color wire) {
-  DrawCubeWiresV(p,
-                 (Vector3){s.x * OUTLINE_WIRE_EXPAND, s.y * OUTLINE_WIRE_EXPAND,
-                           s.z * OUTLINE_WIRE_EXPAND},
-                 wire);
-}
-
-// TODO: put these in their own file, models.c
-static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
-                         f32 reload_t) {
-  rlPushMatrix();
-  rlScalef(scale, scale, scale);
-  gun_reload_pose_p99(reload_t);
-  f32 slide_off = recoil + slide;
-  f32 frame_off = recoil * 0.6f;
-  f32 grip_off = recoil * 0.5f;
-  Vector3 sl = {-0.32f, 0.02f, 0.30f - slide_off};
-  Vector3 sls = {0.14f, 0.10f, 0.48f};
-  DrawCubeV(sl, sls, PAL_MID);
-  draw_box_wires(sl, sls, PAL_DARK);
-  Vector3 fr = {-0.32f, -0.055f, 0.275f - frame_off};
-  Vector3 frs = {0.14f, 0.05f, 0.43f};
-  DrawCubeV(fr, frs, PAL_PURPLE);
-  draw_box_wires(fr, frs, PAL_DARK);
-  Vector3 gr = {-0.32f, -0.20f, 0.14f - grip_off};
-  Vector3 grs = {0.10f, 0.28f, 0.13f};
-  DrawCubeV(gr, grs, PAL_PURPLE);
-  draw_box_wires(gr, grs, PAL_DARK);
-  DrawCubeV((Vector3){-0.385f, 0.045f, 0.18f - slide_off},
-            (Vector3){0.012f, 0.025f, 0.14f}, PAL_DARK);
-  f32 sz = -slide_off;
-  Vector3 rss = {0.022f, 0.028f, 0.04f};
-  Vector3 rl = {-0.375f, 0.080f, 0.09f + sz};
-  Vector3 rr = {-0.265f, 0.080f, 0.09f + sz};
-  DrawCubeV(rl, rss, PAL_DARK);
-  draw_box_wires(rl, rss, PAL_MID);
-  DrawCubeV(rr, rss, PAL_DARK);
-  draw_box_wires(rr, rss, PAL_MID);
-  Vector3 fs = {-0.32f, 0.082f, 0.48f + sz};
-  Vector3 fss = {0.022f, 0.032f, 0.022f};
-  DrawCubeV(fs, fss, PAL_DARK);
-  draw_box_wires(fs, fss, PAL_MID);
-  if (firing)
-    DrawCylinderEx((Vector3){-0.32f, 0.0f, 0.56f - frame_off},
-                   (Vector3){-0.32f, 0.0f, 0.72f - frame_off}, 0.065f, 0.0f, 5,
-                   PAL_LIGHT);
-  rlPopMatrix();
-}
-
-static void draw_gun_fallback(f32 recoil, f32 slide, f32 scale, bool firing) {
-  (void)firing;
-  rlPushMatrix();
-  rlScalef(scale, scale, scale);
-  Vector3 sl = {-0.32f, 0.0f, 0.30f - recoil - slide};
-  DrawCubeV(sl, (Vector3){0.16f, 0.13f, 0.46f}, PAL_MID);
-  draw_box_wires(sl, (Vector3){0.16f, 0.13f, 0.46f}, PAL_DARK);
-  Vector3 gr = {-0.32f, -0.15f, 0.18f - recoil};
-  DrawCubeV(gr, (Vector3){0.13f, 0.26f, 0.15f}, PAL_PURPLE);
-  draw_box_wires(gr, (Vector3){0.13f, 0.26f, 0.15f}, PAL_DARK);
-  rlPopMatrix();
-}
-
-static void draw_gun_local(u8 weapon_id, f32 recoil, f32 slide, f32 scale,
-                           bool firing, f32 reload_t) {
-  switch (weapon_id) {
-  case WEAPON_P99:
-    draw_gun_p99(recoil, slide, scale, firing, reload_t);
-    break;
-  default:
-    draw_gun_fallback(recoil, slide, scale, firing);
-    break;
-  }
 }
 
 static void draw_cube_lit(Vector3 p, Vector3 s, Color fill) {
@@ -599,20 +337,22 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool hurt = g->flash[e] > PLAYER_FIRE_FLASH_TICKS;
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
-  Vector3 point_prev = vec3_mul((Vector3){(f32)remote_aim_point_prev[e].x,
-                                          (f32)remote_aim_point_prev[e].y,
-                                          (f32)remote_aim_point_prev[e].z},
-                                1.0f / (f32)POS_SCALE);
+  Vector3 point_prev =
+      vec3_mul((Vector3){(f32)g->client->remote_aim_point_prev[e].x,
+                         (f32)g->client->remote_aim_point_prev[e].y,
+                         (f32)g->client->remote_aim_point_prev[e].z},
+               1.0f / (f32)POS_SCALE);
   Vector3 point_curr =
       vec3_mul((Vector3){(f32)g->aim_point[e].x, (f32)g->aim_point[e].y,
                          (f32)g->aim_point[e].z},
                1.0f / (f32)POS_SCALE);
   Vector3 target =
-      vec3_add(vec3_mul(point_prev, 1.0f - a), vec3_mul(point_curr, a));
+      vec_add(vec_mul(point_prev, 1.0f - a), vec_mul(point_curr, a));
   f32 body_yaw =
       present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
-  f32 reload_t =
-      remote_reload_q[e] == 0 ? 0.0f : (f32)(remote_reload_q[e] - 1) / 254.0f;
+  f32 reload_t = g->client->remote_reload_q[e] == 0
+                     ? 0.0f
+                     : (f32)(g->client->remote_reload_q[e] - 1) / 254.0f;
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
@@ -625,7 +365,7 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   rlPopMatrix();
   GunPose gp = gun_pose_toward_target(pos, target);
   const WeaponDef *wdef = weapon_def(g->weapon_id[e]);
-  RemoteGun *rp = &remote_gun[e];
+  RemoteGun *rp = &g->client->remote_gun[e];
   f32 b = clamp_float(rp->aim_blend, 0.0f, 1.0f);
   f32 sway_scale = 1.0f - b * 0.75f;
   Vector3 fwd, right, up;
@@ -656,43 +396,6 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   rlTranslatef(GUN_CENTER_X_M, 0.0f, 0.0f);
   draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
                  reload_t);
-  rlPopMatrix();
-}
-
-static Color shell_pal_color(u8 idx) {
-  switch (idx) {
-  case 0:
-    return PAL_DARK;
-  case 1:
-    return PAL_PURPLE;
-  case 2:
-    return PAL_MID;
-  default:
-    return PAL_LIGHT;
-  }
-}
-
-static void draw_casing(const GameState *g, u32 e, Vector3 p) {
-  u8 sid = g->weapon_id[e] < WEAPON_COUNT ? g->weapon_id[e] : WEAPON_P99;
-  const ShellDef *sh = shell_def(sid);
-  f32 half = sh->len * 0.5f;
-  f32 rad = sh->radius;
-  f32 rim = sh->rim_radius;
-  Color body = shell_pal_color(sh->body_pal);
-  Color rimc = shell_pal_color(sh->rim_pal);
-  f32 roll = (f32)g->held_by[e] * (360.0f / 256.0f);
-  rlPushMatrix();
-  rlTranslatef(p.x, p.y, p.z);
-  rlRotatef((f32)g->aim[e].yaw, 0.0f, 1.0f, 0.0f);
-  rlRotatef((f32)g->aim[e].pitch, 1.0f, 0.0f, 0.0f);
-  rlRotatef(roll, 0.0f, 0.0f, 1.0f);
-  DrawCylinderEx((Vector3){0.0f, -half * 1.06f, 0.0f},
-                 (Vector3){0.0f, half * 1.06f, 0.0f}, rim * 1.08f, rad * 1.08f,
-                 6, PAL_DARK);
-  DrawCylinderEx((Vector3){0.0f, -half, 0.0f}, (Vector3){0.0f, half, 0.0f}, rad,
-                 rad * 0.92f, 6, body);
-  DrawCylinderEx((Vector3){0.0f, -half * 1.06f, 0.0f},
-                 (Vector3){0.0f, -half * 0.72f, 0.0f}, rim, rim, 6, rimc);
   rlPopMatrix();
 }
 
@@ -836,9 +539,10 @@ static void draw_world(const GameState *g, f32 a) {
 }
 
 static int glyph_index(u8 c) {
-  for (u32 i = 0; i < TOM_THUMB_3X5_COUNT; ++i)
+  for (u32 i = 0; i < TOM_THUMB_3X5_COUNT; ++i) {
     if (TOM_THUMB_3X5_CHARS[i] == (char)c)
       return (int)i;
+  }
   return -1;
 }
 
@@ -847,17 +551,18 @@ static void draw_small_text(int x, int y, String text, Color color) {
     int idx = glyph_index(text.items[i]);
     if (idx < 0)
       continue;
-    for (int row = 0; row < 5; ++row)
-      for (int col = 0; col < 3; ++col)
+    for (int row = 0; row < 5; ++row) {
+      for (int col = 0; col < 3; ++col) {
         if (tom_thumb_3x5[idx] & (1u << ((4 - row) * 3 + 2 - col)))
           DrawRectangle(x + i * 4 + col, y + row, 1, 1, color);
+      }
+    }
   }
 }
 
 static void draw_number(int x, int y, unsigned value, Color color) {
   u8 digits[8];
   int n = 0;
-// TODO: what is this shitty code.
   do {
     digits[n++] = (u8)('0' + value % 10u);
     value /= 10u;
@@ -868,8 +573,6 @@ static void draw_number(int x, int y, unsigned value, Color color) {
     draw_small_text(x + i * 4, y, t, color);
   }
 }
-
-// TODO: what is this shitty code.
 static int ammo_field_width(unsigned mag) {
   int d = 1;
   unsigned m = mag;
@@ -879,8 +582,6 @@ static int ammo_field_width(unsigned mag) {
   }
   return d < 2 ? 2 : d;
 }
-
-// TODO: what is this shitty code.
 static void draw_number_padded(int x, int y, unsigned value, int width,
                                Color color) {
   u8 buf[8];
@@ -968,57 +669,17 @@ static void draw_help_entry(int x, int y, const char *key, const char *action) {
   draw_small_text(x, y, ks, PAL_MID);
   draw_small_text(x + HELP_KEY_ADV, y, as, PAL_LIGHT);
 }
-
-// TODO: what is this shitty code. DO not use random / magic numbers
-// that is something for every function
-static void draw_hud(GameState *g) {
-  u32 e = local_player_entity(g);
-  if (!g->chatting && g->notice_ticks && g->notice_length) {
-    String note = game_notice(g);
-    int w = small_text_width(note);
-    DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
-    draw_small_text(2, 2, note, PAL_LIGHT);
-  }
-  if (e != ECS_INVALID_ENTITY)
-    draw_hit_indicator(g, e);
-  if (g->aim_blend < 0.5f)
-    DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
-  if (e != ECS_INVALID_ENTITY && g->connected) {
-    bool reloading = weapon_is_reloading(g, e);
-    unsigned ammo = weapon_ammo(g, e);
-    unsigned mag = weapon_mag_size(g->weapon_id[e]);
-    if (ammo > mag)
-      ammo = mag;
-    int width = ammo_field_width(mag);
-    int num_w = width * 4 - 1;
-    int bx = LOGICAL_W - num_w - 3;
-    DrawRectangle(bx, LOGICAL_H - 9, num_w + 2, 7, PAL_DARK);
-    draw_number_padded(bx + 1, LOGICAL_H - 8, ammo, width,
-                       ammo_color(ammo, mag, reloading));
-  }
-  if (g->chatting) {
-    String chat = game_chat_input(g);
-    int w = 8 + small_text_width(chat);
-    if (w < 7)
-      w = 7;
-    if (w > LOGICAL_W - 4)
-      w = LOGICAL_W - 4;
-    DrawRectangle(1, 1, w + 2, 7, PAL_DARK);
-    draw_small_text(2, 2, STR("T"), PAL_MID);
-    draw_small_text(10, 2, chat, PAL_LIGHT);
-  }
+static void draw_stats(GameState *g) {
   if (IsKeyDown(KEY_TAB)) {
-    static unsigned shown_fps, shown_ping;
-    static double last_stat_update = -1.0;
     double now = GetTime();
-    if (now - last_stat_update >= STAT_UPDATE_DT) {
-      shown_fps = (unsigned)GetFPS();
-      shown_ping =
+    if (now - g->client->last_stat_update >= STAT_UPDATE_DT) {
+      g->client->shown_fps = (unsigned)GetFPS();
+      g->client->shown_ping =
           (g->connected && g->ping.have) ? (unsigned)(g->ping.rtt_ms + 0.5) : 0;
-      last_stat_update = now;
+      g->client->last_stat_update = now;
     }
-    unsigned fps = shown_fps;
-    unsigned ping = shown_ping;
+    unsigned fps = g->client->shown_fps;
+    unsigned ping = g->client->shown_ping;
     unsigned fps_copy = fps;
     int fps_digits = 1;
     while (fps_copy >= 10u) {
@@ -1040,6 +701,9 @@ static void draw_hud(GameState *g) {
     draw_small_text(2, 10, STR("PING"), PAL_MID);
     draw_number(2 + STAT_NUM_ADV, 10, ping, PAL_LIGHT);
   }
+}
+
+static void draw_help_overlay(GameState *g) {
   if (g->help) {
     DrawRectangle(0, 0, LOGICAL_W, LOGICAL_H, PAL_DARK);
     DrawRectangleLines(0, 0, LOGICAL_W, LOGICAL_H, PAL_MID);
@@ -1055,10 +719,51 @@ static void draw_hud(GameState *g) {
   }
 }
 
+static void draw_hud(GameState *g) {
+  u32 e = CLIENT_PLAYER(g);
+  if (!g->chatting && g->notice_ticks && g->notice_length) {
+    String note = game_notice(g);
+    int w = small_text_width(note);
+    DrawRectangle(HUD_TOP_X, HUD_TOP_Y, w + 2, HUD_TEXT_HEIGHT, PAL_DARK);
+    draw_small_text(HUD_TEXT_X, HUD_TEXT_Y, note, PAL_LIGHT);
+  }
+  if (e != ECS_INVALID_ENTITY)
+    draw_hit_indicator(g, e);
+  if (g->aim_blend < 0.5f)
+    DrawRectangle(LOGICAL_W / 2, LOGICAL_H / 2, 1, 1, PAL_LIGHT);
+  if (e != ECS_INVALID_ENTITY && g->connected) {
+    bool reloading = weapon_is_reloading(g, e);
+    unsigned ammo = weapon_ammo(g, e);
+    unsigned mag = weapon_mag_size(g->weapon_id[e]);
+    if (ammo > mag)
+      ammo = mag;
+    int width = ammo_field_width(mag);
+    int num_w = width * HUD_DIGIT_ADVANCE - 1;
+    int bx = LOGICAL_W - num_w - HUD_AMMO_RIGHT_MARGIN;
+    int by = LOGICAL_H - HUD_AMMO_BOTTOM_MARGIN;
+    DrawRectangle(bx, by, num_w + 2, HUD_TEXT_HEIGHT, PAL_DARK);
+    draw_number_padded(bx + 1, by + 1, ammo, width,
+                       ammo_color(ammo, mag, reloading));
+  }
+  if (g->chatting) {
+    String chat = game_chat_input(g);
+    int w = 8 + small_text_width(chat);
+    if (w < 7)
+      w = 7;
+    if (w > LOGICAL_W - 4)
+      w = LOGICAL_W - 4;
+    DrawRectangle(HUD_TOP_X, HUD_TOP_Y, w + 2, HUD_TEXT_HEIGHT, PAL_DARK);
+    draw_small_text(2, 2, STR("T"), PAL_MID);
+    draw_small_text(10, 2, chat, PAL_LIGHT);
+  }
+  draw_stats(g);
+  draw_help_overlay(g);
+}
+
 static void update_viewmodel(GameState *g, f32 dt) {
   if (dt > 0.05f)
     dt = 0.05f;
-  u32 aim_e = local_player_entity(g);
+  u32 aim_e = CLIENT_PLAYER(g);
   bool aim_reloading =
       aim_e != ECS_INVALID_ENTITY && weapon_is_reloading(g, aim_e);
   present_blend_tick(&g->aim_blend,
@@ -1110,7 +815,7 @@ static void update_remote_viewmodels(GameState *g, f32 dt) {
     u32 e = q.entity;
     if (g->owner[e] == g->local_player)
       continue;
-    RemoteGun *rp = &remote_gun[e];
+    RemoteGun *rp = &g->client->remote_gun[e];
     i8 mx, mz;
     bool aiming, sprinting;
     unpack_player_locomotion(rp->loco, &mx, &mz, &aiming, &sprinting);
@@ -1125,10 +830,9 @@ static void update_remote_viewmodels(GameState *g, f32 dt) {
   }
 }
 
-static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
-                         f32 a) {
+static void render_scene(GameState *g, RenderTexture2D view, f32 a) {
   Camera3D cam = make_camera(g, a);
-  u32 local_e = local_player_entity(g);
+  u32 local_e = CLIENT_PLAYER(g);
   u8 local_wid =
       local_e != ECS_INVALID_ENTITY ? g->weapon_id[local_e] : WEAPON_P99;
   const WeaponDef *wdef = weapon_def(local_wid);
@@ -1179,12 +883,17 @@ static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
   rlPopMatrix();
   EndMode3D();
   EndTextureMode();
+}
 
+static void render_hud_texture(GameState *g, RenderTexture2D ui) {
   BeginTextureMode(ui);
   ClearBackground(BLANK);
   draw_hud(g);
   EndTextureMode();
+}
 
+static void render_present(GameState *g, RenderTexture2D view,
+                           RenderTexture2D ui) {
   BeginDrawing();
   ClearBackground(PAL_DARK);
   int scale = GetScreenWidth() / LOGICAL_W;
@@ -1210,8 +919,15 @@ static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
   EndDrawing();
 }
 
-static void weapon_predict_system(GameState *g) {
-  u32 e = local_player_entity(g);
+static void render_frame(GameState *g, RenderTexture2D view, RenderTexture2D ui,
+                         f32 a) {
+  render_scene(g, view, a);
+  render_hud_texture(g, ui);
+  render_present(g, view, ui);
+}
+
+static void system_weapon_predict(GameState *g) {
+  u32 e = CLIENT_PLAYER(g);
   if (e == ECS_INVALID_ENTITY)
     return;
   u8 before_ammo = g->weapon_ammo[e];
@@ -1237,10 +953,30 @@ static void weapon_predict_system(GameState *g) {
       g->weapon_reload[e] != before_reload || g->weapon_id[e] != before_id)
     g->weapon_dirty_seq[e] = g->next_sequence;
 }
+static void system_client_tick(GameState *g, int fd) {
+  if (++g->command_ticks >= COMMAND_INTERVAL) {
+    client_send_input(g, fd, NET_PACKET_INPUT);
+    g->command_ticks = 0;
+  }
+  if (g->interpolation_ticks < SNAPSHOT_INTERVAL) {
+    ++g->interpolation_ticks;
+  }
+  if (g->notice_ticks > 0) {
+    --g->notice_ticks;
+  }
+  if (g->connected && ++g->snapshot_silence_ticks > SIM_HZ * 2) {
+    renew_client_session(g);
+    notice_set(g, STR("DROPPED"));
+  }
+  if (g->gun_kick > 0) {
+    --g->gun_kick;
+  }
+  system_weapon_predict(g);
+}
 
-// TODO:  this could be more smaller functions, hard to see whats going on
 static int client_run(String host, u16 port, String name) {
-  GameState game;
+  GameState game = {0};
+  ClientState client_state = {.last_stat_update = -1.0};
   struct sockaddr_in server;
   int fd = open_udp_client(host, port, &server);
   double current = hires_time_in_seconds(), acc = 0.0;
@@ -1249,6 +985,7 @@ static int client_run(String host, u16 port, String name) {
     return 1;
   }
   client_init(&game);
+  game.client = &client_state;
   renew_client_session(&game);
   game.view.yaw = 180;
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i) {
@@ -1282,21 +1019,7 @@ static int client_run(String host, u16 port, String name) {
     acc += dt;
     client_receive(&game, fd);
     while (acc >= SIM_DT) {
-      if (++game.command_ticks >= COMMAND_INTERVAL) {
-        client_send_input(&game, fd, NET_PACKET_INPUT);
-        game.command_ticks = 0;
-      }
-      if (game.interpolation_ticks < SNAPSHOT_INTERVAL)
-        ++game.interpolation_ticks;
-      if (game.notice_ticks > 0)
-        --game.notice_ticks;
-      if (game.connected && ++game.snapshot_silence_ticks > SIM_HZ * 2) {
-        renew_client_session(&game);
-        notice_set(&game, STR("DROPPED"));
-      }
-      if (game.gun_kick > 0)
-        --game.gun_kick;
-      weapon_predict_system(&game);
+      system_client_tick(&game, fd);
       acc -= SIM_DT;
     }
     client_receive(&game, fd);

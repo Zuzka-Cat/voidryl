@@ -55,9 +55,48 @@ typedef struct {
   u8 yaw;
 } LagAim;
 
+/* UI palette, viewport, model offsets, and HUD layout. */
+#define PAL_DARK ((Color){16, 8, 24, 255})
+#define PAL_PURPLE ((Color){60, 30, 102, 255})
+#define PAL_MID ((Color){155, 123, 208, 255})
+#define PAL_LIGHT ((Color){246, 213, 232, 255})
+
+#define VIEWMODEL_SCALE 1.35f
+#define P99_SIGHT_TIP ((Vector3){-0.32f, 0.098f, 0.48f})
+#define OUTLINE_WIRE_EXPAND 1.04f
+#define MARK_SPLAT_BASE 0.08f
+#define MARK_SPLAT_STEP 0.04f
+#define MARK_SPATTER_BASE 2
+#define MARK_SPATTER_LIFE 12
+#define MARK_SPATTER_LIFE_STEP 4
+#define MARK_DRAW_NUDGE 0.008f
+#define HELP_COL0_X 2
+#define HELP_COL1_X (LOGICAL_W / 2 + 1)
+#define HELP_TITLE_Y 3
+#define HELP_ROWS_Y 11
+#define HELP_ROW_DY 6
+#define HELP_KEY_ADV 24
+#define STAT_NUM_ADV 20
+#define STAT_UPDATE_DT 0.1
+#define HUD_TEXT_HEIGHT 7
+#define HUD_TOP_X 1
+#define HUD_TOP_Y 1
+#define HUD_TEXT_X 2
+#define HUD_TEXT_Y 2
+#define HUD_DIGIT_ADVANCE 4
+#define HUD_AMMO_RIGHT_MARGIN 3
+#define HUD_AMMO_BOTTOM_MARGIN 9
+
 #define LOGICAL_W 92
 #define LOGICAL_H 64
 #define POS_SCALE 64
+#define PLAYER_MAX_PITCH 75
+#define SNAP_MAX_XZ_DELTA 240
+#define SNAP_MAX_RISE_DELTA 48
+#define SNAP_MAX_FALL_DELTA 240
+#define PLAYER_JUMP_VELOCITY 6
+#define PLAYER_GRAVITY_PERIOD_TICKS 6u
+#define PLAYER_GRAVITY_TERMINAL -6
 
 #define MAX_PLAYERS 8
 #define MAX_CUBES 8
@@ -191,6 +230,9 @@ static const ShellDef *shell_def(u8 id) {
 #define BULLET_SPEED 64.0f
 #define ARENA_POS (15 * POS_SCALE)
 
+#define HOLD_PICK_RANGE_M 5.0f
+#define HOLD_PICK_MIN_DOT 0.55f
+#define HOLD_PICK_EPSILON 0.01f
 #define HOLD_BASE_DIST 2.0f
 #define HOLD_PITCH_STEP 0.02f
 #define HOLD_MIN_DIST 1.0f
@@ -400,8 +442,8 @@ typedef struct NetSnapshot {
 #define NET_MAX_DATAGRAM 1472u
 #define NET_ENTITY_BASE_WIRE_SIZE (offsetof(NetEntity, aim_dir))
 #define NET_PLAYER_AIM_WIRE_SIZE (sizeof(AimVectorQ) + sizeof(IVec3))
-#define NET_SNAPSHOT_COMPACT_MAX_SIZE                                         \
-  (NET_SNAPSHOT_HEADER_SIZE + NET_ENTITY_LIMIT * NET_ENTITY_BASE_WIRE_SIZE + \
+#define NET_SNAPSHOT_COMPACT_MAX_SIZE                                          \
+  (NET_SNAPSHOT_HEADER_SIZE + NET_ENTITY_LIMIT * NET_ENTITY_BASE_WIRE_SIZE +   \
    MAX_PLAYERS * NET_PLAYER_AIM_WIRE_SIZE + NET_SNAPSHOT_NAMES_SIZE)
 _Static_assert(NET_SNAPSHOT_COMPACT_MAX_SIZE <= NET_MAX_DATAGRAM,
                "compact snapshots exceed UDP payload limit");
@@ -410,16 +452,10 @@ _Static_assert(NET_ENTITY_BASE_WIRE_SIZE == 20,
 #define NET_INPUT_WIRE_SIZE sizeof(NetInputPacket)
 #define NET_CHAT_WIRE_SIZE sizeof(NetChatPacket)
 
-static i32 net_snapshot_wire_size(u8 count) {
-  if (count > NET_ENTITY_LIMIT)
-    return -1;
-  return (i32)(NET_SNAPSHOT_HEADER_SIZE + (i32)count * (i32)sizeof(NetEntity) +
-               NET_SNAPSHOT_NAMES_SIZE);
-}
-
 #define ECS_MAX_ENTITIES 64u
 #define ECS_MAX_COMPONENTS 10u
 #define ECS_INVALID_ENTITY UINT32_MAX
+#define PLAYER_ENTITY 0u
 
 typedef struct ECS {
   uint64_t mask[ECS_MAX_COMPONENTS];
@@ -463,6 +499,15 @@ static void ecs_remove(ECS *e, uint32_t ent, uint32_t component) {
     e->mask[component] &= ~(UINT64_C(1) << ent);
 }
 
+static void ecs_remove_all(ECS *e, uint32_t ent) {
+  if (!ecs_alive(e, ent)) {
+    return;
+  }
+  for (u32 c = 0; c < ECS_MAX_COMPONENTS; ++c) {
+    ecs_remove(e, ent, c);
+  }
+}
+
 static bool ecs_has(const ECS *e, uint32_t ent, uint32_t component) {
   return ent < ECS_MAX_ENTITIES && component < ECS_MAX_COMPONENTS &&
          (e->mask[component] & (UINT64_C(1) << ent)) != 0;
@@ -471,8 +516,9 @@ static bool ecs_has(const ECS *e, uint32_t ent, uint32_t component) {
 static void ecs_destroy(ECS *e, uint32_t ent) {
   if (!ecs_alive(e, ent))
     return;
-  for (uint32_t c = 0; c < ECS_MAX_COMPONENTS; ++c)
+  for (uint32_t c = 0; c < ECS_MAX_COMPONENTS; ++c) {
     e->mask[c] &= ~(UINT64_C(1) << ent);
+  }
   e->dead |= UINT64_C(1) << ent;
   while (e->count && (e->dead & (UINT64_C(1) << (e->count - 1u)))) {
     e->dead &= ~(UINT64_C(1) << (e->count - 1u));
@@ -482,12 +528,16 @@ static void ecs_destroy(ECS *e, uint32_t ent) {
 
 static EcsQuery ecs_query(const ECS *e, const uint32_t *components,
                           uint32_t n) {
-  EcsQuery q = {e, UINT64_MAX, UINT64_MAX, ECS_INVALID_ENTITY};
+  EcsQuery q = {.ecs = e,
+                .bits = UINT64_MAX,
+                .wanted = UINT64_MAX,
+                .entity = ECS_INVALID_ENTITY};
   if (n > ECS_MAX_COMPONENTS)
     n = ECS_MAX_COMPONENTS;
-  for (uint32_t i = 0; i < n; ++i)
+  for (uint32_t i = 0; i < n; ++i) {
     if (components[i] < ECS_MAX_COMPONENTS)
       q.wanted &= e->mask[components[i]];
+  }
   q.bits = q.wanted;
   if (e->count < ECS_MAX_ENTITIES)
     q.bits &= (UINT64_C(1) << e->count) - 1u;
@@ -526,8 +576,11 @@ typedef struct PingState {
   u8 have;
 } PingState;
 
+typedef struct ClientState ClientState;
+
 typedef struct GameState {
   ECS ecs;
+  ClientState *client; /* Client-only presentation state; never global. */
   IVec3 pos[ECS_MAX_ENTITIES];
   IVec3 vel[ECS_MAX_ENTITIES];
   Aim aim[ECS_MAX_ENTITIES];
@@ -577,10 +630,20 @@ _Static_assert(ECS_MAX_ENTITIES <= 64u,
                "current ecs can only handle 64 entities");
 _Static_assert(MAX_PLAYERS <= 8, "visible_players is an 8-bit mask");
 
+/* Forward declarations for the shared single-translation-unit build. */
+static int open_udp_client(String host, u16 port, struct sockaddr_in *server);
+static int open_udp_server(u16 port);
+static void client_receive(GameState *g, int fd);
+static void client_send_input(GameState *g, int fd, u8 type);
+static void client_send_chat(GameState *g, int fd);
+static void server_receive(GameState *g, int fd);
+static void server_send_all(GameState *g, int fd);
+
 static i32 cstr_len(const char *s) {
   i32 n = 0;
-  while (s[n] != '\0')
+  while (s[n] != '\0') {
     ++n;
+  }
   return n;
 }
 
@@ -734,7 +797,7 @@ static i16 weapon_recoil_pitch(i16 pitch, u8 weapon_id, bool holding) {
   const WeaponDef *def = weapon_def(weapon_id);
   int kick = holding ? (int)def->recoil_pitch_hold_deg
                      : (int)def->recoil_pitch_tap_deg;
-  return (i16)clamp_int((int)pitch + kick, -75, 75);
+  return (i16)clamp_int((int)pitch + kick, -PLAYER_MAX_PITCH, PLAYER_MAX_PITCH);
 }
 
 static f32 weapon_spread_deg(u8 weapon_id, bool aiming) {
@@ -945,252 +1008,6 @@ static bool valid_player_name(String text, String *out) {
   return true;
 }
 
-static bool valid_wire_name(String name) {
-  if (name.length != PLAYER_NAME_LENGTH)
-    return false;
-  for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
-    if (!CHAR_IS_UPPER(name.items[i]))
-      return false;
-  return true;
-}
-
-static bool parse_ipv4(String text, struct in_addr *address) {
-  char tmp[64];
-  String use = text;
-  if (string_eq(text, STR("localhost")))
-    use = STR("127.0.0.1");
-  if (use.length <= 0 || use.length >= (i32)sizeof(tmp))
-    return false;
-  for (i32 i = 0; i < use.length; ++i)
-    tmp[i] = (char)use.items[i];
-  tmp[use.length] = '\0';
-  return inet_pton(AF_INET, tmp, address) == 1;
-}
-
-static void socket_nonblocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0)
-    (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static bool net_packet_ok(const u8 *buf, i32 n, u8 type, i32 size) {
-  return n == size && n >= 2 &&
-         buf[offsetof(NetSnapshot, magic)] == NET_MAGIC &&
-         buf[offsetof(NetSnapshot, type)] == type;
-}
-
-static bool net_seq_fresh(u16 seq, bool got, u16 last) {
-  return !got || sequence_newer(seq, last);
-}
-
-static bool net_validate_chat_fields(String name, u8 length, u16 seq, bool got,
-                                     u16 last) {
-  if (length > CHAT_LENGTH)
-    return false;
-  if (!valid_wire_name(name))
-    return false;
-  if (!net_seq_fresh(seq, got, last))
-    return false;
-  return true;
-}
-
-static bool net_validate_input_fields(u32 session, String name) {
-  if (session == 0)
-    return false;
-  if (!valid_wire_name(name))
-    return false;
-  return true;
-}
-
-static bool net_validate_snapshot_fields(const NetSnapshot *snap,
-                                         u32 expected_session, bool got,
-                                         u16 last_tick) {
-  if (snap->count > NET_ENTITY_LIMIT)
-    return false;
-  if (snap->local_player != NET_PACKET_NONE &&
-      snap->local_player >= MAX_PLAYERS)
-    return false;
-  if (snap->session != expected_session)
-    return false;
-  if (!net_seq_fresh(snap->tick, got, last_tick))
-    return false;
-  return true;
-}
-
-/* Preserve the original fixed-size packet whenever it fits. Larger world
- * states use a compact per-kind wire representation: the first 20 bytes of
- * each NetEntity, followed by 3+6 aim bytes for players only. */
-static i32 net_snapshot_compact_size(const NetSnapshot *snap) {
-  if (!snap || snap->count > NET_ENTITY_LIMIT)
-    return -1;
-  i32 size = (i32)(NET_SNAPSHOT_HEADER_SIZE + NET_SNAPSHOT_NAMES_SIZE);
-  u32 players = 0;
-  for (u32 i = 0; i < snap->count; ++i) {
-    size += (i32)NET_ENTITY_BASE_WIRE_SIZE;
-    if (snap->entities[i].kind == KIND_PLAYER) {
-      if (++players > MAX_PLAYERS)
-        return -1;
-      size += (i32)NET_PLAYER_AIM_WIRE_SIZE;
-    }
-  }
-  return size <= (i32)NET_MAX_DATAGRAM ? size : -1;
-}
-
-static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
-  if (!buf || n < (i32)(NET_SNAPSHOT_HEADER_SIZE + NET_SNAPSHOT_NAMES_SIZE) ||
-      n > (i32)NET_MAX_DATAGRAM ||
-      buf[offsetof(NetSnapshot, magic)] != NET_MAGIC)
-    return false;
-  u8 type = buf[offsetof(NetSnapshot, type)];
-  if (type != NET_PACKET_SNAPSHOT && type != NET_PACKET_SNAPSHOT_COMPACT)
-    return false;
-  u8 count = buf[offsetof(NetSnapshot, count)];
-  if (count > NET_ENTITY_LIMIT)
-    return false;
-  if (type == NET_PACKET_SNAPSHOT)
-    return n == net_snapshot_wire_size(count); /* Legacy 30-byte records. */
-  i32 pos = (i32)NET_SNAPSHOT_HEADER_SIZE;
-  u32 players = 0;
-  for (u32 i = 0; i < count; ++i) {
-    if (pos + (i32)NET_ENTITY_BASE_WIRE_SIZE > n - NET_SNAPSHOT_NAMES_SIZE)
-      return false;
-    u8 kind = buf[pos + offsetof(NetEntity, kind)];
-    pos += (i32)NET_ENTITY_BASE_WIRE_SIZE;
-    if (kind == KIND_PLAYER) {
-      if (++players > MAX_PLAYERS ||
-          pos + (i32)NET_PLAYER_AIM_WIRE_SIZE > n - NET_SNAPSHOT_NAMES_SIZE)
-        return false;
-      pos += (i32)NET_PLAYER_AIM_WIRE_SIZE;
-    }
-  }
-  return pos + NET_SNAPSHOT_NAMES_SIZE == n;
-}
-
-static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
-  if (!snap || !out || snap->count > NET_ENTITY_LIMIT)
-    return -1;
-  i32 want = net_snapshot_wire_size(snap->count);
-  if (want >= 0 && want <= (i32)NET_MAX_DATAGRAM && want <= out_cap) {
-    memcpy(out, snap, NET_SNAPSHOT_HEADER_SIZE);
-    out[offsetof(NetSnapshot, type)] = NET_PACKET_SNAPSHOT;
-    if (snap->count)
-      memcpy(out + NET_SNAPSHOT_HEADER_SIZE, snap->entities,
-             (size_t)snap->count * sizeof(NetEntity));
-    memcpy(out + NET_SNAPSHOT_HEADER_SIZE +
-               (size_t)snap->count * sizeof(NetEntity),
-           snap->names, NET_SNAPSHOT_NAMES_SIZE);
-    return want;
-  }
-  want = net_snapshot_compact_size(snap);
-  if (want < 0 || out_cap < want)
-    return -1;
-  memcpy(out, snap, NET_SNAPSHOT_HEADER_SIZE);
-  out[offsetof(NetSnapshot, type)] = NET_PACKET_SNAPSHOT_COMPACT;
-  size_t pos = NET_SNAPSHOT_HEADER_SIZE;
-  for (u32 i = 0; i < snap->count; ++i) {
-    const NetEntity *e = &snap->entities[i];
-    memcpy(out + pos, e, NET_ENTITY_BASE_WIRE_SIZE);
-    pos += NET_ENTITY_BASE_WIRE_SIZE;
-    if (e->kind == KIND_PLAYER) {
-      memcpy(out + pos, &e->aim_dir, sizeof(e->aim_dir));
-      pos += sizeof(e->aim_dir);
-      memcpy(out + pos, &e->aim_point, sizeof(e->aim_point));
-      pos += sizeof(e->aim_point);
-    }
-  }
-  memcpy(out + pos, snap->names, NET_SNAPSHOT_NAMES_SIZE);
-  return want;
-}
-
-static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
-  if (!out || !net_snapshot_wire_ok(buf, n))
-    return false;
-  u8 count = buf[offsetof(NetSnapshot, count)];
-  *out = (NetSnapshot){0};
-  memcpy(out, buf, NET_SNAPSHOT_HEADER_SIZE);
-  out->type = NET_PACKET_SNAPSHOT; /* Internal representation is format-neutral. */
-  out->count = count;
-  if (buf[offsetof(NetSnapshot, type)] == NET_PACKET_SNAPSHOT) {
-    if (count)
-      memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
-             (size_t)count * sizeof(NetEntity));
-    memcpy(out->names,
-           buf + NET_SNAPSHOT_HEADER_SIZE + (size_t)count * sizeof(NetEntity),
-           NET_SNAPSHOT_NAMES_SIZE);
-    return true;
-  }
-  size_t pos = NET_SNAPSHOT_HEADER_SIZE;
-  for (u32 i = 0; i < count; ++i) {
-    NetEntity *e = &out->entities[i];
-    memcpy(e, buf + pos, NET_ENTITY_BASE_WIRE_SIZE);
-    pos += NET_ENTITY_BASE_WIRE_SIZE;
-    e->aim_dir = (AimVectorQ){0, 0, 127};
-    e->aim_point = (IVec3){0, 0, POS_SCALE};
-    if (e->kind == KIND_PLAYER) {
-      memcpy(&e->aim_dir, buf + pos, sizeof(e->aim_dir));
-      pos += sizeof(e->aim_dir);
-      memcpy(&e->aim_point, buf + pos, sizeof(e->aim_point));
-      pos += sizeof(e->aim_point);
-    }
-  }
-  memcpy(out->names, buf + pos, NET_SNAPSHOT_NAMES_SIZE);
-  return true;
-}
-
-static bool net_input_decode(const u8 *buf, i32 n, NetInputPacket *out) {
-  if (!buf || !out || n != (i32)sizeof(NetInputPacket))
-    return false;
-  if (buf[offsetof(NetInputPacket, magic)] != NET_MAGIC ||
-      (buf[offsetof(NetInputPacket, type)] != NET_PACKET_INPUT &&
-       buf[offsetof(NetInputPacket, type)] != NET_PACKET_DISCONNECT))
-    return false;
-  *out = (NetInputPacket){0};
-  out->magic = buf[offsetof(NetInputPacket, magic)];
-  out->type = buf[offsetof(NetInputPacket, type)];
-  out->claimed_player = buf[offsetof(NetInputPacket, claimed_player)];
-  out->buttons = buf[offsetof(NetInputPacket, buttons)];
-  memcpy(&out->session, buf + offsetof(NetInputPacket, session),
-         sizeof(out->session));
-  memcpy(&out->sequence, buf + offsetof(NetInputPacket, sequence),
-         sizeof(out->sequence));
-  out->move_x = (i8)buf[offsetof(NetInputPacket, move_x)];
-  out->move_z = (i8)buf[offsetof(NetInputPacket, move_z)];
-  out->aim_dir.x = (i8)buf[offsetof(NetInputPacket, aim_dir.x)];
-  out->aim_dir.y = (i8)buf[offsetof(NetInputPacket, aim_dir.y)];
-  out->aim_dir.z = (i8)buf[offsetof(NetInputPacket, aim_dir.z)];
-  memcpy(out->name, buf + offsetof(NetInputPacket, name), PLAYER_NAME_LENGTH);
-  return true;
-}
-
-static bool net_chat_decode(const u8 *buf, i32 n, NetChatPacket *out) {
-  if (!buf || !out)
-    return false;
-  if (!net_packet_ok(buf, n, NET_PACKET_CHAT, (i32)sizeof(NetChatPacket)))
-    return false;
-  *out = (NetChatPacket){0};
-  out->magic = buf[offsetof(NetChatPacket, magic)];
-  out->type = buf[offsetof(NetChatPacket, type)];
-  out->player = buf[offsetof(NetChatPacket, player)];
-  out->length = buf[offsetof(NetChatPacket, length)];
-  if (out->length > CHAT_LENGTH)
-    return false;
-  memcpy(&out->session, buf + offsetof(NetChatPacket, session),
-         sizeof(out->session));
-  memcpy(&out->sequence, buf + offsetof(NetChatPacket, sequence),
-         sizeof(out->sequence));
-  memcpy(out->name, buf + offsetof(NetChatPacket, name), PLAYER_NAME_LENGTH);
-  memcpy(out->text, buf + offsetof(NetChatPacket, text), out->length);
-  return true;
-}
-
-static void net_sanitize_chat_text(String text) {
-  for (i32 i = 0; i < text.length; ++i) {
-    u8 c = text.items[i];
-    if (!CHAR_IS_CHAT(c))
-      text.items[i] = ' ';
-  }
-}
-
 static void notice_set(GameState *g, String s) {
   i32 n = s.length < NOTICE_LENGTH ? s.length : NOTICE_LENGTH;
   if (n > 0)
@@ -1202,12 +1019,14 @@ static void notice_set(GameState *g, String s) {
 static void notice_name_status(GameState *g, String name, String status) {
   u8 tmp[NOTICE_LENGTH];
   i32 pos = 0;
-  for (i32 i = 0; i < name.length && pos < NOTICE_LENGTH; ++i)
+  for (i32 i = 0; i < name.length && pos < NOTICE_LENGTH; ++i) {
     tmp[pos++] = name.items[i];
+  }
   if (pos < NOTICE_LENGTH)
     tmp[pos++] = ' ';
-  for (i32 i = 0; i < status.length && pos < NOTICE_LENGTH; ++i)
+  for (i32 i = 0; i < status.length && pos < NOTICE_LENGTH; ++i) {
     tmp[pos++] = status.items[i];
+  }
   if (pos > 0)
     memcpy(g->notice, tmp, (size_t)pos);
   g->notice_length = (u8)pos;
@@ -1217,14 +1036,16 @@ static void notice_name_status(GameState *g, String name, String status) {
 static void notice_chat_msg(GameState *g, String name, String text) {
   u8 tmp[NOTICE_LENGTH];
   i32 pos = 0;
-  for (i32 i = 0; i < name.length && pos < NOTICE_LENGTH; ++i)
+  for (i32 i = 0; i < name.length && pos < NOTICE_LENGTH; ++i) {
     tmp[pos++] = name.items[i];
+  }
   if (pos < NOTICE_LENGTH)
     tmp[pos++] = ':';
   if (pos < NOTICE_LENGTH)
     tmp[pos++] = ' ';
-  for (i32 i = 0; i < text.length && pos < NOTICE_LENGTH; ++i)
+  for (i32 i = 0; i < text.length && pos < NOTICE_LENGTH; ++i) {
     tmp[pos++] = text.items[i];
+  }
   if (pos > 0)
     memcpy(g->notice, tmp, (size_t)pos);
   g->notice_length = (u8)pos;
@@ -1249,8 +1070,12 @@ static String game_notice(GameState *g) {
 
 static void game_zero(GameState *g) {
   *g = (GameState){.local_player = NET_PACKET_NONE};
-  memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
-  memset(g->player_entity, NET_PACKET_NONE, sizeof(g->player_entity));
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
+    g->network_entity[e] = NET_PACKET_NONE;
+  }
+  for (u32 p = 0; p < MAX_PLAYERS; ++p) {
+    g->player_entity[p] = NET_PACKET_NONE;
+  }
 }
 
 static void clear_entity_data(GameState *g, u32 e) {
@@ -1268,30 +1093,38 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->weapon_id[e] = WEAPON_P99;
 }
 
-// TODO: use switch here
 static void add_kind_components(GameState *g, u32 e, u8 kind) {
   ecs_add(&g->ecs, e, COMP_POSITION);
   ecs_add(&g->ecs, e, COMP_RENDERABLE);
   ecs_add(&g->ecs, e, COMP_NETWORKED);
-  if (kind == KIND_CUBE) {
+  switch (kind) {
+  case KIND_CUBE:
     ecs_add(&g->ecs, e, COMP_SCALE);
     ecs_add(&g->ecs, e, COMP_SOLID);
-  } else if (kind == KIND_PLAYER) {
+    break;
+  case KIND_PLAYER:
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_AIM);
     ecs_add(&g->ecs, e, COMP_PLAYER);
     ecs_add(&g->ecs, e, COMP_SOLID);
-  } else if (kind == KIND_BULLET) {
+    break;
+  case KIND_BULLET:
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_PROJECTILE);
     ecs_add(&g->ecs, e, COMP_LIFETIME);
-  } else if (kind == KIND_CASING) {
+    break;
+  case KIND_CASING:
     ecs_add(&g->ecs, e, COMP_VELOCITY);
     ecs_add(&g->ecs, e, COMP_LIFETIME);
-  } else if (kind == KIND_IMPACT_MARK) {
+    break;
+  case KIND_IMPACT_MARK:
     ecs_add(&g->ecs, e, COMP_LIFETIME);
-  } else if (kind == KIND_FLOOR) {
+    break;
+  case KIND_FLOOR:
     ecs_add(&g->ecs, e, COMP_SOLID);
+    break;
+  default:
+    break;
   }
 }
 
@@ -1299,9 +1132,10 @@ static u32 count_kind(const GameState *g, u8 kind) {
   u32 comps[] = {COMP_RENDERABLE};
   EcsQuery q = ecs_query(&g->ecs, comps, 1);
   u32 n = 0;
-  while (ecs_next(&q))
+  while (ecs_next(&q)) {
     if (g->kind[q.entity] == kind)
       ++n;
+  }
   return n;
 }
 
@@ -1358,19 +1192,26 @@ static u32 create_floor(GameState *g) {
 
 static void game_init(GameState *g) {
   game_zero(g);
-  for (u32 i = 0; i < MAX_CUBES; ++i)
+  for (u32 i = 0; i < MAX_CUBES; ++i) {
     (void)create_cube(g, i);
+  }
   (void)create_floor(g);
 }
 
 static void client_clear_world(GameState *g) {
   u32 comps[] = {COMP_POSITION};
   EcsQuery q = ecs_query(&g->ecs, comps, 1);
-  while (ecs_next(&q))
+  while (ecs_next(&q)) {
     ecs_destroy(&g->ecs, q.entity);
-  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
+  }
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
     g->scale[e] = 1.0f;
-  memset(g->network_entity, NET_PACKET_NONE, sizeof(g->network_entity));
+    g->network_entity[e] = NET_PACKET_NONE;
+  }
+  /* The local player always occupies slot 0, even before the first snapshot. */
+  if (!ecs_alive(&g->ecs, PLAYER_ENTITY)) {
+    (void)ecs_create(&g->ecs);
+  }
   g->snapshot_seen = 0;
 }
 
@@ -1378,9 +1219,21 @@ static void client_init(GameState *g) {
   game_zero(g);
   client_clear_world(g);
 }
-
-// TODO: use c generics / macros for these
 static Vector3 vec3(f32 x, f32 y, f32 z) { return (Vector3){x, y, z}; }
+
+static Vector2 vec2_add(Vector2 a, Vector2 b) {
+  return (Vector2){a.x + b.x, a.y + b.y};
+}
+static Vector2 vec2_sub(Vector2 a, Vector2 b) {
+  return (Vector2){a.x - b.x, a.y - b.y};
+}
+static Vector2 vec2_mul(Vector2 a, f32 s) {
+  return (Vector2){a.x * s, a.y * s};
+}
+
+#define vec_add(a, b) _Generic((a), Vector2: vec2_add, Vector3: vec3_add)(a, b)
+#define vec_sub(a, b) _Generic((a), Vector2: vec2_sub, Vector3: vec3_sub)(a, b)
+#define vec_mul(a, s) _Generic((a), Vector2: vec2_mul, Vector3: vec3_mul)(a, s)
 
 static Vector3 vec3_add(Vector3 a, Vector3 b) {
   return vec3(a.x + b.x, a.y + b.y, a.z + b.z);
@@ -1418,8 +1271,7 @@ static AimVectorQ aim_vector_encode(Vector3 d) {
 }
 
 static Vector3 aim_vector_decode(AimVectorQ q) {
-  Vector3 d = vec3((f32)q.x / 127.0f, (f32)q.y / 127.0f,
-                   (f32)q.z / 127.0f);
+  Vector3 d = vec3((f32)q.x / 127.0f, (f32)q.y / 127.0f, (f32)q.z / 127.0f);
   f32 l = vec3_len(d);
   return l < 0.001f ? vec3(0.0f, 0.0f, 1.0f) : vec3_mul(d, 1.0f / l);
 }
@@ -1427,9 +1279,9 @@ static Vector3 aim_vector_decode(AimVectorQ q) {
 static Aim aim_from_dir(Vector3 d) {
   d = vec3_norm(d);
   return (Aim){wrap_degrees((int)lroundf(atan2f(d.x, d.z) * RAD2DEG)),
-               (i16)clamp_int((int)lroundf(asinf(clamp_float(d.y, -1.0f, 1.0f)) *
-                                             RAD2DEG),
-                              -75, 75)};
+               (i16)clamp_int(
+                   (int)lroundf(asinf(clamp_float(d.y, -1.0f, 1.0f)) * RAD2DEG),
+                   -PLAYER_MAX_PITCH, PLAYER_MAX_PITCH)};
 }
 
 static void aim_basis_from_dir(Vector3 dir, Vector3 *fwd, Vector3 *right,
@@ -1457,7 +1309,7 @@ static Vector3 interp_center_fp(const GameState *g, u32 e, f32 a) {
 }
 
 static Vector3 entity_pos_m(const GameState *g, u32 e, f32 a) {
-  return vec3_mul(interp_center_fp(g, e, a), 1.0f / (f32)POS_SCALE);
+  return vec_mul(interp_center_fp(g, e, a), 1.0f / (f32)POS_SCALE);
 }
 
 static bool cube_overlap(const GameState *g, i16 x, i16 z, i16 radius) {
@@ -1487,7 +1339,7 @@ static Vector3 sight_dir(f32 yaw_deg, f32 pitch_deg) {
  * replicated vector and its derived angle must obey the player pitch limit. */
 static AimVectorQ aim_vector_pitch_limited(AimVectorQ wire) {
   Vector3 dir = aim_vector_decode(wire);
-  if (fabsf(dir.y) > sinf(75.0f * DEG2RAD)) {
+  if (fabsf(dir.y) > sinf((f32)PLAYER_MAX_PITCH * DEG2RAD)) {
     Aim clamped = aim_from_dir(dir);
     dir = sight_dir((f32)clamped.yaw, (f32)clamped.pitch);
   }
@@ -1548,18 +1400,22 @@ static const u8 SOLID_MAT[] = {
 static void solid_bounds_fp(const GameState *g, u32 e, f32 a, Vector3 *bmin,
                             Vector3 *bmax) {
   Vector3 c = interp_center_fp(g, e, a);
-  if (g->kind[e] == KIND_FLOOR) {
+  switch (g->kind[e]) {
+  case KIND_FLOOR: {
     float r = (float)(ARENA * POS_SCALE);
     *bmin = vec3(-r, -r, -r);
     *bmax = vec3(r, 0.0f, r);
     return;
   }
-  if (g->kind[e] == KIND_PLAYER) {
+  case KIND_PLAYER: {
     float r = PLAYER_HIT_RADIUS_M * (float)POS_SCALE;
     float h = PLAYER_HIT_HEIGHT_M * (float)POS_SCALE;
     *bmin = vec3(c.x - r, c.y, c.z - r);
     *bmax = vec3(c.x + r, c.y + h, c.z + r);
     return;
+  }
+  default:
+    break;
   }
   f32 s = scale_value(g, e);
   f32 hx = 0.5f * CUBE_VIS_X * s * (f32)POS_SCALE;
@@ -1569,87 +1425,49 @@ static void solid_bounds_fp(const GameState *g, u32 e, f32 a, Vector3 *bmin,
   *bmax = vec3(c.x + hx, c.y + hy, c.z + hz);
 }
 
+#define RAY_PARALLEL_EPSILON 1e-9f
+
+static bool seg_box_axis(f32 start, f32 delta, f32 lo, f32 hi,
+                         Vector3 negative_normal, Vector3 positive_normal,
+                         f32 *tmin, f32 *tmax, Vector3 *normal) {
+  if (fabsf(delta) < RAY_PARALLEL_EPSILON) {
+    return start >= lo && start <= hi;
+  }
+  f32 t1 = (lo - start) / delta;
+  f32 t2 = (hi - start) / delta;
+  if (t1 > t2) {
+    f32 tmp = t1;
+    t1 = t2;
+    t2 = tmp;
+    Vector3 swap = negative_normal;
+    negative_normal = positive_normal;
+    positive_normal = swap;
+  }
+  if (t1 > *tmin) {
+    *tmin = t1;
+    *normal = negative_normal;
+  }
+  if (t2 < *tmax) {
+    *tmax = t2;
+  }
+  return *tmin <= *tmax;
+}
+
 static bool seg_box_hit(Vector3 p0, Vector3 d, Vector3 bmin, Vector3 bmax,
                         float *t_out, Vector3 *n_out) {
-  float tmin = 0.0f, tmax = 1.0f;
+  f32 tmin = 0.0f, tmax = 1.0f;
   Vector3 n = {0.0f, 0.0f, 0.0f};
-  if (fabsf(d.x) < 1e-9f) {
-    if (p0.x < bmin.x || p0.x > bmax.x)
-      return false;
-  } else {
-    float inv = 1.0f / d.x;
-    float t1 = (bmin.x - p0.x) * inv;
-    float t2 = (bmax.x - p0.x) * inv;
-    Vector3 f1 = {-1.0f, 0.0f, 0.0f}, f2 = {1.0f, 0.0f, 0.0f};
-    if (t1 > t2) {
-      float tt = t1;
-      t1 = t2;
-      t2 = tt;
-      Vector3 tf = f1;
-      f1 = f2;
-      f2 = tf;
-    }
-    if (t1 > tmin) {
-      tmin = t1;
-      n = f1;
-    }
-    if (t2 < tmax)
-      tmax = t2;
-    if (tmin > tmax)
-      return false;
+  if (!seg_box_axis(p0.x, d.x, bmin.x, bmax.x, vec3(-1.0f, 0.0f, 0.0f),
+                    vec3(1.0f, 0.0f, 0.0f), &tmin, &tmax, &n) ||
+      !seg_box_axis(p0.y, d.y, bmin.y, bmax.y, vec3(0.0f, -1.0f, 0.0f),
+                    vec3(0.0f, 1.0f, 0.0f), &tmin, &tmax, &n) ||
+      !seg_box_axis(p0.z, d.z, bmin.z, bmax.z, vec3(0.0f, 0.0f, -1.0f),
+                    vec3(0.0f, 0.0f, 1.0f), &tmin, &tmax, &n)) {
+    return false;
   }
-  if (fabsf(d.y) < 1e-9f) {
-    if (p0.y < bmin.y || p0.y > bmax.y)
-      return false;
-  } else {
-    float inv = 1.0f / d.y;
-    float t1 = (bmin.y - p0.y) * inv;
-    float t2 = (bmax.y - p0.y) * inv;
-    Vector3 f1 = {0.0f, -1.0f, 0.0f}, f2 = {0.0f, 1.0f, 0.0f};
-    if (t1 > t2) {
-      float tt = t1;
-      t1 = t2;
-      t2 = tt;
-      Vector3 tf = f1;
-      f1 = f2;
-      f2 = tf;
-    }
-    if (t1 > tmin) {
-      tmin = t1;
-      n = f1;
-    }
-    if (t2 < tmax)
-      tmax = t2;
-    if (tmin > tmax)
-      return false;
-  }
-  if (fabsf(d.z) < 1e-9f) {
-    if (p0.z < bmin.z || p0.z > bmax.z)
-      return false;
-  } else {
-    float inv = 1.0f / d.z;
-    float t1 = (bmin.z - p0.z) * inv;
-    float t2 = (bmax.z - p0.z) * inv;
-    Vector3 f1 = {0.0f, 0.0f, -1.0f}, f2 = {0.0f, 0.0f, 1.0f};
-    if (t1 > t2) {
-      float tt = t1;
-      t1 = t2;
-      t2 = tt;
-      Vector3 tf = f1;
-      f1 = f2;
-      f2 = tf;
-    }
-    if (t1 > tmin) {
-      tmin = t1;
-      n = f1;
-    }
-    if (t2 < tmax)
-      tmax = t2;
-    if (tmin > tmax)
-      return false;
-  }
-  if (n.x == 0.0f && n.y == 0.0f && n.z == 0.0f)
+  if (n.x == 0.0f && n.y == 0.0f && n.z == 0.0f) {
     n = mark_normal_vec(mark_code_for_vec(vec3(-d.x, -d.y, -d.z)));
+  }
   *t_out = tmin;
   *n_out = n;
   return true;

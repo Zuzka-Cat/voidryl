@@ -1,14 +1,11 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
+CFLAGS ?= -std=c11 -O2 -Wall -Wextra
 RAYLIB_CFLAGS := $(shell pkg-config --cflags raylib)
 RAYLIB_LIBS := $(shell pkg-config --libs raylib)
 
-all: tinyfps
+all: voidryl
 
-tinyfps: main.c shared.c server.c client.c
-	$(CC) $(CFLAGS) $(RAYLIB_CFLAGS) -o $@ main.c $(RAYLIB_LIBS) -lm
+voidryl: main.c client.c server.c shared.c networking.c models.c
+	$(CC) $(CFLAGS) $(RAYLIB_CFLAGS) main.c -o $@ $(RAYLIB_LIBS) -lm
 
-clean:
-	rm -f tinyfps
-
-.PHONY: all clean
+.PHONY: all

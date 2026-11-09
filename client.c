@@ -1,8 +1,8 @@
 #ifndef CLIENT_C
 #define CLIENT_C
 
-#include "shared.c"
 #include "rlgl.h"
+#include "shared.c"
 
 #define PAL_DARK ((Color){16, 8, 24, 255})
 #define PAL_PURPLE ((Color){60, 30, 102, 255})
@@ -295,8 +295,8 @@ static void client_send_input(GameState *g, int fd, u8 type) {
     packet.sequence = g->next_sequence++;
     packet.move_x = g->input[0].move_x;
     packet.move_z = g->input[0].move_z;
-    packet.aim_dir = aim_vector_encode(
-        sight_dir((f32)g->view.yaw, (f32)g->view.pitch));
+    packet.aim_dir =
+        aim_vector_encode(sight_dir((f32)g->view.yaw, (f32)g->view.pitch));
     u32 slot = (u32)packet.sequence & PING_WINDOW_MASK;
     g->ping.send_time[slot] = hires_time_in_seconds();
     g->ping.send_seq[slot] = packet.sequence;
@@ -584,15 +584,15 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
   Vector3 point_prev = vec3_mul((Vector3){(f32)remote_aim_point_prev[e].x,
-                                           (f32)remote_aim_point_prev[e].y,
-                                           (f32)remote_aim_point_prev[e].z},
+                                          (f32)remote_aim_point_prev[e].y,
+                                          (f32)remote_aim_point_prev[e].z},
                                 1.0f / (f32)POS_SCALE);
-  Vector3 point_curr = vec3_mul((Vector3){(f32)g->aim_point[e].x,
-                                           (f32)g->aim_point[e].y,
-                                           (f32)g->aim_point[e].z},
-                                1.0f / (f32)POS_SCALE);
-  Vector3 target = vec3_add(vec3_mul(point_prev, 1.0f - a),
-                            vec3_mul(point_curr, a));
+  Vector3 point_curr =
+      vec3_mul((Vector3){(f32)g->aim_point[e].x, (f32)g->aim_point[e].y,
+                         (f32)g->aim_point[e].z},
+               1.0f / (f32)POS_SCALE);
+  Vector3 target =
+      vec3_add(vec3_mul(point_prev, 1.0f - a), vec3_mul(point_curr, a));
   f32 body_yaw =
       present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
   f32 reload_t =
@@ -626,9 +626,8 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   /* Aim the actual barrel axis from the displaced model origin. The muzzle
    * is on this axis at GUN_MUZZLE_Z_M, so it converges on the sight target. */
   Vector3 to_target = vec3_sub(target, origin);
-  Vector3 final_dir = vec3_len(to_target) > GUN_MUZZLE_Z_M
-                          ? vec3_norm(to_target)
-                          : gp.fwd;
+  Vector3 final_dir =
+      vec3_len(to_target) > GUN_MUZZLE_Z_M ? vec3_norm(to_target) : gp.fwd;
   aim_basis_from_dir(final_dir, &gp.fwd, &gp.right, &gp.up);
   gp.yaw = atan2f(gp.fwd.x, gp.fwd.z) * RAD2DEG;
   gp.pitch = asinf(clamp_float(gp.fwd.y, -1.0f, 1.0f)) * RAD2DEG;
@@ -720,14 +719,12 @@ static void reflect_basis(Vector3 r, Vector3 *u, Vector3 *v) {
 
 static Color color_lerp(Color a, Color b, f32 t) {
   t = clamp_float(t, 0.0f, 1.0f);
-  return (Color){(u8)clamp_int((int)lroundf((f32)a.r + ((f32)b.r - (f32)a.r) * t),
-                               0, 255),
-                 (u8)clamp_int((int)lroundf((f32)a.g + ((f32)b.g - (f32)a.g) * t),
-                               0, 255),
-                 (u8)clamp_int((int)lroundf((f32)a.b + ((f32)b.b - (f32)a.b) * t),
-                               0, 255),
-                 (u8)clamp_int((int)lroundf((f32)a.a + ((f32)b.a - (f32)a.a) * t),
-                               0, 255)};
+  return (Color){
+      (u8)clamp_int((int)lroundf((f32)a.r + ((f32)b.r - (f32)a.r) * t), 0, 255),
+      (u8)clamp_int((int)lroundf((f32)a.g + ((f32)b.g - (f32)a.g) * t), 0, 255),
+      (u8)clamp_int((int)lroundf((f32)a.b + ((f32)b.b - (f32)a.b) * t), 0, 255),
+      (u8)clamp_int((int)lroundf((f32)a.a + ((f32)b.a - (f32)a.a) * t), 0,
+                    255)};
 }
 
 static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
@@ -749,8 +746,8 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
   f32 fade_t = 1.0f - life;
   fade_t = fade_t * fade_t * (3.0f - 2.0f * fade_t);
   Color hole = color_lerp(PAL_DARK, mat, fade_t);
-  f32 size = (MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str) *
-             (1.0f - 0.28f * fade_t);
+  f32 size =
+      (MARK_SPLAT_BASE + MARK_SPLAT_STEP * (f32)str) * (1.0f - 0.28f * fade_t);
   draw_mark_quad(c, ru, rv, size, hole);
   if (fade_t < 0.55f) {
     Color core = color_lerp(PAL_DARK, hole, 0.35f);

@@ -98,10 +98,9 @@ static void aim_point_system(GameState *g) {
     Vector3 p0 = vec3_mul(eye, (f32)POS_SCALE);
     Vector3 ray = vec3_mul(dir, SIGHT_MAX_DIST_M * (f32)POS_SCALE);
     TraceHit hit = trace_solids(g, p0, ray, e, g->owner[e], 1.0f);
-    Vector3 point = hit.hit ? vec3_add(p0, vec3_mul(ray, hit.t))
-                            : vec3_add(p0, ray);
-    g->aim_point[e] = (IVec3){(i16)lroundf(point.x),
-                              (i16)lroundf(point.y),
+    Vector3 point =
+        hit.hit ? vec3_add(p0, vec3_mul(ray, hit.t)) : vec3_add(p0, ray);
+    g->aim_point[e] = (IVec3){(i16)lroundf(point.x), (i16)lroundf(point.y),
                               (i16)lroundf(point.z)};
   }
 }
@@ -291,8 +290,8 @@ static void weapon_system(GameState *g) {
         weapon_on_fired(g, e, holding);
         i16 new_pitch = weapon_recoil_pitch(g->aim[e].pitch, wid, holding);
         g->aim[e].pitch = new_pitch;
-        g->input[p].aim_dir = aim_vector_encode(
-            sight_dir((f32)g->aim[e].yaw, (f32)new_pitch));
+        g->input[p].aim_dir =
+            aim_vector_encode(sight_dir((f32)g->aim[e].yaw, (f32)new_pitch));
         g->aim_dir[e] = g->input[p].aim_dir;
         if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
           g->flash[e] = PLAYER_FIRE_FLASH_TICKS;
@@ -426,8 +425,8 @@ static void lifetime_system(GameState *g) {
     if (age && g->lifetime[e] > 0)
       --g->lifetime[e];
     if (g->kind[e] == KIND_IMPACT_MARK) {
-      g->flash[e] = encode_unorm8((f32)g->lifetime[e] /
-                                 (f32)IMPACT_MARK_LIFETIME_TICKS);
+      g->flash[e] =
+          encode_unorm8((f32)g->lifetime[e] / (f32)IMPACT_MARK_LIFETIME_TICKS);
       if (g->flash[e] == 0 && g->lifetime[e] > 0)
         g->flash[e] = 1;
     }
@@ -478,27 +477,26 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
       if (g->owner[e] < MAX_PLAYERS)
         scale = pack_player_locomotion(&g->input[g->owner[e]]);
     }
-    snap->entities[snap->count++] = (NetEntity){.entity = (u8)e,
-                                                .kind = g->kind[e],
-                                                .owner = g->owner[e],
-                                                .flags = g->flash[e],
-                                                .extra = g->held_by[e],
-                                                .weapon = weapon,
-                                                .ammo = ammo,
-                                                .reloading = reloading,
-                                                .reload_q = reload_q,
-                                                .scale = scale,
-                                                .x = g->pos[e].x,
-                                                .y = g->pos[e].y,
-                                                .z = g->pos[e].z,
-                                                .yaw = g->aim[e].yaw,
-                                                .pitch = g->aim[e].pitch,
-                                                .aim_dir = g->kind[e] == KIND_PLAYER
-                                                               ? g->aim_dir[e]
-                                                               : (AimVectorQ){0, 0, 127},
-                                                .aim_point = g->kind[e] == KIND_PLAYER
-                                                                 ? g->aim_point[e]
-                                                                 : (IVec3){0, 0, POS_SCALE}};
+    snap->entities[snap->count++] = (NetEntity){
+        .entity = (u8)e,
+        .kind = g->kind[e],
+        .owner = g->owner[e],
+        .flags = g->flash[e],
+        .extra = g->held_by[e],
+        .weapon = weapon,
+        .ammo = ammo,
+        .reloading = reloading,
+        .reload_q = reload_q,
+        .scale = scale,
+        .x = g->pos[e].x,
+        .y = g->pos[e].y,
+        .z = g->pos[e].z,
+        .yaw = g->aim[e].yaw,
+        .pitch = g->aim[e].pitch,
+        .aim_dir =
+            g->kind[e] == KIND_PLAYER ? g->aim_dir[e] : (AimVectorQ){0, 0, 127},
+        .aim_point = g->kind[e] == KIND_PLAYER ? g->aim_point[e]
+                                               : (IVec3){0, 0, POS_SCALE}};
   }
 }
 

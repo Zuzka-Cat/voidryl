@@ -739,7 +739,8 @@ static void server_receive(GameState *g, int fd) {
   }
 }
 
-static void expire_peers_system(GameState *g) {
+// TODO: put system_ in the front for all systems.
+static void drop_afk_player_system(GameState *g) {
   for (int i = 0; i < MAX_PLAYERS; ++i)
     if (g->peers[i].active &&
         tick_age(g->tick, g->peers[i].last_seen) > SIM_HZ * 10)
@@ -788,7 +789,7 @@ static void server_run(u16 port) {
     server_receive(&game, fd);
     while (acc >= SIM_DT) {
       server_tick(&game);
-      expire_peers_system(&game);
+      drop_afk_player_system(&game);
       if (game.tick % SNAPSHOT_INTERVAL == 0)
         server_send_all(&game, fd);
       acc -= SIM_DT;

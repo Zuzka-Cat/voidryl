@@ -4,6 +4,7 @@
 #include "rlgl.h"
 #include "shared.c"
 
+// TODO: this needs to be like in a shared place with all UI constant and offsets and that sort of thing.
 #define PAL_DARK ((Color){16, 8, 24, 255})
 #define PAL_PURPLE ((Color){60, 30, 102, 255})
 #define PAL_MID ((Color){155, 123, 208, 255})
@@ -27,8 +28,11 @@
 #define STAT_NUM_ADV 20
 #define STAT_UPDATE_DT 0.1
 
+// TODO: ensure the player is always on same entity slot. this function should not exist. then add a define like PLAYER_ENTITY
 static u32 local_player_entity(const GameState *g);
 
+// TODO: remote gun should ont be sepeated like this. why is this outside of ecs / main ecs Game state???
+// im pretty sure this isn't even necessary at all to have.
 typedef struct RemoteGun {
   f32 walk_phase, walk_blend, aim_blend, sprint_blend;
   Vector2 move_sway, move_vel;
@@ -39,6 +43,7 @@ static RemoteGun remote_gun[ECS_MAX_ENTITIES];
 static IVec3 remote_aim_point_prev[ECS_MAX_ENTITIES];
 static u8 remote_reload_q[ECS_MAX_ENTITIES];
 
+// TODO: why is this function so stupid short???
 static void remote_gun_reset(u32 e) {
   if (e < ECS_MAX_ENTITIES)
     remote_gun[e] = (RemoteGun){0};
@@ -63,6 +68,7 @@ static int open_udp_client(String host, u16 port, struct sockaddr_in *server) {
 }
 
 static void renew_client_session(GameState *g) {
+// TODO: do not init struct like this., use c initialiters. this is for all places
   g->session = make_session_id(g->session);
   g->connected = 0;
   g->local_player = NET_PACKET_NONE;
@@ -72,9 +78,12 @@ static void renew_client_session(GameState *g) {
   g->last_snapshot_tick = g->last_chat_sequence = 0;
   g->last_snapshot_ack = 0;
   g->snapshot_silence_ticks = 0;
+// TODO: use ecs functions for this. bad.
   for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
     g->weapon_dirty_seq[e] = 0;
   client_clear_world(g);
+  // TODO: why is this some weird global. bad. if you need this. we should not have all things directly in global. need to have g->client-> maybe or something.
+  // more order
   g->gun_kick = 0;
   g->gun_recoil = g->gun_recoil_velocity = 0.0f;
   g->gun_rise = g->gun_rise_velocity = 0.0f;
@@ -86,6 +95,7 @@ static void renew_client_session(GameState *g) {
   g->move_sway = (Vector2){0, 0};
   g->move_vel = (Vector2){0, 0};
   g->sprint_blend = 0.0f;
+// TODO: no memset
   memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
   g->ping.rtt_ms = 0.0;
   g->ping.have = 0;
@@ -141,6 +151,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
       }
     }
   }
+  // TODO: DO not use for loops without braces. this is true for everythwernere.
   for (u32 p = 0; p < MAX_PLAYERS; ++p)
     for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
       g->player_name[p][i] = snap->names[p][i];
@@ -221,6 +232,8 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
   }
 }
 
+// TODO: put this in networking.c any networking / encoding decoding. inside networking. have different section for sending recieve, and encode decode.
+// have smaller functions than these huge conglomerates
 static void client_receive(GameState *g, int fd) {
   u8 buf[NET_MAX_DATAGRAM];
   for (;;) {
@@ -305,6 +318,7 @@ static void client_send_input(GameState *g, int fd, u8 type) {
   (void)send(fd, &packet, sizeof(packet), 0);
 }
 
+// TODO: again, no sepearation. this kind of code, in all places, should be more generalized and neat.
 static void client_send_chat(GameState *g, int fd) {
   if (g->chat_length > CHAT_LENGTH)
     return;
@@ -415,6 +429,7 @@ static u32 local_player_entity(const GameState *g) {
 
 static Camera3D make_camera(const GameState *g, f32 a) {
   u32 e = local_player_entity(g);
+// TODO: again this can be initialized cleaner
   Vector3 dir = {0.0f, 0.0f, 1.0f};
   u8 wid = e != ECS_INVALID_ENTITY ? g->weapon_id[e] : WEAPON_P99;
   f32 hip_fov = weapon_hip_fov(wid);
@@ -499,6 +514,7 @@ static void draw_box_wires(Vector3 p, Vector3 s, Color wire) {
                  wire);
 }
 
+// TODO: put these in their own file, models.c
 static void draw_gun_p99(f32 recoil, f32 slide, f32 scale, bool firing,
                          f32 reload_t) {
   rlPushMatrix();
@@ -841,6 +857,7 @@ static void draw_small_text(int x, int y, String text, Color color) {
 static void draw_number(int x, int y, unsigned value, Color color) {
   u8 digits[8];
   int n = 0;
+// TODO: what is this shitty code.
   do {
     digits[n++] = (u8)('0' + value % 10u);
     value /= 10u;
@@ -852,6 +869,7 @@ static void draw_number(int x, int y, unsigned value, Color color) {
   }
 }
 
+// TODO: what is this shitty code.
 static int ammo_field_width(unsigned mag) {
   int d = 1;
   unsigned m = mag;
@@ -862,6 +880,7 @@ static int ammo_field_width(unsigned mag) {
   return d < 2 ? 2 : d;
 }
 
+// TODO: what is this shitty code.
 static void draw_number_padded(int x, int y, unsigned value, int width,
                                Color color) {
   u8 buf[8];
@@ -950,6 +969,8 @@ static void draw_help_entry(int x, int y, const char *key, const char *action) {
   draw_small_text(x + HELP_KEY_ADV, y, as, PAL_LIGHT);
 }
 
+// TODO: what is this shitty code. DO not use random / magic numbers
+// that is something for every function
 static void draw_hud(GameState *g) {
   u32 e = local_player_entity(g);
   if (!g->chatting && g->notice_ticks && g->notice_length) {
@@ -1217,6 +1238,7 @@ static void weapon_predict_system(GameState *g) {
     g->weapon_dirty_seq[e] = g->next_sequence;
 }
 
+// TODO:  this could be more smaller functions, hard to see whats going on
 static int client_run(String host, u16 port, String name) {
   GameState game;
   struct sockaddr_in server;

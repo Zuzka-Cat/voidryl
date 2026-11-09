@@ -1268,6 +1268,7 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->weapon_id[e] = WEAPON_P99;
 }
 
+// TODO: use switch here
 static void add_kind_components(GameState *g, u32 e, u8 kind) {
   ecs_add(&g->ecs, e, COMP_POSITION);
   ecs_add(&g->ecs, e, COMP_RENDERABLE);
@@ -1378,6 +1379,7 @@ static void client_init(GameState *g) {
   client_clear_world(g);
 }
 
+// TODO: use c generics / macros for these
 static Vector3 vec3(f32 x, f32 y, f32 z) { return (Vector3){x, y, z}; }
 
 static Vector3 vec3_add(Vector3 a, Vector3 b) {

@@ -31,11 +31,13 @@ static u32 local_player_entity(const GameState *g);
 
 typedef struct RemoteGun {
   f32 walk_phase, walk_blend, aim_blend, sprint_blend;
-  Vector2 move_sway, move_vel, gun_sway;
+  Vector2 move_sway, move_vel;
   u8 loco;
 } RemoteGun;
 
 static RemoteGun remote_gun[ECS_MAX_ENTITIES];
+static IVec3 remote_aim_point_prev[ECS_MAX_ENTITIES];
+static u8 remote_reload_q[ECS_MAX_ENTITIES];
 
 static void remote_gun_reset(u32 e) {
   if (e < ECS_MAX_ENTITIES)
@@ -87,8 +89,10 @@ static void renew_client_session(GameState *g) {
   memset(g->ping.slot_valid, 0, sizeof(g->ping.slot_valid));
   g->ping.rtt_ms = 0.0;
   g->ping.have = 0;
-  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e)
+  for (u32 e = 0; e < ECS_MAX_ENTITIES; ++e) {
     remote_gun_reset(e);
+    remote_aim_point_prev[e] = (IVec3){0, 0, POS_SCALE};
+  }
 }
 
 static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
@@ -108,6 +112,7 @@ static u32 client_entity_for(GameState *g, u8 server_entity, u8 kind) {
     ecs_remove(&g->ecs, e, c);
   clear_entity_data(g, e);
   remote_gun_reset(e);
+  remote_reload_q[e] = 0;
   return e;
 }
 
@@ -168,16 +173,21 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
     g->vel[e].x = snap_pos ? 0 : dx;
     g->vel[e].y = snap_pos ? 0 : dy;
     g->vel[e].z = snap_pos ? 0 : dz;
-    if (had && w->kind == KIND_PLAYER) {
-      g->lag[e].yaw = lag_encode(wrap_degrees(w->yaw - g->aim[e].yaw));
-      g->lag[e].pitch = lag_encode((int)w->pitch - (int)g->aim[e].pitch);
-    } else if (w->kind == KIND_PLAYER) {
-      g->lag[e] = (LagAim){LAG_NEUTRAL, LAG_NEUTRAL};
+    if (w->kind == KIND_PLAYER) {
+      if (had)
+        g->lag[e].yaw = lag_encode(wrap_degrees(w->yaw - g->aim[e].yaw));
+      else
+        g->lag[e].yaw = LAG_NEUTRAL;
+      remote_aim_point_prev[e] = had ? g->aim_point[e] : w->aim_point;
     }
     g->kind[e] = w->kind;
     g->owner[e] = w->owner;
     g->pos[e] = (IVec3){nx, ny, nz};
     g->aim[e] = (Aim){w->yaw, w->pitch};
+    if (w->kind == KIND_PLAYER) {
+      g->aim_dir[e] = w->aim_dir;
+      g->aim_point[e] = w->aim_point;
+    }
     g->flash[e] = w->flags;
     g->held_by[e] = w->extra;
     if (w->kind == KIND_CUBE)
@@ -194,7 +204,7 @@ static void apply_snapshot(GameState *g, const NetSnapshot *snap) {
         weapon_apply_snapshot(g, e, w->weapon, w->ammo, w->reloading != 0,
                               w->reload_q, snap->acknowledged_sequence);
       }
-      g->r_reload[e] = w->reload_q;
+      remote_reload_q[e] = w->reload_q;
       remote_gun[e].loco = w->scale;
     }
     add_kind_components(g, e, w->kind);
@@ -285,8 +295,8 @@ static void client_send_input(GameState *g, int fd, u8 type) {
     packet.sequence = g->next_sequence++;
     packet.move_x = g->input[0].move_x;
     packet.move_z = g->input[0].move_z;
-    packet.aim_yaw = g->view.yaw;
-    packet.aim_pitch = g->view.pitch;
+    packet.aim_dir = aim_vector_encode(
+        sight_dir((f32)g->view.yaw, (f32)g->view.pitch));
     u32 slot = (u32)packet.sequence & PING_WINDOW_MASK;
     g->ping.send_time[slot] = hires_time_in_seconds();
     g->ping.send_seq[slot] = packet.sequence;
@@ -560,26 +570,44 @@ static void draw_cube_lit(Vector3 p, Vector3 s, Color fill) {
   draw_box_wires(p, s, PAL_DARK);
 }
 
+static GunPose gun_pose_toward_target(Vector3 feet, Vector3 target) {
+  Vector3 eye = player_eye_m(feet);
+  Vector3 dir = vec3_sub(target, eye);
+  if (vec3_len(dir) < 0.001f)
+    dir = vec3(0.0f, 0.0f, 1.0f);
+  Aim initial = aim_from_dir(dir);
+  return gun_pose_at(feet, (f32)initial.yaw, (f32)initial.pitch, 0.0f);
+}
+
 static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   bool hurt = g->flash[e] > PLAYER_FIRE_FLASH_TICKS;
   bool firing = g->flash[e] > 0 && g->flash[e] <= PLAYER_FIRE_FLASH_TICKS;
   f32 fire = firing ? (f32)g->flash[e] / (f32)PLAYER_FIRE_FLASH_TICKS : 0.0f;
-  f32 yaw_r = present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
-  f32 pitch_r =
-      present_lerp_angle(g->aim[e].pitch, lag_decode(g->lag[e].pitch), a);
+  Vector3 point_prev = vec3_mul((Vector3){(f32)remote_aim_point_prev[e].x,
+                                           (f32)remote_aim_point_prev[e].y,
+                                           (f32)remote_aim_point_prev[e].z},
+                                1.0f / (f32)POS_SCALE);
+  Vector3 point_curr = vec3_mul((Vector3){(f32)g->aim_point[e].x,
+                                           (f32)g->aim_point[e].y,
+                                           (f32)g->aim_point[e].z},
+                                1.0f / (f32)POS_SCALE);
+  Vector3 target = vec3_add(vec3_mul(point_prev, 1.0f - a),
+                            vec3_mul(point_curr, a));
+  f32 body_yaw =
+      present_lerp_angle(g->aim[e].yaw, lag_decode(g->lag[e].yaw), a);
   f32 reload_t =
-      g->r_reload[e] == 0 ? 0.0f : (f32)(g->r_reload[e] - 1) / 254.0f;
+      remote_reload_q[e] == 0 ? 0.0f : (f32)(remote_reload_q[e] - 1) / 254.0f;
   Color body = hurt ? PAL_LIGHT : PAL_MID;
   rlPushMatrix();
   rlTranslatef(pos.x, pos.y, pos.z);
-  rlRotatef(yaw_r, 0.0f, 1.0f, 0.0f);
+  rlRotatef(body_yaw, 0.0f, 1.0f, 0.0f);
   draw_cube_lit((Vector3){0.0f, PLAYER_BODY_Y * 0.5f, 0.0f},
                 (Vector3){PLAYER_BODY_X, PLAYER_BODY_Y, PLAYER_BODY_Z}, body);
   draw_cube_lit((Vector3){0.0f, PLAYER_HEAD_Y, 0.06f},
                 (Vector3){PLAYER_HEAD_S, PLAYER_HEAD_S, PLAYER_HEAD_S},
                 hurt ? PAL_LIGHT : PAL_PURPLE);
   rlPopMatrix();
-  GunPose gp = player_gun_pose(g, e, pos, yaw_r, pitch_r, a);
+  GunPose gp = gun_pose_toward_target(pos, target);
   const WeaponDef *wdef = weapon_def(g->weapon_id[e]);
   RemoteGun *rp = &remote_gun[e];
   f32 b = clamp_float(rp->aim_blend, 0.0f, 1.0f);
@@ -589,26 +617,26 @@ static void draw_remote_player(const GameState *g, u32 e, Vector3 pos, f32 a) {
   PresentBob bob =
       present_bob_offsets(rp->walk_phase, rp->walk_blend, 1.0f - 0.5f * b);
   Vector2 lean = present_lean_offsets(rp->move_sway);
-  f32 swing_yaw = rp->move_vel.x * 1.2f * sway_scale;
-  f32 swing_pitch = -rp->move_vel.y * 0.5f * sway_scale;
   f32 swing_roll = -rp->move_vel.x * 0.6f * sway_scale;
   Vector3 origin = gp.origin;
-  origin = vec3_add(origin, vec3_mul(right, rp->gun_sway.x * 1.02f * sway_scale +
-                                                lean.x + bob.pos.x));
-  origin = vec3_add(origin, vec3_mul(up, rp->gun_sway.y * 1.28f * sway_scale +
-                                             bob.pos.y));
+  origin = vec3_add(origin, vec3_mul(right, lean.x + bob.pos.x));
+  origin = vec3_add(origin, vec3_mul(up, bob.pos.y));
   origin = vec3_add(origin, vec3_mul(fwd, lean.y + bob.pos.z));
-  f32 extra_yaw = rp->gun_sway.x * -52.0f * sway_scale + swing_yaw;
-  f32 extra_pitch = (rp->gun_sway.y * -46.0f + rp->gun_sway.x * -11.0f) *
-                        sway_scale +
-                    swing_pitch + wdef->ads_pitch_deg * b +
-                    wdef->sprint_tilt_deg * rp->sprint_blend;
-  f32 extra_roll = rp->gun_sway.x * -29.0f * sway_scale + wdef->ads_cant_deg * b +
-                   bob.roll + swing_roll;
+  gp.origin = origin;
+  /* Aim the actual barrel axis from the displaced model origin. The muzzle
+   * is on this axis at GUN_MUZZLE_Z_M, so it converges on the sight target. */
+  Vector3 to_target = vec3_sub(target, origin);
+  Vector3 final_dir = vec3_len(to_target) > GUN_MUZZLE_Z_M
+                          ? vec3_norm(to_target)
+                          : gp.fwd;
+  aim_basis_from_dir(final_dir, &gp.fwd, &gp.right, &gp.up);
+  gp.yaw = atan2f(gp.fwd.x, gp.fwd.z) * RAD2DEG;
+  gp.pitch = asinf(clamp_float(gp.fwd.y, -1.0f, 1.0f)) * RAD2DEG;
+  f32 extra_roll = wdef->ads_cant_deg * b * 0.15f + bob.roll + swing_roll;
   rlPushMatrix();
   rlTranslatef(origin.x, origin.y, origin.z);
-  rlRotatef(gp.yaw + extra_yaw, 0.0f, 1.0f, 0.0f);
-  rlRotatef(-gp.pitch + extra_pitch, 1.0f, 0.0f, 0.0f);
+  rlRotatef(gp.yaw, 0.0f, 1.0f, 0.0f);
+  rlRotatef(-gp.pitch, 1.0f, 0.0f, 0.0f);
   rlRotatef(extra_roll, 0.0f, 0.0f, 1.0f);
   rlTranslatef(GUN_CENTER_X_M, 0.0f, 0.0f);
   draw_gun_local(g->weapon_id[e], fire * 0.03f, fire * 0.08f, 1.0f, firing,
@@ -728,8 +756,7 @@ static void draw_impact_mark(const GameState *g, u32 e, Vector3 p) {
     Color core = color_lerp(PAL_DARK, hole, 0.35f);
     draw_mark_quad(c, ru, rv, size * (0.55f - 0.25f * fade_t), core);
   }
-  Vector3 d;
-  aim_dir(g->aim[e].yaw, g->aim[e].pitch, &d);
+  Vector3 d = sight_dir((f32)g->aim[e].yaw, (f32)g->aim[e].pitch);
   float dn = vec3_dot(d, n);
   Vector3 r = vec3_sub(d, vec3_mul(n, 2.0f * dn));
   Vector3 cu, cv;
@@ -1059,9 +1086,6 @@ static void update_viewmodel(GameState *g, f32 dt) {
 static void update_remote_viewmodels(GameState *g, f32 dt) {
   if (dt > 0.05f)
     dt = 0.05f;
-  f32 snap_t = (f32)SNAPSHOT_INTERVAL * SIM_DT;
-  if (snap_t < 1e-4f)
-    snap_t = 0.05f;
   u32 comps[] = {COMP_PLAYER, COMP_POSITION};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
@@ -1080,17 +1104,6 @@ static void update_remote_viewmodels(GameState *g, f32 dt) {
     present_lean_tick(&rp->move_sway.x, &rp->move_vel.x, (f32)mx, dt);
     present_lean_tick(&rp->move_sway.y, &rp->move_vel.y, (f32)mz, dt);
     present_blend_tick(&rp->sprint_blend, sprinting, 8.0f, dt);
-    f32 k = dt / snap_t;
-    f32 look_x = -(f32)lag_decode(g->lag[e].yaw) * k;
-    f32 look_y = -(f32)lag_decode(g->lag[e].pitch) * k;
-    f32 steady = 1.0f - rp->aim_blend * 0.55f;
-    f32 tx = look_x * 0.048f * steady;
-    f32 ty = -look_y * 0.045f * steady;
-    tx = clamp_float(tx, -0.50f, 0.50f);
-    ty = clamp_float(ty, -0.45f, 0.45f);
-    f32 sk = 1.0f - expf(-5.2f * dt);
-    rp->gun_sway.x += (tx - rp->gun_sway.x) * sk;
-    rp->gun_sway.y += (ty - rp->gun_sway.y) * sk;
   }
 }
 

@@ -52,7 +52,7 @@ typedef struct {
 } Aim;
 
 typedef struct {
-  u8 yaw, pitch;
+  u8 yaw;
 } LagAim;
 
 #define LOGICAL_W 92
@@ -72,6 +72,7 @@ enum NetPacketKind {
   NET_PACKET_SNAPSHOT,
   NET_PACKET_CHAT,
   NET_PACKET_DISCONNECT,
+  NET_PACKET_SNAPSHOT_COMPACT,
   NET_PACKET_NONE = 255
 };
 
@@ -342,9 +343,13 @@ enum {
   COMP_SOLID
 } ComponentKind;
 
+typedef struct AimVectorQ {
+  i8 x, y, z;
+} AimVectorQ;
+
 typedef struct InputCommand {
   i8 move_x, move_z;
-  i16 aim_yaw, aim_pitch;
+  AimVectorQ aim_dir;
   u8 buttons;
 } InputCommand;
 
@@ -359,9 +364,9 @@ typedef struct NetInputPacket {
   u32 session;
   u16 sequence;
   i8 move_x, move_z;
-  i16 aim_yaw, aim_pitch;
+  AimVectorQ aim_dir;
   u8 name[PLAYER_NAME_LENGTH];
-  u8 reserved[3];
+  u8 reserved[1];
 } NetInputPacket;
 
 typedef struct NetEntity {
@@ -369,6 +374,8 @@ typedef struct NetEntity {
   u8 reload_q;
   u8 scale;
   i16 x, y, z, yaw, pitch;
+  AimVectorQ aim_dir;
+  IVec3 aim_point;
 } NetEntity;
 
 typedef struct NetChatPacket {
@@ -390,7 +397,16 @@ typedef struct NetSnapshot {
 
 #define NET_SNAPSHOT_HEADER_SIZE (offsetof(NetSnapshot, entities))
 #define NET_SNAPSHOT_NAMES_SIZE (MAX_PLAYERS * PLAYER_NAME_LENGTH)
-#define NET_MAX_DATAGRAM sizeof(NetSnapshot)
+#define NET_MAX_DATAGRAM 1472u
+#define NET_ENTITY_BASE_WIRE_SIZE (offsetof(NetEntity, aim_dir))
+#define NET_PLAYER_AIM_WIRE_SIZE (sizeof(AimVectorQ) + sizeof(IVec3))
+#define NET_SNAPSHOT_COMPACT_MAX_SIZE                                         \
+  (NET_SNAPSHOT_HEADER_SIZE + NET_ENTITY_LIMIT * NET_ENTITY_BASE_WIRE_SIZE + \
+   MAX_PLAYERS * NET_PLAYER_AIM_WIRE_SIZE + NET_SNAPSHOT_NAMES_SIZE)
+_Static_assert(NET_SNAPSHOT_COMPACT_MAX_SIZE <= NET_MAX_DATAGRAM,
+               "compact snapshots exceed UDP payload limit");
+_Static_assert(NET_ENTITY_BASE_WIRE_SIZE == 20,
+               "snapshot compact base layout changed");
 #define NET_INPUT_WIRE_SIZE sizeof(NetInputPacket)
 #define NET_CHAT_WIRE_SIZE sizeof(NetChatPacket)
 
@@ -515,6 +531,8 @@ typedef struct GameState {
   IVec3 pos[ECS_MAX_ENTITIES];
   IVec3 vel[ECS_MAX_ENTITIES];
   Aim aim[ECS_MAX_ENTITIES];
+  AimVectorQ aim_dir[ECS_MAX_ENTITIES];
+  IVec3 aim_point[ECS_MAX_ENTITIES];
   u8 kind[ECS_MAX_ENTITIES], lifetime[ECS_MAX_ENTITIES];
   u8 owner[ECS_MAX_ENTITIES];
   LagAim lag[ECS_MAX_ENTITIES];
@@ -552,7 +570,6 @@ typedef struct GameState {
   Vector2 move_sway, move_vel;
   f32 sprint_blend;
   f32 scale[ECS_MAX_ENTITIES];
-  u8 r_reload[ECS_MAX_ENTITIES];
 } GameState;
 
 _Static_assert(sizeof(GameState) <= 4096, "game state exceeds 4 KiB");
@@ -1000,47 +1017,123 @@ static bool net_validate_snapshot_fields(const NetSnapshot *snap,
   return true;
 }
 
+/* Preserve the original fixed-size packet whenever it fits. Larger world
+ * states use a compact per-kind wire representation: the first 20 bytes of
+ * each NetEntity, followed by 3+6 aim bytes for players only. */
+static i32 net_snapshot_compact_size(const NetSnapshot *snap) {
+  if (!snap || snap->count > NET_ENTITY_LIMIT)
+    return -1;
+  i32 size = (i32)(NET_SNAPSHOT_HEADER_SIZE + NET_SNAPSHOT_NAMES_SIZE);
+  u32 players = 0;
+  for (u32 i = 0; i < snap->count; ++i) {
+    size += (i32)NET_ENTITY_BASE_WIRE_SIZE;
+    if (snap->entities[i].kind == KIND_PLAYER) {
+      if (++players > MAX_PLAYERS)
+        return -1;
+      size += (i32)NET_PLAYER_AIM_WIRE_SIZE;
+    }
+  }
+  return size <= (i32)NET_MAX_DATAGRAM ? size : -1;
+}
+
 static bool net_snapshot_wire_ok(const u8 *buf, i32 n) {
-  if (!buf || n < (i32)NET_SNAPSHOT_HEADER_SIZE ||
-      buf[offsetof(NetSnapshot, magic)] != NET_MAGIC ||
-      buf[offsetof(NetSnapshot, type)] != NET_PACKET_SNAPSHOT)
+  if (!buf || n < (i32)(NET_SNAPSHOT_HEADER_SIZE + NET_SNAPSHOT_NAMES_SIZE) ||
+      n > (i32)NET_MAX_DATAGRAM ||
+      buf[offsetof(NetSnapshot, magic)] != NET_MAGIC)
+    return false;
+  u8 type = buf[offsetof(NetSnapshot, type)];
+  if (type != NET_PACKET_SNAPSHOT && type != NET_PACKET_SNAPSHOT_COMPACT)
     return false;
   u8 count = buf[offsetof(NetSnapshot, count)];
   if (count > NET_ENTITY_LIMIT)
     return false;
-  i32 want = net_snapshot_wire_size(count);
-  return want >= 0 && n == want && (size_t)n <= sizeof(NetSnapshot);
+  if (type == NET_PACKET_SNAPSHOT)
+    return n == net_snapshot_wire_size(count); /* Legacy 30-byte records. */
+  i32 pos = (i32)NET_SNAPSHOT_HEADER_SIZE;
+  u32 players = 0;
+  for (u32 i = 0; i < count; ++i) {
+    if (pos + (i32)NET_ENTITY_BASE_WIRE_SIZE > n - NET_SNAPSHOT_NAMES_SIZE)
+      return false;
+    u8 kind = buf[pos + offsetof(NetEntity, kind)];
+    pos += (i32)NET_ENTITY_BASE_WIRE_SIZE;
+    if (kind == KIND_PLAYER) {
+      if (++players > MAX_PLAYERS ||
+          pos + (i32)NET_PLAYER_AIM_WIRE_SIZE > n - NET_SNAPSHOT_NAMES_SIZE)
+        return false;
+      pos += (i32)NET_PLAYER_AIM_WIRE_SIZE;
+    }
+  }
+  return pos + NET_SNAPSHOT_NAMES_SIZE == n;
 }
 
 static i32 net_snapshot_encode(const NetSnapshot *snap, u8 *out, i32 out_cap) {
   if (!snap || !out || snap->count > NET_ENTITY_LIMIT)
     return -1;
   i32 want = net_snapshot_wire_size(snap->count);
+  if (want >= 0 && want <= (i32)NET_MAX_DATAGRAM && want <= out_cap) {
+    memcpy(out, snap, NET_SNAPSHOT_HEADER_SIZE);
+    out[offsetof(NetSnapshot, type)] = NET_PACKET_SNAPSHOT;
+    if (snap->count)
+      memcpy(out + NET_SNAPSHOT_HEADER_SIZE, snap->entities,
+             (size_t)snap->count * sizeof(NetEntity));
+    memcpy(out + NET_SNAPSHOT_HEADER_SIZE +
+               (size_t)snap->count * sizeof(NetEntity),
+           snap->names, NET_SNAPSHOT_NAMES_SIZE);
+    return want;
+  }
+  want = net_snapshot_compact_size(snap);
   if (want < 0 || out_cap < want)
     return -1;
   memcpy(out, snap, NET_SNAPSHOT_HEADER_SIZE);
-  if (snap->count > 0)
-    memcpy(out + NET_SNAPSHOT_HEADER_SIZE, snap->entities,
-           (size_t)snap->count * sizeof(NetEntity));
-  memcpy(out + NET_SNAPSHOT_HEADER_SIZE +
-             (size_t)snap->count * sizeof(NetEntity),
-         snap->names, NET_SNAPSHOT_NAMES_SIZE);
+  out[offsetof(NetSnapshot, type)] = NET_PACKET_SNAPSHOT_COMPACT;
+  size_t pos = NET_SNAPSHOT_HEADER_SIZE;
+  for (u32 i = 0; i < snap->count; ++i) {
+    const NetEntity *e = &snap->entities[i];
+    memcpy(out + pos, e, NET_ENTITY_BASE_WIRE_SIZE);
+    pos += NET_ENTITY_BASE_WIRE_SIZE;
+    if (e->kind == KIND_PLAYER) {
+      memcpy(out + pos, &e->aim_dir, sizeof(e->aim_dir));
+      pos += sizeof(e->aim_dir);
+      memcpy(out + pos, &e->aim_point, sizeof(e->aim_point));
+      pos += sizeof(e->aim_point);
+    }
+  }
+  memcpy(out + pos, snap->names, NET_SNAPSHOT_NAMES_SIZE);
   return want;
 }
 
 static bool net_snapshot_decode(const u8 *buf, i32 n, NetSnapshot *out) {
-  if (!buf || !out || !net_snapshot_wire_ok(buf, n))
+  if (!out || !net_snapshot_wire_ok(buf, n))
     return false;
   u8 count = buf[offsetof(NetSnapshot, count)];
   *out = (NetSnapshot){0};
   memcpy(out, buf, NET_SNAPSHOT_HEADER_SIZE);
+  out->type = NET_PACKET_SNAPSHOT; /* Internal representation is format-neutral. */
   out->count = count;
-  if (count > 0)
-    memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
-           (size_t)count * sizeof(NetEntity));
-  memcpy(out->names,
-         buf + NET_SNAPSHOT_HEADER_SIZE + (size_t)count * sizeof(NetEntity),
-         NET_SNAPSHOT_NAMES_SIZE);
+  if (buf[offsetof(NetSnapshot, type)] == NET_PACKET_SNAPSHOT) {
+    if (count)
+      memcpy(out->entities, buf + NET_SNAPSHOT_HEADER_SIZE,
+             (size_t)count * sizeof(NetEntity));
+    memcpy(out->names,
+           buf + NET_SNAPSHOT_HEADER_SIZE + (size_t)count * sizeof(NetEntity),
+           NET_SNAPSHOT_NAMES_SIZE);
+    return true;
+  }
+  size_t pos = NET_SNAPSHOT_HEADER_SIZE;
+  for (u32 i = 0; i < count; ++i) {
+    NetEntity *e = &out->entities[i];
+    memcpy(e, buf + pos, NET_ENTITY_BASE_WIRE_SIZE);
+    pos += NET_ENTITY_BASE_WIRE_SIZE;
+    e->aim_dir = (AimVectorQ){0, 0, 127};
+    e->aim_point = (IVec3){0, 0, POS_SCALE};
+    if (e->kind == KIND_PLAYER) {
+      memcpy(&e->aim_dir, buf + pos, sizeof(e->aim_dir));
+      pos += sizeof(e->aim_dir);
+      memcpy(&e->aim_point, buf + pos, sizeof(e->aim_point));
+      pos += sizeof(e->aim_point);
+    }
+  }
+  memcpy(out->names, buf + pos, NET_SNAPSHOT_NAMES_SIZE);
   return true;
 }
 
@@ -1062,10 +1155,9 @@ static bool net_input_decode(const u8 *buf, i32 n, NetInputPacket *out) {
          sizeof(out->sequence));
   out->move_x = (i8)buf[offsetof(NetInputPacket, move_x)];
   out->move_z = (i8)buf[offsetof(NetInputPacket, move_z)];
-  memcpy(&out->aim_yaw, buf + offsetof(NetInputPacket, aim_yaw),
-         sizeof(out->aim_yaw));
-  memcpy(&out->aim_pitch, buf + offsetof(NetInputPacket, aim_pitch),
-         sizeof(out->aim_pitch));
+  out->aim_dir.x = (i8)buf[offsetof(NetInputPacket, aim_dir.x)];
+  out->aim_dir.y = (i8)buf[offsetof(NetInputPacket, aim_dir.y)];
+  out->aim_dir.z = (i8)buf[offsetof(NetInputPacket, aim_dir.z)];
   memcpy(out->name, buf + offsetof(NetInputPacket, name), PLAYER_NAME_LENGTH);
   return true;
 }
@@ -1165,12 +1257,13 @@ static void clear_entity_data(GameState *g, u32 e) {
   g->pos[e] = (IVec3){0, 0, 0};
   g->vel[e] = (IVec3){0, 0, 0};
   g->aim[e] = (Aim){0, 0};
+  g->aim_dir[e] = (AimVectorQ){0, 0, 127};
+  g->aim_point[e] = (IVec3){0, 0, POS_SCALE};
   g->kind[e] = g->lifetime[e] = g->owner[e] = 0;
   g->flash[e] = g->held_by[e] = 0;
   g->weapon_ammo[e] = g->weapon_cooldown[e] = g->weapon_prev[e] = 0;
   g->weapon_reload[e] = g->weapon_dirty_seq[e] = 0;
-  g->r_reload[e] = 0;
-  g->lag[e] = (LagAim){LAG_NEUTRAL, LAG_NEUTRAL};
+  g->lag[e] = (LagAim){LAG_NEUTRAL};
   g->scale[e] = 1.0f;
   g->weapon_id[e] = WEAPON_P99;
 }
@@ -1315,6 +1408,36 @@ static Vector3 vec3_norm(Vector3 a) {
   return l < 1e-6f ? vec3(1.0f, 0.0f, 0.0f) : vec3_mul(a, 1.0f / l);
 }
 
+static AimVectorQ aim_vector_encode(Vector3 d) {
+  d = vec3_norm(d);
+  return (AimVectorQ){(i8)clamp_int((int)lroundf(d.x * 127.0f), -127, 127),
+                      (i8)clamp_int((int)lroundf(d.y * 127.0f), -127, 127),
+                      (i8)clamp_int((int)lroundf(d.z * 127.0f), -127, 127)};
+}
+
+static Vector3 aim_vector_decode(AimVectorQ q) {
+  Vector3 d = vec3((f32)q.x / 127.0f, (f32)q.y / 127.0f,
+                   (f32)q.z / 127.0f);
+  f32 l = vec3_len(d);
+  return l < 0.001f ? vec3(0.0f, 0.0f, 1.0f) : vec3_mul(d, 1.0f / l);
+}
+
+static Aim aim_from_dir(Vector3 d) {
+  d = vec3_norm(d);
+  return (Aim){wrap_degrees((int)lroundf(atan2f(d.x, d.z) * RAD2DEG)),
+               (i16)clamp_int((int)lroundf(asinf(clamp_float(d.y, -1.0f, 1.0f)) *
+                                             RAD2DEG),
+                              -75, 75)};
+}
+
+static void aim_basis_from_dir(Vector3 dir, Vector3 *fwd, Vector3 *right,
+                               Vector3 *up) {
+  dir = vec3_norm(dir);
+  *fwd = dir;
+  *right = vec3_norm(vec3(-dir.z, 0.0f, dir.x));
+  *up = vec3_cross(*right, *fwd);
+}
+
 static f32 scale_value(const GameState *g, u32 e) {
   if (e >= ECS_MAX_ENTITIES || !ecs_has(&g->ecs, e, COMP_SCALE))
     return 1.0f;
@@ -1358,16 +1481,20 @@ static Vector3 sight_dir(f32 yaw_deg, f32 pitch_deg) {
               cosf(yaw_deg * DEG2RAD) * h);
 }
 
-static void aim_dir(i16 yaw_deg, i16 pitch_deg, Vector3 *out) {
-  *out = sight_dir((f32)yaw_deg, (f32)pitch_deg);
+/* Canonicalize the wire vector once at the server boundary. Both the
+ * replicated vector and its derived angle must obey the player pitch limit. */
+static AimVectorQ aim_vector_pitch_limited(AimVectorQ wire) {
+  Vector3 dir = aim_vector_decode(wire);
+  if (fabsf(dir.y) > sinf(75.0f * DEG2RAD)) {
+    Aim clamped = aim_from_dir(dir);
+    dir = sight_dir((f32)clamped.yaw, (f32)clamped.pitch);
+  }
+  return aim_vector_encode(dir);
 }
 
 static void look_basis(f32 yaw_deg, f32 pitch_deg, Vector3 *fwd, Vector3 *right,
                        Vector3 *up) {
-  *fwd = sight_dir(yaw_deg, pitch_deg);
-  f32 cy = cosf(yaw_deg * DEG2RAD), sy = sinf(yaw_deg * DEG2RAD);
-  *right = vec3(-cy, 0.0f, sy);
-  *up = vec3_cross(*right, *fwd);
+  aim_basis_from_dir(sight_dir(yaw_deg, pitch_deg), fwd, right, up);
 }
 
 static Vector3 player_eye_m(Vector3 feet) {
@@ -1587,16 +1714,6 @@ static TraceHit trace_solids(const GameState *g, Vector3 p0, Vector3 d,
     }
   }
   return r;
-}
-
-static f32 sight_zero_m(const GameState *g, u32 skip, Vector3 eye, Vector3 f,
-                        f32 a) {
-  Vector3 p0 = vec3_mul(eye, (f32)POS_SCALE);
-  Vector3 d = vec3_mul(f, SIGHT_MAX_DIST_M * (f32)POS_SCALE);
-  TraceHit h = trace_solids(g, p0, d, skip, NET_PACKET_NONE, a);
-  if (!h.hit)
-    return SIGHT_SKY_DIST_M;
-  return clamp_float(h.t * SIGHT_MAX_DIST_M, 0.35f, SIGHT_MAX_DIST_M);
 }
 
 static GunPose player_gun_pose(const GameState *g, u32 e, Vector3 feet, f32 yaw,

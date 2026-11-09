@@ -78,11 +78,31 @@ static void aim_system(GameState *g) {
   u32 comps[] = {COMP_AIM, COMP_PLAYER};
   EcsQuery q = ecs_query(&g->ecs, comps, 2);
   while (ecs_next(&q)) {
-    u8 p = g->owner[q.entity];
+    u32 e = q.entity;
+    u8 p = g->owner[e];
     if (p >= MAX_PLAYERS)
       continue;
-    g->aim[q.entity].yaw = wrap_degrees(g->input[p].aim_yaw);
-    g->aim[q.entity].pitch = (i16)clamp_int(g->input[p].aim_pitch, -75, 75);
+    g->aim_dir[e] = g->input[p].aim_dir;
+    g->aim[e] = aim_from_dir(aim_vector_decode(g->aim_dir[e]));
+  }
+}
+
+static void aim_point_system(GameState *g) {
+  u32 comps[] = {COMP_POSITION, COMP_AIM, COMP_PLAYER};
+  EcsQuery q = ecs_query(&g->ecs, comps, 3);
+  while (ecs_next(&q)) {
+    u32 e = q.entity;
+    Vector3 feet = entity_pos_m(g, e, 1.0f);
+    Vector3 eye = player_eye_m(feet);
+    Vector3 dir = aim_vector_decode(g->aim_dir[e]);
+    Vector3 p0 = vec3_mul(eye, (f32)POS_SCALE);
+    Vector3 ray = vec3_mul(dir, SIGHT_MAX_DIST_M * (f32)POS_SCALE);
+    TraceHit hit = trace_solids(g, p0, ray, e, g->owner[e], 1.0f);
+    Vector3 point = hit.hit ? vec3_add(p0, vec3_mul(ray, hit.t))
+                            : vec3_add(p0, ray);
+    g->aim_point[e] = (IVec3){(i16)lroundf(point.x),
+                              (i16)lroundf(point.y),
+                              (i16)lroundf(point.z)};
   }
 }
 
@@ -115,7 +135,7 @@ static void holding_system(GameState *g) {
       EcsQuery cq = ecs_query(&g->ecs, cubes, 3);
       f32 best_d = 1000.0f;
       u32 best = ECS_INVALID_ENTITY;
-      aim_dir(g->aim[pe].yaw, g->aim[pe].pitch, &dir);
+      dir = sight_dir((f32)g->aim[pe].yaw, (f32)g->aim[pe].pitch);
       while (ecs_next(&cq)) {
         u32 c = cq.entity;
         if (g->kind[c] != KIND_CUBE || g->held_by[c] != 0)
@@ -178,10 +198,8 @@ static u32 spawn_bullet(GameState *g, u32 pe) {
     return e;
   clear_entity_data(g, e);
   Vector3 feet = entity_pos_m(g, pe, 1.0f);
-  f32 yaw = (f32)g->aim[pe].yaw;
-  f32 pitch = (f32)g->aim[pe].pitch;
   Vector3 fwd, right, up;
-  look_basis(yaw, pitch, &fwd, &right, &up);
+  aim_basis_from_dir(aim_vector_decode(g->aim_dir[pe]), &fwd, &right, &up);
   u8 owner = g->owner[pe];
   bool aiming = owner < MAX_PLAYERS && (g->input[owner].buttons & BTN_AIM) != 0;
   u32 h = mix32(g->tick * 2654435761u ^ (u32)pe * 40503u ^ (u32)owner * 65599u ^
@@ -271,9 +289,11 @@ static void weapon_system(GameState *g) {
       if (spawn_bullet(g, e) != ECS_INVALID_ENTITY) {
         u8 wid = g->weapon_id[e];
         weapon_on_fired(g, e, holding);
-        g->aim[e].pitch = weapon_recoil_pitch(g->aim[e].pitch, wid, holding);
-        g->input[p].aim_pitch =
-            weapon_recoil_pitch(g->input[p].aim_pitch, wid, holding);
+        i16 new_pitch = weapon_recoil_pitch(g->aim[e].pitch, wid, holding);
+        g->aim[e].pitch = new_pitch;
+        g->input[p].aim_dir = aim_vector_encode(
+            sight_dir((f32)g->aim[e].yaw, (f32)new_pitch));
+        g->aim_dir[e] = g->input[p].aim_dir;
         if (g->flash[e] <= PLAYER_FIRE_FLASH_TICKS)
           g->flash[e] = PLAYER_FIRE_FLASH_TICKS;
         spawn_casing(g, e);
@@ -472,7 +492,13 @@ static void write_snapshot(GameState *g, NetSnapshot *snap, u8 recipient,
                                                 .y = g->pos[e].y,
                                                 .z = g->pos[e].z,
                                                 .yaw = g->aim[e].yaw,
-                                                .pitch = g->aim[e].pitch};
+                                                .pitch = g->aim[e].pitch,
+                                                .aim_dir = g->kind[e] == KIND_PLAYER
+                                                               ? g->aim_dir[e]
+                                                               : (AimVectorQ){0, 0, 127},
+                                                .aim_point = g->kind[e] == KIND_PLAYER
+                                                                 ? g->aim_point[e]
+                                                                 : (IVec3){0, 0, POS_SCALE}};
   }
 }
 
@@ -528,6 +554,7 @@ static u32 create_player(GameState *g, u8 player) {
   g->owner[e] = player;
   g->player_entity[player] = (u8)e;
   weapon_init_entity(g, e);
+  g->aim_dir[e] = (AimVectorQ){0, 0, 127};
   add_kind_components(g, e, KIND_PLAYER);
   return e;
 }
@@ -559,7 +586,7 @@ static int add_peer(GameState *g, const struct sockaddr_in *from, u32 session,
                           .last_seen = g->tick,
                           .active = 1,
                           .player = (u8)slot};
-  g->input[slot] = (InputCommand){.aim_yaw = g->aim[e].yaw};
+  g->input[slot] = (InputCommand){.aim_dir = (AimVectorQ){0, 0, 127}};
   for (i32 i = 0; i < PLAYER_NAME_LENGTH; ++i)
     g->player_name[slot][i] = name.items[i];
   return slot;
@@ -685,8 +712,7 @@ static void server_handle_input(GameState *g, int fd,
   peer->port = from->sin_port;
   g->input[peer->player].move_x = (i8)clamp_int(packet->move_x, -1, 1);
   g->input[peer->player].move_z = (i8)clamp_int(packet->move_z, -1, 1);
-  g->input[peer->player].aim_yaw = wrap_degrees(packet->aim_yaw);
-  g->input[peer->player].aim_pitch = (i16)clamp_int(packet->aim_pitch, -75, 75);
+  g->input[peer->player].aim_dir = aim_vector_pitch_limited(packet->aim_dir);
   g->input[peer->player].buttons = packet->buttons & BTN_ALL;
 }
 
@@ -724,6 +750,14 @@ static void expire_peers_system(GameState *g) {
 
 static void server_send_all(GameState *g, int fd) {
   NetSnapshot snap;
+  bool have_peer = false;
+  for (int i = 0; i < MAX_PLAYERS; ++i)
+    have_peer |= g->peers[i].active && g->peers[i].player < MAX_PLAYERS;
+  if (!have_peer)
+    return;
+  /* Sight targets are presentation-only and need one raycast per snapshot,
+   * not one on each of the five intervening simulation ticks. */
+  aim_point_system(g);
   for (int i = 0; i < MAX_PLAYERS; ++i) {
     if (!g->peers[i].active || g->peers[i].player >= MAX_PLAYERS)
       continue;
